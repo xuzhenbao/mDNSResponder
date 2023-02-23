@@ -8710,6 +8710,13 @@ mDNSlocal void mDNSCoreReceiveQuery(mDNS *const m, const DNSMessage *const msg, 
                   msg->h.numAuthorities, msg->h.numAuthorities == 1 ? "y,  " : "ies,",
                   msg->h.numAdditionals, msg->h.numAdditionals == 1 ? " "    : "s", end - msg->data);
 
+    if ((srcaddr->type == mDNSAddrType_IPv4 && !mDNSv4AddressIsLinkLocal(&srcaddr->ip.v4))
+            || (srcaddr->type == mDNSAddrType_IPv6 && !mDNSv6AddressIsLinkLocal(&srcaddr->ip.v6)))
+    {
+        verbosedebugf("Ignore Query from outside local link!!!");
+        return;
+    }
+
     responseend = ProcessQuery(m, msg, end, srcaddr, InterfaceID,
                                !mDNSSameIPPort(srcport, MulticastDNSPort), mDNSAddrIsDNSMulticast(dstaddr), QueryWasLocalUnicast, &m->omsg);
 
