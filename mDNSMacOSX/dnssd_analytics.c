@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -116,7 +116,7 @@ _post_dns_analytic(dns_analytic_t * const _Nonnull analytic, const char * _Nonnu
 }
 
 static void
-_post_dns_query_info()
+_post_dns_query_info(void)
 {
 	for (uint8_t i = 0 ; i < e_index_count ; i++ ) {
 		if (s_dns_analytics[i].latency_count > 0) {
@@ -291,7 +291,7 @@ _post_cache_request_count(CacheRequestType inType, CacheState inState, uint64_t 
 }
 
 static void
-_post_cache_request_counts()
+_post_cache_request_counts(void)
 {
     if (sCacheRequest_UnicastHitCount > 0) {
 		_post_cache_request_count(CacheRequestType_unicast, CacheState_hit, sCacheRequest_UnicastHitCount);
@@ -329,7 +329,7 @@ _post_cache_usage_counts_for_type(CacheRequestType inType, uint64_t inHitCount, 
 }
 
 static void
-_post_cache_usage_counts()
+_post_cache_usage_counts(void)
 {
 	if (sCacheUsage_MulticastHitCount || sCacheUsage_MulticastMissCount) {
 		_post_cache_usage_counts_for_type(CacheRequestType_multicast, sCacheUsage_MulticastHitCount, sCacheUsage_MulticastMissCount);
@@ -379,6 +379,63 @@ dnssd_analytics_update_cache_usage_counts(uint32_t inHitMulticastCount, uint32_t
 }
 
 #endif // CACHE_ANALYTICS
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
+
+static uint64_t sUnicastAssist_UnicastCount = 0;
+static uint64_t sUnicastAssist_MulticastCount = 0;
+static uint64_t sNonUnicastAssist_UnicastCount = 0;
+static uint64_t sNonUnicastAssist_MulticastCount = 0;
+
+static void
+_post_unicast_assist(void)
+{
+	bool posted;
+	posted = analytics_send_event_lazy("com.apple.mDNSResponder.unicastassist", ^{
+		xpc_object_t dict;
+		dict = xpc_dictionary_create(NULL, NULL, 0);
+		xpc_dictionary_set_uint64(dict, "unicast",			sUnicastAssist_UnicastCount);
+		xpc_dictionary_set_uint64(dict, "multicast",		sUnicastAssist_MulticastCount);
+		xpc_dictionary_set_uint64(dict, "non_unicast",		sNonUnicastAssist_UnicastCount);
+		xpc_dictionary_set_uint64(dict, "non_multicast",	sNonUnicastAssist_MulticastCount);
+		return (dict);
+	});
+	if (!posted) {
+		LogRedact(MDNS_LOG_CATEGORY_ANALYTICS, MDNS_LOG_WARNING, "com.apple.mDNSResponder.unicastassist: Analytic not posted");
+	}
+	sUnicastAssist_UnicastCount = 0;
+	sUnicastAssist_MulticastCount = 0;
+	sNonUnicastAssist_UnicastCount = 0;
+	sNonUnicastAssist_MulticastCount = 0;
+}
+
+void
+dnssd_analytics_update_unicast_assist(bool assist, bool unicast)
+{
+	if (assist) {
+		if (unicast) {
+			sUnicastAssist_UnicastCount++;
+		} else {
+			sUnicastAssist_MulticastCount++;
+		}
+	} else {
+		if (unicast) {
+			sNonUnicastAssist_UnicastCount++;
+		} else {
+			sNonUnicastAssist_MulticastCount++;
+		}
+	}
+	LogRedact(MDNS_LOG_CATEGORY_ANALYTICS, MDNS_LOG_DEBUG,
+			  "dnssd_analytics_update_unicast_assist Assist(unicast %s%lld, multicast %s%lld) "
+			  "NonAssist(unicast %s%lld, multicast %s%lld)",
+			  assist ? unicast ? "*" : "" : "", sUnicastAssist_UnicastCount,
+			  assist ? unicast ? "" : "*" : "", sUnicastAssist_MulticastCount,
+			  !assist ? unicast ? "*" : "" : "", sNonUnicastAssist_UnicastCount,
+			  !assist ? unicast ? "" : "*" : "", sNonUnicastAssist_MulticastCount);
+}
+
+#endif // UNICAST_ASSIST_ANALYTICS
+
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, WAB_ANALYTICS)
 
@@ -515,7 +572,7 @@ dnssd_analytics_post_WAB_usage_event_count(WABUsageKind inKind, WABUsageType inT
 // MARK:  - Exported Analytics Functions
 
 void
-dnssd_analytics_init()
+dnssd_analytics_init(void)
 {
 	static dispatch_once_t	sInitAnalyticsOnce = 0;
 	static dispatch_queue_t sAnalyticsQueue = NULL;
@@ -547,6 +604,9 @@ dnssd_analytics_init()
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNS_ANALYTICS)
 					_post_dns_query_info();
 #endif	//	DNS_ANALYTICS
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
+					_post_unicast_assist();
+#endif	//	UNICAST_ASSIST_ANALYTICS
 					LogRedact(MDNS_LOG_CATEGORY_ANALYTICS, MDNS_LOG_DEFAULT, "com.apple.mDNSResponder.analytics.daily Complete");
 					mDNS_Unlock(&mDNSStorage);
 					KQueueUnlock("Analytics Update");
@@ -602,6 +662,13 @@ dnssd_analytics_log(int fd)
 		}
 	}
 #endif // DNS_ANALYTICS
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
+	LogToFD(fd, "----    Unicast Assist");
+	LogToFD(fd, "Assist Unicast: %llu", sUnicastAssist_UnicastCount);
+	LogToFD(fd, "Assist Multicast: %llu", sUnicastAssist_MulticastCount);
+	LogToFD(fd, "Non-assist Unicast: %llu", sNonUnicastAssist_UnicastCount);
+	LogToFD(fd, "Non-assist Multicast: %llu", sNonUnicastAssist_MulticastCount);
+#endif // UNICAST_ASSIST_ANALYTICS
 }
 
 #endif // ANALYTICS

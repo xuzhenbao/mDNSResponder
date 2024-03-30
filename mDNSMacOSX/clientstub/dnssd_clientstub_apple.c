@@ -146,6 +146,12 @@ get_validation_data_from_tlvs(const uint8_t * const ptr, const uint8_t * const l
 	return data;
 }
 
+const char *
+get_tracker_hostname_from_tlvs(const uint8_t * const ptr, const uint8_t * const limit)
+{
+	return get_tlv_string(ptr, limit, IPC_TLV_TYPE_SERVICE_ATTR_TRACKER_STR);
+}
+
 void
 put_tlvs_for_defaults(const xpc_object_t defaults, ipc_msg_hdr * const hdr, uint8_t ** const ptr,
 	const uint8_t * const limit)

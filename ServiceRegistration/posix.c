@@ -37,7 +37,54 @@
 #include "dns-msg.h"
 #include "ioloop.h"
 
+#undef OBJECT_TYPE
+#define OBJECT_TYPE(x) int x##_created, x##_finalized, old_##x##_created, old_##x##_finalized;
+#include "object-types.h"
+
+void
+ioloop_dump_object_allocation_stats(void)
+{
+#undef OBJECT_TYPE
+#define OBJECT_TYPE(x) || (x ## _created != old_ ## x ## _created) || (x ## _finalized != old_ ## x ## _finalized)
+    if (false
+#include "object-types.h"
+        )
+    {
+        char outbuf[1000];
+        char *obp = outbuf;
+        size_t len;
+#undef OBJECT_TYPE
+#define OBJECT_TYPE_STR(x) #x
+#define OBJECT_TYPE(x)                                                                                  \
+        len = snprintf(obp, (sizeof(outbuf)) - (obp - outbuf), OBJECT_TYPE_STR(x) " %d %d %d %d|",      \
+             old_ ## x ##_created, x ## _created, old_ ## x ## _finalized, x ## _finalized);            \
+        obp += len;                                                                                     \
+        old_ ## x ## _created = x ## _created;                                                          \
+        old_ ## x ## _finalized = x ## _finalized;                                                      \
+        if (obp - outbuf > 900) {                                                                       \
+            INFO(PUB_S_SRP, outbuf);                                                                    \
+            obp = outbuf;                                                                               \
+            len = 0;                                                                                    \
+        }
+#include "object-types.h"
+        if (len > 0) {
+            INFO(PUB_S_SRP, outbuf);
+        }
+    }
+}
+
 interface_address_state_t *interface_addresses;
+
+void
+ioloop_strcpy(char *dest, const char *src, size_t lim)
+{
+    size_t len = strlen(src);
+    if (len >= lim - 1) {
+      len = lim - 1;
+    }
+    memcpy(dest, src, len);
+    dest[len] = 0;
+}
 
 bool
 ioloop_map_interface_addresses(const char *ifname, void *context, interface_callback_t callback)
@@ -385,10 +432,31 @@ ioloop_message_create_(size_t message_size, const char *file, int line)
     message = (message_t *)malloc(message_size + (sizeof(message_t)) - (sizeof(dns_wire_t)));
     if (message) {
         memset(message, 0, (sizeof(message_t)) - (sizeof(dns_wire_t)));
-        RETAIN(message);
+        RETAIN(message, message);
         message->length = (uint16_t)message_size;
     }
     return message;
+}
+
+// Return continuous time, if provided by O.S., otherwise unadjusted time.
+time_t srp_time(void)
+{
+#ifdef CLOCK_BOOTTIME
+    // CLOCK_BOOTTIME is a Linux-specific constant that indicates a monotonic time that includes time asleep
+    const int clockid = CLOCK_BOOTTIME;
+#elif defined(CLOCK_MONOTONIC_RAW)
+    // On MacOS, CLOCK_MONOTONIC_RAW is a monotonic time that includes time asleep and is not adjusted.
+    // According to the man page, CLOCK_MONOTONIC on MacOS violates the POSIX spec in that it can be adjusted.
+    const int clockid = CLOCK_MONOTONIC_RAW;
+#else
+    // On other Posix systems, CLOCK_MONOTONIC should be the right thing, at least according to the POSIX spec.
+    const int clockid = CLOCK_MONOTONIC;
+#endif
+    struct timespec tm;
+    clock_gettime(clockid, &tm);
+
+    // We are only accurate to the second.
+    return tm.tv_sec;
 }
 
 #ifdef DEBUG_FD_LEAKS

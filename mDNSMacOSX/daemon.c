@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-file-style: "bsd"; c-basic-offset: 4; fill-column: 108; indent-tabs-mode: nil -*-
  *
- * Copyright (c) 2002-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,7 +64,6 @@
 
 #include <mdns/power.h>
 #include "mrcs_server.h"
-#include "mdns_strict.h"
 
 #ifndef USE_SELECT_WITH_KQUEUEFD
 #define USE_SELECT_WITH_KQUEUEFD 0
@@ -73,6 +72,8 @@
 #if MDNSRESPONDER_SUPPORTS(APPLE, CACHE_MEM_LIMIT)
 #include <os/feature_private.h>
 #endif
+
+#include "mdns_strict.h"
 
 // Used on OSX(10.11.x onwards) for manipulating mDNSResponder program arguments
 
@@ -309,6 +310,30 @@ mDNSlocal void HandleSIG(int sig)
 
 #endif // MDNSRESPONDER_USES_LIB_DISPATCH_AS_PRIMARY_EVENT_LOOP_MECHANISM
 
+static const char *if_functional_type_to_string(const uint32_t type)
+{
+    switch (type) {
+        case IFRTYPE_FUNCTIONAL_UNKNOWN:
+            return "Unknown";
+        case IFRTYPE_FUNCTIONAL_LOOPBACK:
+            return "Loopback";
+        case IFRTYPE_FUNCTIONAL_WIRED:
+            return "Wired";
+        case IFRTYPE_FUNCTIONAL_WIFI_INFRA:
+            return "Wi-Fi";
+        case IFRTYPE_FUNCTIONAL_WIFI_AWDL:
+            return "AWDL";
+        case IFRTYPE_FUNCTIONAL_CELLULAR:
+            return "Cellular";
+        case IFRTYPE_FUNCTIONAL_INTCOPROC:
+            return "Inter-(co)proc";
+        case IFRTYPE_FUNCTIONAL_COMPANIONLINK:
+            return "CompanionLink";
+    }
+
+    return "Unrecognized";
+}
+
 mDNSexport void dump_state_to_fd(int fd)
 {
 #if !MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
@@ -353,7 +378,7 @@ mDNSexport void dump_state_to_fd(int fd)
     if (!mDNSStorage.p->InterfaceList) LogToFD(fd, "<None>");
     else
     {
-        LogToFD(fd, "  Struct addr           Registered                MAC               BSSID                                Interface Address");
+        LogToFD(fd, "Struct addr          Registered                     MAC               BSSID                                Functional Type  Interface Address");
         for (i = mDNSStorage.p->InterfaceList; i; i = i->next)
         {
             // Allow six characters for interface name, for names like "vmnet8"
@@ -366,7 +391,7 @@ mDNSexport void dump_state_to_fd(int fd)
             {
                 const CacheRecord *sps[3];
                 FindSPSInCache(&mDNSStorage, &i->ifinfo.NetWakeBrowse, sps);
-                LogToFD(fd, "%p %2ld, %p,  %s %-6s %.6a %.6a %s %s %s %s %s %s %#a",
+                LogToFD(fd, "%p %2ld, %p,  %s %-8.8s %.6a %.6a %s %s %s %s %s %s %-16.16s %#a",
                           i, i->ifinfo.InterfaceID, i->Registered,
                           i->sa_family == AF_INET ? "v4" : i->sa_family == AF_INET6 ? "v6" : "??", i->ifinfo.ifname, &i->ifinfo.MAC, &i->BSSID,
                           i->ifinfo.InterfaceActive ? "Active" : "      ",
@@ -375,6 +400,7 @@ mDNSexport void dump_state_to_fd(int fd)
                           i->ifinfo.Advertise ? "A" : " ",
                           i->ifinfo.McastTxRx ? "M" : " ",
                           !(i->ifinfo.InterfaceActive && i->ifinfo.NetWake) ? " " : !sps[0] ? "p" : "P",
+                          if_functional_type_to_string(i->if_functional_type),
                           &i->ifinfo.ip);
 
                 // Only print the discovered sleep proxies once for the lead/active interface of an interface set.
@@ -500,7 +526,7 @@ mDNSexport void INFOCallback(void)
 }
 
 // Writes the state out to the dynamic store and also affects the ASL filter level
-mDNSexport void UpdateDebugState()
+mDNSexport void UpdateDebugState(void)
 {
     mDNSu32 one  = 1;
     mDNSu32 zero = 0;

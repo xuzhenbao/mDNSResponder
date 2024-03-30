@@ -1,12 +1,12 @@
 /* cti-services.c
  *
- * Copyright (c) 2020-2021 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *     https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -68,7 +68,7 @@ cti_fd_finalize(void *context)
     if (connection->callback.reply != NULL && connection->internal_callback != NULL) {
         connection->internal_callback(connection, NULL, kCTIStatus_Disconnected);
     }
-    RELEASE_HERE(connection, cti_connection_finalize);
+    RELEASE_HERE(connection, cti_connection);
 }
 
 void
@@ -130,7 +130,7 @@ cti_connection_read_callback(io_t *UNUSED io, void *context)
 void
 cti_connection_release_(cti_connection_t connection, const char *file, int line)
 {
-    RELEASE(connection, cti_connection_finalize);
+    RELEASE(connection, cti_connection);
 }
 
 static int
@@ -142,7 +142,7 @@ cti_connection_create(void *context, cti_callback_t callback,
         ERROR("cti_connection_create: no memory for connection.");
         return kCTIStatus_NoMemory;
     }
-    RETAIN_HERE(connection);
+    RETAIN_HERE(connection, cti_connection);
 
     connection->fd = cti_make_unix_socket(CTI_SERVER_SOCKET_NAME, sizeof(CTI_SERVER_SOCKET_NAME), false);
     if (connection->fd < 0) {
@@ -168,9 +168,9 @@ cti_connection_create(void *context, cti_callback_t callback,
 }
 
 cti_status_t
-cti_add_service_(void *context, cti_reply_t callback, run_context_t client_queue,
+cti_add_service_(srp_server_t *UNUSED server, void *context, cti_reply_t callback, run_context_t client_queue,
                  uint32_t enterprise_number, const uint8_t *NONNULL service_data, size_t service_data_length,
-                 const uint8_t *NONNULL server_data, size_t server_data_length, const char *file, int line)
+                 const uint8_t *server_data, size_t server_data_length, const char *file, int line)
 {
     cti_callback_t app_callback;
     app_callback.reply = callback;
@@ -200,7 +200,7 @@ cti_add_service_(void *context, cti_reply_t callback, run_context_t client_queue
 }
 
 cti_status_t
-cti_remove_service_(void *context, cti_reply_t callback, run_context_t client_queue,
+cti_remove_service_(srp_server_t *UNUSED server, void *context, cti_reply_t callback, run_context_t client_queue,
                     uint32_t enterprise_number, const uint8_t *NONNULL service_data, size_t service_data_length,
                     const char *file, int line)
 {
@@ -231,9 +231,9 @@ cti_remove_service_(void *context, cti_reply_t callback, run_context_t client_qu
 
 
 cti_status_t
-cti_add_prefix_(void *context, cti_reply_t callback, run_context_t client_queue,
+cti_add_prefix_(srp_server_t *UNUSED server, void *context, cti_reply_t callback, run_context_t client_queue,
                 struct in6_addr *prefix, int prefix_length, bool on_mesh, bool preferred, bool slaac, bool stable,
-                const char *file, int line)
+                int priority, const char *file, int line)
 {
     cti_callback_t app_callback;
     int ret;
@@ -266,8 +266,9 @@ cti_add_prefix_(void *context, cti_reply_t callback, run_context_t client_queue,
 }
 
 cti_status_t
-cti_remove_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                   struct in6_addr *NONNULL prefix, int prefix_length, const char *file, int line)
+cti_remove_prefix_(srp_server_t *UNUSED server, void *NULLABLE context, cti_reply_t NONNULL callback,
+                   run_context_t NULLABLE client_queue, struct in6_addr *NONNULL prefix, int prefix_length,
+                   const char *file, int line)
 {
     cti_callback_t app_callback;
     int ret;
@@ -296,7 +297,7 @@ cti_remove_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_con
 
 // For configuration comments, we return success/failure.
 static void
-cti_internal_tunnel_reply_callback(cti_connection_t conn_ref, void *tunnel_name, cti_status_t status)
+cti_internal_string_property_reply(cti_connection_t conn_ref, void *tunnel_name, cti_status_t status)
 {
     cti_tunnel_reply_t callback;
     INFO("conn_ref = %p name = %s", conn_ref,
@@ -310,14 +311,14 @@ cti_internal_tunnel_reply_callback(cti_connection_t conn_ref, void *tunnel_name,
 }
 
 cti_status_t
-cti_get_tunnel_name_(void *NULLABLE context, cti_tunnel_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                     const char *file, int line)
+cti_get_tunnel_name_(srp_server_t *UNUSED server, void *NULLABLE context, cti_string_property_reply_t NONNULL callback,
+                     run_context_t NULLABLE client_queue, const char *file, int line)
 {
     cti_callback_t app_callback;
-    app_callback.tunnel_reply = callback;
+    app_callback.string_property_reply = callback;
     int ret;
     cti_connection_t conn_ref;
-    ret = cti_connection_create(context, app_callback, cti_internal_tunnel_reply_callback, &conn_ref);
+    ret = cti_connection_create(context, app_callback, cti_internal_string_property_reply, &conn_ref);
     if (ret == kCTIStatus_NoError) {
         if (cti_connection_message_create(conn_ref, kCTIMessageType_GetTunnelName, 0))
         {
@@ -333,6 +334,7 @@ cti_get_tunnel_name_(void *NULLABLE context, cti_tunnel_reply_t NONNULL callback
     }
     return ret;
 }
+
 
 // For event comamnds, we return failure and close; on success, we just wait for events to flow and return those.
 static void
@@ -352,8 +354,8 @@ cti_internal_state_event_callback(cti_connection_t conn_ref, void *UNUSED object
 }
 
 cti_status_t
-cti_get_state_(cti_connection_t *ref, void *NULLABLE context, cti_state_reply_t NONNULL callback,
-               run_context_t NULLABLE client_queue, const char *file, int line)
+cti_get_state_(srp_server_t *UNUSED server, cti_connection_t *ref, void *NULLABLE context,
+               cti_state_reply_t NONNULL callback, run_context_t NULLABLE client_queue, const char *file, int line)
 {
     cti_callback_t app_callback;
     app_callback.state_reply = callback;
@@ -418,7 +420,7 @@ cti_get_uint64_property(cti_connection_t *ref, void *NULLABLE context, cti_uint6
 }
 
 cti_status_t
-cti_get_partition_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+cti_get_partition_id_(srp_server_t *UNUSED server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
                       cti_uint64_property_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                       const char *NONNULL file, int line)
 {
@@ -426,7 +428,7 @@ cti_get_partition_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE co
 }
 
 cti_status_t
-cti_get_extended_pan_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+cti_get_extended_pan_id_(srp_server_t *UNUSED server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
                          cti_uint64_property_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                          const char *NONNULL file, int line)
 {
@@ -451,7 +453,8 @@ cti_internal_node_type_event_callback(cti_connection_t conn_ref, void *UNUSED ob
 }
 
 cti_status_t
-cti_get_network_node_type_(cti_connection_t *ref, void *NULLABLE context, cti_network_node_type_reply_t NONNULL callback,
+cti_get_network_node_type_(srp_server_t *UNUSED server, cti_connection_t *ref, void *NULLABLE context,
+                           cti_network_node_type_reply_t NONNULL callback,
                            run_context_t NULLABLE client_queue, const char *file, int line)
 {
     cti_callback_t app_callback;
@@ -480,6 +483,9 @@ cti_service_finalize(cti_service_t *service)
     if (service->server != NULL) {
         free(service->server);
     }
+    if (service->service != NULL) {
+        free(service->service);
+    }
     free(service);
 }
 
@@ -491,7 +497,7 @@ cti_service_vec_finalize(cti_service_vec_t *services)
     if (services->services != NULL) {
         for (i = 0; i < services->num; i++) {
             if (services->services[i] != NULL) {
-                RELEASE_HERE(services->services[i], cti_service_finalize);
+                RELEASE_HERE(services->services[i], cti_service);
             }
         }
         free(services->services);
@@ -512,7 +518,7 @@ cti_service_vec_create_(size_t num_services, const char *file, int line)
             }
         }
         services->num = num_services;
-        RETAIN(services);
+        RETAIN(services, cti_service_vec);
     }
     return services;
 }
@@ -520,22 +526,27 @@ cti_service_vec_create_(size_t num_services, const char *file, int line)
 void
 cti_service_vec_release_(cti_service_vec_t *services, const char *file, int line)
 {
-    RELEASE(services, cti_service_vec_finalize);
+    RELEASE(services, cti_service_vec);
 }
 
 cti_service_t *
-cti_service_create_(uint64_t enterprise_number, uint16_t service_type, uint16_t service_version,
-                    uint8_t *server, size_t server_length, int flags, const char *file, int line)
+cti_service_create_(uint64_t enterprise_number, uint16_t rloc16, uint16_t service_type,
+                    uint16_t service_version, uint8_t *service_data, size_t service_length,
+                    uint8_t *server, size_t server_length, uint16_t service_id, int flags, const char *file, int line)
 {
     cti_service_t *service = calloc(1, sizeof(*service));
     if (service != NULL) {
         service->enterprise_number = enterprise_number;
         service->service_type = service_type;
         service->service_version = service_version;
+        service->rloc16 = rloc16;
+        service->service = service_data;
+        service->service_length = service_length;
         service->server = server;
         service->server_length = server_length;
+        service->service_id = service_id;
         service->flags = flags;
-        RETAIN(service);
+        RETAIN(service, cti_service);
     }
     return service;
 }
@@ -543,7 +554,7 @@ cti_service_create_(uint64_t enterprise_number, uint16_t service_type, uint16_t 
 void
 cti_service_release_(cti_service_t *service, const char *file, int line)
 {
-    RELEASE(service, cti_service_finalize);
+    RELEASE(service, cti_service);
 }
 
 // For event comamnds, we return failure and close; on success, we just wait for events to flow and return those.
@@ -564,8 +575,9 @@ cti_internal_service_event_callback(cti_connection_t conn_ref, void *UNUSED obje
 }
 
 cti_status_t
-cti_get_service_list_(cti_connection_t *ref, void *NULLABLE context, cti_service_reply_t NONNULL callback,
-                      run_context_t NULLABLE client_queue, const char *file, int line)
+cti_get_service_list_(srp_server_t *UNUSED server, cti_connection_t *ref, void *NULLABLE context,
+                      cti_service_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
+                      const char *file, int line)
 {
     cti_callback_t app_callback;
     app_callback.service_reply = callback;
@@ -601,7 +613,7 @@ cti_prefix_vec_finalize(cti_prefix_vec_t *prefixes)
     if (prefixes->prefixes != NULL) {
         for (i = 0; i < prefixes->num; i++) {
             if (prefixes->prefixes[i] != NULL) {
-                RELEASE_HERE(prefixes->prefixes[i], cti_prefix_finalize);
+                RELEASE_HERE(prefixes->prefixes[i], cti_prefix);
             }
         }
         free(prefixes->prefixes);
@@ -622,7 +634,7 @@ cti_prefix_vec_create_(size_t num_prefixes, const char *file, int line)
             }
         }
         prefixes->num = num_prefixes;
-        RETAIN(prefixes);
+        RETAIN(prefixes, cti_prefix_vec);
     }
     return prefixes;
 }
@@ -630,11 +642,12 @@ cti_prefix_vec_create_(size_t num_prefixes, const char *file, int line)
 void
 cti_prefix_vec_release_(cti_prefix_vec_t *prefixes, const char *file, int line)
 {
-    RELEASE(prefixes, cti_prefix_vec_finalize);
+    RELEASE(prefixes, cti_prefix_vec);
 }
 
 cti_prefix_t *
-cti_prefix_create_(struct in6_addr *prefix, int prefix_length, int metric, int flags, const char *file, int line)
+cti_prefix_create_(struct in6_addr *prefix, int prefix_length, int metric, int flags, int rloc, bool stable, bool ncp,
+                   const char *file, int line)
 {
     cti_prefix_t *prefix_ret = calloc(1, sizeof(*prefix_ret));
     if (prefix != NULL) {
@@ -642,7 +655,10 @@ cti_prefix_create_(struct in6_addr *prefix, int prefix_length, int metric, int f
         prefix_ret->prefix_length = prefix_length;
         prefix_ret->metric = metric;
         prefix_ret->flags = flags;
-        RETAIN(prefix_ret);
+        prefix_ret->rloc = rloc;
+        prefix_ret->stable = stable;
+        prefix_ret->ncp = ncp;
+        RETAIN(prefix_ret, cti_prefix);
     }
     return prefix_ret;
 }
@@ -650,7 +666,7 @@ cti_prefix_create_(struct in6_addr *prefix, int prefix_length, int metric, int f
 void
 cti_prefix_release_(cti_prefix_t *prefix, const char *file, int line)
 {
-    RELEASE(prefix, cti_prefix_finalize);
+    RELEASE(prefix, cti_prefix);
 }
 
 // For event comamnds, we return failure and close; on success, we just wait for events to flow and return those.
@@ -671,8 +687,9 @@ cti_internal_prefix_event_callback(cti_connection_t conn_ref, void *UNUSED objec
 }
 
 cti_status_t
-cti_get_prefix_list_(cti_connection_t *ref, void *NULLABLE context, cti_prefix_reply_t NONNULL callback,
-                     run_context_t NULLABLE client_queue, const char *file, int line)
+cti_get_prefix_list_(srp_server_t *UNUSED server, cti_connection_t *ref, void *NULLABLE context,
+                     cti_prefix_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
+                     const char *file, int line)
 {
     cti_callback_t app_callback;
     app_callback.prefix_reply = callback;
@@ -693,6 +710,8 @@ cti_get_prefix_list_(cti_connection_t *ref, void *NULLABLE context, cti_prefix_r
     }
     return ret;
 }
+
+
 
 cti_status_t
 cti_events_discontinue(cti_connection_t connection)
@@ -846,7 +865,7 @@ cti_prefix_event_parse(cti_connection_t connection)
                 cti_prefix_vec_release(vec);
                 return;
             }
-            memcpy(prefix_addr, prefix_data, prefix_data_length);
+            in6prefix_copy_from_data(prefix_addr, prefix_data, prefix_data_length);
             free(prefix_data);
             cti_prefix_t *prefix = cti_prefix_create(prefix_addr, prefix_length, 0, flags);
             if (prefix == NULL) {

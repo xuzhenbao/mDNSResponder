@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -4619,16 +4619,6 @@ mDNSlocal void uDNS_HandleLLQState(mDNS *const NONNULL m, DNSQuestion *const NON
                 fallBackToLLQPoll = mDNStrue;
             }
             break;
-#else // MDNSRESPONDER_SUPPORTS(COMMON, DNS_PUSH)
-        // These are never reached without DNS Push support.
-        case LLQ_DNSPush_ServerDiscovery:
-        case LLQ_DNSPush_Connecting:
-        case LLQ_DNSPush_Established:
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT,
-                "[Q%u] Question is in DNS push state but DNS push is not supported - "
-                "qname: " PRI_DM_NAME ", qtype: " PUB_S ".", mDNSVal16(q->TargetQID), DM_NAME_PARAM(&q->qname),
-                DNSTypeName(q->qtype));
-            break;
 #endif // MDNSRESPONDER_SUPPORTS(COMMON, DNS_PUSH)
 #if MDNSRESPONDER_SUPPORTS(COMMON, DNS_LLQ)
         case LLQ_InitialRequest:   startLLQHandshake(m, q); break;
@@ -4645,6 +4635,17 @@ mDNSlocal void uDNS_HandleLLQState(mDNS *const NONNULL m, DNSQuestion *const NON
             break;
         case LLQ_Invalid:          break;
 #endif // MDNSRESPONDER_SUPPORTS(COMMON, DNS_LLQ)
+#if !MDNSRESPONDER_SUPPORTS(COMMON, DNS_PUSH)
+        // These are never reached without DNS Push support.
+        case LLQ_DNSPush_ServerDiscovery:
+        case LLQ_DNSPush_Connecting:
+        case LLQ_DNSPush_Established:
+            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT,
+                "[Q%u] Question is in DNS push state but DNS push is not supported - "
+                "qname: " PRI_DM_NAME ", qtype: " PUB_S ".", mDNSVal16(q->TargetQID), DM_NAME_PARAM(&q->qname),
+                DNSTypeName(q->qtype));
+            break;
+#endif // !MDNSRESPONDER_SUPPORTS(COMMON, DNS_PUSH)
     }
 
     if (fallBackToLLQPoll)
@@ -5687,13 +5688,6 @@ mDNSexport domainname  *uDNS_GetNextSearchDomain(mDNSInterfaceID InterfaceID, in
         if (labels > 0)
         {
             const domainname *d = SkipLeadingLabels(&p->domain, labels - 1);
-            if (SameDomainLabel(d->c, (const mDNSu8 *)"\x4" "arpa"))
-            {
-                LogInfo("uDNS_GetNextSearchDomain: skipping search domain %##s, InterfaceID %p", p->domain.c, p->InterfaceID);
-                (*searchIndex)++;
-                p = p->next;
-                continue;
-            }
             if (ignoreDotLocal && SameDomainLabel(d->c, (const mDNSu8 *)"\x5" "local"))
             {
                 LogInfo("uDNS_GetNextSearchDomain: skipping local domain %##s, InterfaceID %p", p->domain.c, p->InterfaceID);
@@ -5922,7 +5916,10 @@ mDNSlocal void DNSPushProcessResponse(mDNS *const m, const DNSMessage *const msg
 
         // Use the DNS Server we remember from the question that created this DNS Push server structure.
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-		mdns_replace(&mrr->dnsservice, server->dnsservice);
+        if (mrr->metadata)
+        {
+            mdns_cache_metadata_set_dns_service(mrr->metadata, server->dnsservice);
+        }
 #else
         mrr->rDNSServer = server->qDNSServer;
 #endif
@@ -5963,7 +5960,7 @@ mDNSlocal void DNSPushProcessResponses(mDNS *const m, const DNSMessage *const ms
     const mDNSu8 *ptr = firstAnswer;
     mDNSIPPort port;
     port.NotAnInteger = 0;
-    ResourceRecord *mrr = &m->rec.r.resrec;
+    ResourceRecord *const mrr = &m->rec.r.resrec;
 
     // Validate the contents of the message
     // XXX Right now this code will happily parse all the valid data and then hit invalid data
@@ -5971,6 +5968,11 @@ mDNSlocal void DNSPushProcessResponses(mDNS *const m, const DNSMessage *const ms
     // XXX what about source validation?   Like, if we have a VPN, are we safe?   I think yes, but let's think about it.
     while ((ptr = GetLargeResourceRecord(m, msg, ptr, end, mDNSNULL, kDNSRecordTypePacketAns, &m->rec)))
     {
+    #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
+        mdns_forget(&mrr->metadata);
+        mrr->metadata = mdns_cache_metadata_create();
+    #endif
+
         int gotOne = 0;
         for (q = m->Questions; q; q = q->next)
         {
@@ -6006,6 +6008,11 @@ mDNSlocal void DNSPushProcessResponses(mDNS *const m, const DNSMessage *const ms
         }
         mrr->RecordType = 0;     // Clear RecordType to show we're not still using it
     }
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
+    // Release the temporary metadata that is already retained by the newly added RR.
+    mdns_forget(&mrr->metadata);
+#endif
 }
 
 static void
@@ -6959,6 +6966,17 @@ mDNSexport void UnsubscribeQuestionFromDNSPushServer(mDNS *const NONNULL m, DNSQ
 
     if (server == mDNSNULL || dso == mDNSNULL)
     {
+        // In theory, this should never happen because any outstanding query should have a DSO connection and a DSO
+        // server associated with it. However, bug report shows that some outstanding queries will have dangling
+        // question pointer which lead to user-after-free crash. Therefore, this function is called to scan through
+        // any active DSO query to reset the possible dangling pointer unconditionally, to avoid crash.
+        const uint32_t reset_count = dso_connections_reset_outstanding_query_context(q);
+        if (reset_count)
+        {
+            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR, "[Q%u] Question is not associated with any DSO "
+                "connection, but DSO connection(s) have outstanding reference to it, resetting the reference - "
+                "reset_count: %u", qid, reset_count);
+        }
         goto exit;
     }
 

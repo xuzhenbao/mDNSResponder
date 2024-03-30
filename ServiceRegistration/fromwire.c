@@ -636,6 +636,9 @@ dns_message_free(dns_message_t *message)
     if (message->sets) {                                \
         for (unsigned i = 0; i < message->count; i++) { \
             dns_rr_t *set = &message->sets[i];          \
+            if (set->type == dns_invalid_rr) {          \
+                continue;                               \
+            }                                           \
             if (set->name) {                            \
                 dns_name_free(set->name);               \
             }                                           \

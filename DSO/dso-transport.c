@@ -1,6 +1,6 @@
 /* dso-transport.c
  *
- * Copyright (c) 2018-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,7 +41,6 @@
 #include "mDNSEmbeddedAPI.h"
 #include "dso.h"
 #include "dso-transport.h"
-#include "mdns_strict.h"
 #include "DebugServices.h"      // For check_compile_time_code().
 #include "mDNSDebug.h"
 #include "misc_utilities.h"     // For mDNSAddr_from_sockaddr().
@@ -55,6 +54,8 @@
 // MacOSX.
 #include "mDNSMacOSX.h"
 #endif
+
+#include "mdns_strict.h"
 
 extern mDNS mDNSStorage;
 
@@ -117,11 +118,11 @@ dso_transport_finalize(dso_transport_t *transport, const char *whence)
 
     if (transport->connection != NULL) {
 #ifdef DSO_USES_NETWORK_FRAMEWORK
-        nw_release(transport->connection);
+        MDNS_DISPOSE_NW(transport->connection);
 #else
         mDNSPlatformTCPCloseConnection(transport->connection);
-#endif
         transport->connection = NULL;
+#endif
     } else {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
             "Finalizing a dso_transport_t with no corresponding underlying connection - transport: %p.", transport);
@@ -175,6 +176,12 @@ int32_t dso_transport_idle(void *context, int32_t now_in, int32_t next_timer_eve
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[DSOC%u] dso_connect_state_t finalizing - "
             "dso_connect: %p, hostname: " PRI_S ", dso_connect->context: %p.", cs->serial, cs, cs->hostname,
             cs->context);
+        // If this connect state object is released before we get canceled event for the underlying nw_connection_t,
+        // we need to release the reference it holds. The last reference of this nw_connection_t will be released when
+        // canceled event is delivered.
+    #if defined(DSO_USES_NETWORK_FRAMEWORK)
+        MDNS_DISPOSE_NW(cs->connection);
+    #endif
         if (cs->dso_connect_context_callback != NULL) {
             cs->dso_connect_context_callback(dso_connect_life_cycle_free, cs->context, cs);
         }
@@ -1080,8 +1087,6 @@ dso_connection_succeeded(dso_connect_state_t *cs)
     dso_transport_t *transport =
         dso_transport_create(cs->connection, false, cs->context, cs->dso_context_callback,
             cs->max_outstanding_queries, cs->outbuf_size, cs->hostname, cs->callback, cs->dso);
-    nw_release(cs->connection);
-    cs->connection = NULL;
     if (transport == NULL) {
         // If dso_transport_create fails, there's no point in continuing to try to connect to new
         // addresses
@@ -1213,6 +1218,9 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
     if (parameters == NULL) {
         goto exit;
     }
+
+    // connection now holds a reference to the nw_connection.
+    // It holds the reference during the entire life time of the nw_connection_t, until it is canceled.
     connection = nw_connection_create(endpoint, parameters);
     if (connection == NULL) {
         goto exit;
@@ -1233,7 +1241,7 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
                 // If we cannot find dso_connect_state_t in the system's list, it means that we have already canceled it
                 // in dso_connect_state_cancel() including the corresponding nw_connection_t. Therefore, there is no
                 // need to cancel the nw_connection_t again.
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT, "[DSOC%u->C%" PRIu64
+                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[DSOC%u->C%" PRIu64
                           "] No connect state found - nw_connection_state_t: " PUB_S ".",
                           serial, nw_connection_id, nw_connection_state_to_string(state));
             } else {
@@ -1273,10 +1281,7 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
                         "[DSOC%u->C%" PRIu64 "] Connection to server: " PRI_IP_ADDR ":%u canceled.",
                         serial, nw_connection_id, &addr, mDNSVal16(port));
                     if (ncs->transport) {
-                        if (ncs->transport->connection) {
-                            nw_release(ncs->transport->connection);
-                            ncs->transport->connection = NULL;
-                        }
+                        MDNS_DISPOSE_NW(ncs->transport->connection);
                         // If there is a dso state on the connect state and it is referencing this transport,
                         // remove the reference.
                         if (ncs->dso != NULL && ncs->dso->transport == ncs->transport) {
@@ -1289,10 +1294,7 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
                         dso_transport_finalize(ncs->transport, "dso_connect_internal");
                         ncs->transport = NULL;
                     }
-                    if (ncs->connection) {
-                        nw_release(ncs->connection);
-                    }
-                    ncs->connection = NULL;
+                    MDNS_DISPOSE_NW(ncs->connection);
                     if (ncs->connecting) {
                         ncs->connecting = mDNSfalse;
                         // If we get here and cs exists, we are still trying to connect.   So do the next step.
@@ -1311,12 +1313,21 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
                     }
                 }
             }
+
+            // Release the nw_connection_t reference held by `connection`, the nw_release here always releases the last
+            // reference we have for the nw_connection_t.
+            if ((state == nw_connection_state_cancelled) && connection) {
+                nw_release(connection);
+            }
+
             KQueueUnlock("dso_connect_internal state change handler");
         });
     nw_connection_start(connection);
     cs->connecting = mDNStrue;
+
+    // Connect state now also holds a reference to the nw_connection.
     cs->connection = connection;
-    connection = NULL;
+    nw_retain(cs->connection);
 
     // We finished setting up the connection with the first address in the list, so remove it from the list.
     cs->next_addr = dest_addr->next;
@@ -1324,7 +1335,6 @@ static void dso_connect_internal(dso_connect_state_t *cs, mDNSBool reconnecting)
 exit:
     MDNS_DISPOSE_NW(endpoint);
     MDNS_DISPOSE_NW(parameters);
-    MDNS_DISPOSE_NW(connection);
 }
 
 #else

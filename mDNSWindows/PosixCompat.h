@@ -42,10 +42,6 @@ extern char*
 if_indextoname( unsigned ifindex, char * ifname );
 
 
-extern int
-inet_pton( int family, const char * addr, void * dst );
-
-
 /* 
  * Posix time compatibility
  */

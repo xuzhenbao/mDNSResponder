@@ -1,6 +1,6 @@
 /* srp-replication.h
  *
- * Copyright (c) 2020-2022 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Computer, Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,10 +60,10 @@ enum srpl_state {
     srpl_state_connecting,
 
     // Session establishment
-    srpl_state_server_id_send,
-    srpl_state_server_id_response_wait,
-    srpl_state_server_id_evaluate,
-    srpl_state_server_id_regenerate,
+    srpl_state_session_send,
+    srpl_state_session_response_wait,
+    srpl_state_session_evaluate,
+    srpl_state_sync_wait,
 
     // Requesting and getting remote candidate list
     srpl_state_send_candidates_send,
@@ -123,9 +123,11 @@ enum srpl_event_type {
     srpl_event_host_response_received,
     srpl_event_session_message_received,
     srpl_event_send_candidates_message_received,
+    srpl_event_do_sync,
 };
 enum srpl_candidate_disposition { srpl_candidate_yes, srpl_candidate_no, srpl_candidate_conflict };
 
+typedef struct srpl_instance_service srpl_instance_service_t;
 typedef struct srpl_connection srpl_connection_t;
 typedef struct srpl_instance srpl_instance_t;
 typedef struct srpl_domain srpl_domain_t;
@@ -140,6 +142,7 @@ typedef struct srpl_srp_client_queue_entry srpl_srp_client_queue_entry_t;
 typedef struct srpl_srp_client_update_result srpl_srp_client_update_result_t;
 typedef struct srpl_host_update srpl_host_update_t;
 typedef struct srpl_advertise_finished_result srpl_advertise_finished_result_t;
+typedef struct srpl_session srpl_session_t;
 
 typedef void (*address_change_callback_t)(void *NULLABLE context, addr_t *NULLABLE address, bool added, int err);
 typedef void (*address_query_cancel_callback_t)(void *NULLABLE context);
@@ -178,10 +181,21 @@ struct srpl_advertise_finished_result {
     int rcode;
 };
 
+// 1: local > remote
+// 0: local == remote
+// -1: local < remote
+// -2: undefined result.
+enum {
+    EQUAL = 0,
+    LOCAL_LARGER = 1,
+    LOCAL_SMALLER = -1,
+    UNDEFINED = -2,
+};
+
 typedef enum {
     srpl_event_content_type_none = 0,
     srpl_event_content_type_address,
-    srpl_event_content_type_server_id,
+    srpl_event_content_type_session,
     srpl_event_content_type_candidate,
     srpl_event_content_type_rcode,
     srpl_event_content_type_candidate_disposition,
@@ -198,12 +212,21 @@ struct srpl_srp_client_update_result {
 };
 
 struct srpl_host_update {
-    message_t *NULLABLE message;
+    message_t *NULLABLE *NULLABLE messages;
+    intptr_t orig_buffer;
     uint64_t server_stable_id;
-    uint32_t update_offset;
-    time_t update_time;
     dns_name_t *NULLABLE hostname;
+    uint32_t update_offset;
+    int num_messages, max_messages, messages_processed;
     int rcode;
+    unsigned num_bytes;
+};
+
+struct srpl_session {
+    uint64_t partner_id;
+    dns_name_t *NULLABLE domain_name;
+    uint16_t remote_version;
+    bool new_partner;
 };
 
 struct srpl_event {
@@ -211,7 +234,7 @@ struct srpl_event {
     srpl_event_content_type_t content_type;
     union {
         addr_t address;
-        uint64_t server_id;
+        srpl_session_t session;
         srpl_srp_client_update_result_t client_result;
         srpl_candidate_t *NULLABLE candidate;
         int rcode;
@@ -232,7 +255,7 @@ struct srpl_srp_client_queue_entry {
 
 struct srpl_connection {
     int ref_count;
-    uint64_t remote_server_id;
+    uint64_t remote_partner_id;
     char *NONNULL name;
     char *NONNULL state_name;
     comm_t *NULLABLE connection;
@@ -245,52 +268,91 @@ struct srpl_connection {
     adv_host_t *NULLABLE *NULLABLE candidates;
     srpl_host_update_t stashed_host;
     srpl_srp_client_queue_entry_t *NULLABLE client_update_queue;
+    wakeup_t *NULLABLE keepalive_send_wakeup;
+    wakeup_t *NULLABLE keepalive_receive_wakeup;
+    time_t last_message_sent;
+    time_t last_message_received;
     int num_candidates;
     int current_candidate;
     int retry_delay; // How long to send when we send a retry_delay message
+    int keepalive_interval;
     srpl_state_t state, next_state;
+    uint32_t variation_mask; // Protocol variations to support pre-standard TLV formats
     bool is_server;
+    bool new_partner;
     bool database_synchronized;
     bool candidates_not_generated; // If this is true, we haven't generated a candidates list yet.
 };
 
-struct srpl_instance {
+struct srpl_instance_service {
     int ref_count;
-    dnssd_txn_t *NULLABLE resolve_txn;
-    srpl_instance_t *NULLABLE next;
+    srpl_instance_t *NULLABLE instance;
+    dnssd_txn_t *NULLABLE txt_txn;
+    dnssd_txn_t *NULLABLE srv_txn;
+    srpl_instance_service_t *NULLABLE next;
     srpl_domain_t *NONNULL domain;
-    char *NULLABLE name;
-    char *NULLABLE instance_name;
-    srpl_connection_t *NULLABLE incoming, *NULLABLE outgoing;
-    address_query_t *NULLABLE address_query;
+    wakeup_t *NULLABLE resolve_wakeup;
     wakeup_t *NULLABLE discontinue_timeout;
-    wakeup_t *NULLABLE reconnect_timeout;
-    uint64_t server_id;
-    uint16_t outgoing_port;
+    uint8_t *NULLABLE txt_rdata;
+    uint8_t *NULLABLE srv_rdata;
+    uint8_t *NULLABLE ptr_rdata;
+    uint8_t *NULLABLE addr_rdata;
+    char *NULLABLE host_name;
+    char *NULLABLE full_service_name;
+    address_query_t *NULLABLE address_query;
     int num_copies;     // Tracks adds and deletes from the DNSServiceBrowse for this instance.
+    uint32_t ifindex;
+    uint16_t outgoing_port;
+    uint16_t txt_length;
+    uint16_t srv_length;
+    uint16_t ptr_length;
+    bool have_srv_record, have_txt_record;
+    // True if we've already started a resolve for this instance, to prevent starting a second resolve if the instance
+    // is seen on more than one interface.
+    bool resolve_started;
     bool discontinuing; // True if we are in the process of discontinuing this instance.
-    bool is_me;
-    bool have_server_id;
+    bool got_new_info; // True if we have received new information since the last time we did a reconfirm.
 };
 
-struct srpl_domain {
+struct srpl_instance {
     int ref_count;
+    srpl_instance_t *NULLABLE next;
+    srpl_domain_t *NONNULL domain;
+    srpl_connection_t *NULLABLE connection;
+    wakeup_t *NULLABLE reconnect_timeout;
+    char *NULLABLE instance_name;
+    srpl_instance_service_t *NONNULL services;
+    uint64_t partner_id;
+    uint64_t dataset_id;
+    bool have_partner_id;
+    bool have_dataset_id;
+    bool sync_to_join;  // True if sync with the remote partner is required to join the replication
+    bool is_me;
+    bool discontinuing; // True if we are in the process of discontinuing this instance.
+    bool unmatched; // True if this is an incoming connection that hasn't been associated with a real instance.
+};
+
+typedef enum {
+    SRPL_OPSTATE_STARTUP = 0,
+    SRPL_OPSTATE_ROUTINE = 1
+} srpl_opstate_t;
+
+struct srpl_domain {
+    uint64_t partner_id; // SRP replication partner ID
+    uint64_t dataset_id;
+    bool have_dataset_id;
+    bool partner_discovery_pending;
+    int ref_count;
+    srpl_opstate_t srpl_opstate;
     srpl_domain_t *NULLABLE next;
     char *NONNULL name;
     srpl_instance_t *NULLABLE instances;
+    srpl_instance_service_t *NULLABLE unresolved_services;
     dnssd_txn_t *NULLABLE query;
     srp_server_t *NULLABLE server_state;
-};
-
-struct unclaimed_connection {
-    int ref_count;
-    unclaimed_connection_t *NULLABLE next;
-    wakeup_t *NULLABLE wakeup_timeout;
-    dso_state_t *NULLABLE dso;
-    message_t *NULLABLE message;
-    comm_t *NULLABLE connection;
-    srp_server_t *NULLABLE server_state;
-    addr_t address;
+    dnssd_txn_t *NULLABLE srpl_advertise_txn;
+    wakeup_t *NULLABLE srpl_register_wakeup;
+    wakeup_t *NULLABLE partner_discovery_timeout;
 };
 
 #define SRP_THREAD_DOMAIN "thread.home.arpa."
@@ -300,9 +362,17 @@ struct unclaimed_connection {
 
 
 #define SRPL_RETRY_DELAY_LENGTH        DSO_MESSAGE_MIN_LENGTH + sizeof(uint32_t)
-#define SRPL_SESSION_MESSAGE_LENGTH    DSO_MESSAGE_MIN_LENGTH + sizeof(uint64_t) // DSO header + 8 byte session ID
+#define SRPL_SESSION_MESSAGE_LENGTH    (DSO_MESSAGE_MIN_LENGTH +                  \
+                                        sizeof(uint64_t) +                        \
+                                        DNS_MAX_NAME_SIZE + DSO_TLV_HEADER_SIZE + \
+                                        DSO_TLV_HEADER_SIZE + sizeof(uint16_t)  + \
+                                        DSO_TLV_HEADER_SIZE + sizeof(uint16_t))
 #define SRPL_SEND_CANDIDATES_LENGTH    DSO_MESSAGE_MIN_LENGTH
 #define SRPL_CANDIDATE_MESSAGE_LENGTH  (DSO_MESSAGE_MIN_LENGTH + \
+                                        DNS_MAX_NAME_SIZE + DSO_TLV_HEADER_SIZE + \
+                                        sizeof(uint32_t) + DSO_TLV_HEADER_SIZE + \
+                                        sizeof(uint32_t) + DSO_TLV_HEADER_SIZE)
+#define SRPL_KEEPALIVE_MESSAGE_LENGTH  (DSO_MESSAGE_MIN_LENGTH + \
                                         DNS_MAX_NAME_SIZE + DSO_TLV_HEADER_SIZE + \
                                         sizeof(uint32_t) + DSO_TLV_HEADER_SIZE + \
                                         sizeof(uint32_t) + DSO_TLV_HEADER_SIZE)
@@ -315,9 +385,28 @@ struct unclaimed_connection {
 
 #define SRPL_UPDATE_JITTER_WINDOW 10
 
+#define MIN_PARTNER_DISCOVERY_INTERVAL 4000  // minimum partner discovery time interval in milliseconds
+#define MAX_PARTNER_DISCOVERY_INTERVAL 7500  // maximum partner discovery time interval in milliseconds
+#define PARTNER_DISCOVERY_INTERVAL_RANGE (MAX_PARTNER_DISCOVERY_INTERVAL - \
+                                          MIN_PARTNER_DISCOVERY_INTERVAL + 1)
+#define DEFAULT_KEEPALIVE_WAKEUP_EXPIRY (5 * 60 * 1000) // five minutes
+
+#define PARTNER_ID_BITS 64
+#define LOWER56_BIT_MASK 0xFFFFFFFFFFFFFFULL
+
+// SRP Replication protocol versioning
+#define SRPL_VERSION_MULTI_HOST_MESSAGE     1
+#define SRPL_VERSION_ANYCAST                2
+#define SRPL_CURRENT_VERSION                SRPL_VERSION_ANYCAST
+
+// Variation bits.
+#define SRPL_VARIATION_MULTI_HOST_MESSAGE   1
+#define SRPL_SUPPORTS(srpl_connection, variation) \
+    (((srpl_connection)->variation_mask & ~(variation)) != 0)
+
 // Exported functions...
-time_t srpl_time(void);
 void srpl_startup(srp_server_t *NONNULL srp_server);
+void srpl_shutdown(srp_server_t *NONNULL server_state);
 void srpl_disable(srp_server_t *NONNULL srp_server);
 void srpl_drop_srpl_connection(srp_server_t *NONNULL srp_server);
 void srpl_undrop_srpl_connection(srp_server_t *NONNULL srp_server);

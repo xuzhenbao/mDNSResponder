@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2022 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -162,7 +162,7 @@ exit:
 
 //**************************************************************************************************************
 
-mDNSexport mStatus mDNSHelperInit()
+mDNSexport mStatus mDNSHelperInit(void)
 {
     HelperQueue = dispatch_queue_create("com.apple.mDNSResponder.HelperQueue", NULL);
     if (HelperQueue == NULL)

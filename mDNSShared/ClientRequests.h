@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,12 @@
 #include "mDNSEmbeddedAPI.h"
 #include "dns_sd_internal.h"
 
-typedef void (*QueryRecordResultHandler)(mDNS *const m, DNSQuestion *question, const ResourceRecord *const answer, QC_result AddRecord,
-    DNSServiceErrorType error, void *context);
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+    #include <mdns/audit_token.h>
+#endif
+
+typedef void (*QueryRecordResultHandler)(mDNS *const m, DNSQuestion *question, const ResourceRecord *const answer,
+    mDNSBool expired, QC_result AddRecord, DNSServiceErrorType error, void *context);
 
 typedef struct
 {
@@ -44,11 +48,17 @@ typedef struct
     mDNSBool                    answered;               // True if the query was answered.
 #endif
     mDNSBool                    useAAAAFallback;        // If a AAAA question gets a negative answer, it's restarted as an A.
+    mDNSBool                    gotExpiredCNAME;        // True is an expired CNAME record was encountered.
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
     mDNSu16                     qtype;                  // Original QTYPE.
     mDNSBool                    useFailover;            // Use DNS service failover if applicable.
     mDNSBool                    failoverMode;           // Use DNS service failover immediately.
     mDNSBool                    prohibitEncryptedDNS;   // Prohibit use of encrypted DNS protocols.
+    mDNSu8                      resolverUUID[UUID_SIZE];// Resolver UUID to use with original QNAME.
+#endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+    mdns_audit_token_t          peerToken;
+    mdns_audit_token_t          delegatorToken;
 #endif
 
 }   QueryRecordOp;
@@ -61,12 +71,14 @@ typedef struct
     QueryRecordOp *     op6;            // Query record operation object for AAAA record.
 
 }   GetAddrInfoClientRequest;
+mdns_compile_time_max_size_check(GetAddrInfoClientRequest, 32);
 
 typedef struct
 {
     QueryRecordOp       op; // Query record operation object.
 
 }   QueryRecordClientRequest;
+mdns_compile_time_max_size_check(QueryRecordClientRequest, 792);
 
 typedef struct
 {
@@ -87,13 +99,14 @@ typedef struct
     mDNSBool                prohibitEncryptedDNS;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    const audit_token_t *   peerAuditToken;
-    const audit_token_t *   delegatorAuditToken;
+    mdns_audit_token_t      peerToken;
+    mdns_audit_token_t      delegatorToken;
     mDNSBool                isInAppBrowserRequest;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
     dnssd_log_privacy_level_t logPrivacyLevel;
 #endif
+    mDNSBool                persistWhenARecordsUnusable;
 
 }   GetAddrInfoClientRequestParams;
 
@@ -117,8 +130,8 @@ typedef struct
     mDNSBool                prohibitEncryptedDNS;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    const audit_token_t *   peerAuditToken;
-    const audit_token_t *   delegatorAuditToken;
+    mdns_audit_token_t      peerToken;
+    mdns_audit_token_t      delegatorToken;
     mDNSBool                isInAppBrowserRequest;
 #endif
     mDNSBool                useAAAAFallback;

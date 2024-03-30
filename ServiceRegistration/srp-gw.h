@@ -1,6 +1,6 @@
 /* srp-gw.c
  *
- * Copyright (c) 2019-2021 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2019-2022 Apple Computer, Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
  * Structure definitions for the Service Registration Protocol gateway.
  */
 
+#ifndef SRP_GW_H
+#define SRP_GW_H
 typedef struct subnet subnet_t;
 struct subnet {
     subnet_t *NULLABLE next;
@@ -113,7 +115,7 @@ struct update {
     size_t update_max;
     uint8_t fail_rcode;                           // rcode to return after deleting added service instances.
 };
-
+#endif  //SRP_GW_H
 // Local Variables:
 // mode: C
 // tab-width: 4

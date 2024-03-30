@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -218,8 +218,8 @@ extern int mDNS_McastTracingEnabled;
 extern int mDNS_DebugMode;          // If non-zero, LogMsg() writes to stderr instead of syslog
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-extern int gNumOfPrivateLogRedactionEnabledQueries;
-extern int gPrivateLogRedactionEnabled; // If true, LogRedact() will redact all private level logs. The content of state
+extern int gNumOfSensitiveLoggingEnabledQuestions;
+extern int gSensitiveLoggingEnabled; // If true, LogRedact() will redact all private level logs. The content of state
                                         // dump that is related to user's privacy will also be redacted.
 #endif
 
@@ -304,7 +304,7 @@ extern void freeL(const char *msg, void *x);
     #define LogRedact(CATEGORY, LEVEL, FORMAT, ...)                                         \
         do                                                                                  \
         {                                                                                   \
-            if (!gPrivateLogRedactionEnabled)                                               \
+            if (!gSensitiveLoggingEnabled)                                               \
             {                                                                               \
                 os_log_with_type(CATEGORY, LEVEL, FORMAT, ## __VA_ARGS__);                  \
             }                                                                               \
@@ -339,6 +339,12 @@ extern void freeL(const char *msg, void *x);
 // that hashes cannot be correlated across processes or devices.
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    #define PRI_PREFIX "{sensitive, mask.hash}"
+#else
+    #define PRI_PREFIX
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
     #define PUB_S "%{public}s"
     #define PRI_S "%{sensitive, mask.hash}s"
 #else
@@ -355,6 +361,34 @@ extern void freeL(const char *msg, void *x);
 #endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    #define DNS_MSG_ID_FLAGS                                "%{mdns:dns.idflags}08lX"
+    #define DNS_MSG_ID_FLAGS_PARAM(HEADER, ID_AND_FLAGS)    ((unsigned long)(ID_AND_FLAGS))
+#else
+    #define DNS_MSG_ID_FLAGS                                "id: 0x%04X (%u), flags: 0x%04X"
+    #define DNS_MSG_ID_FLAGS_PARAM(HEADER, ID_AND_FLAGS)    mDNSVal16((HEADER).id), mDNSVal16((HEADER).id), \
+                                                                ((HEADER).flags.b)
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    #define DNS_MSG_COUNTS                          "%{mdns:dns.counts}016llX"
+    #define DNS_MSG_COUNTS_PARAM(HEADER, COUNTS)    ((unsigned long long)(COUNTS))
+#else
+    #define DNS_MSG_COUNTS                          "counts: %u/%u/%u/%u"
+    #define DNS_MSG_COUNTS_PARAM(HEADER, COUNTS)    (HEADER).numQuestions, (HEADER).numAnswers, \
+                                                        (HEADER).numAuthorities, (HEADER).numAdditionals
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    #define MDNS_NAME_HASH_TYPE_BYTES \
+        "%{sensitive, mask.hash, mdnsresponder:mdns_name_hash_type_bytes}.*P"
+    #define MDNS_NAME_HASH_TYPE_BYTES_PARAM(BYTES, BYTES_LEN) BYTES_LEN, BYTES
+#else
+    // If os_log is not supported, there is no way to parse the name hash type bytes.
+    #define MDNS_NAME_HASH_TYPE_BYTES                           "%s"
+    #define MDNS_NAME_HASH_TYPE_BYTES_PARAM(BYTES, BYTES_LEN)   ""
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
     #define PUB_DNS_TYPE                "%{mdns:rrtype}d"
     #define DNS_TYPE_PARAM(type_value)  (type_value)
 #else
@@ -362,12 +396,30 @@ extern void freeL(const char *msg, void *x);
     #define DNS_TYPE_PARAM(type_value)  (DNSTypeName(type_value))
 #endif
 
+// Notes about using RMV rather than REMOVE:
+// Both "add" and "rmv" are three characters so that when the log is printed, the content will be aligned which is good
+// for log searching. For example:
+// DNSServiceBrowse(_test._tcp.local., PTR) RESULT ADD interface 1:   23 _test._tcp.local. PTR demo._test._tcp.local.
+// DNSServiceBrowse(_test._tcp.local., PTR) RESULT RMV interface 1:   23 _test._tcp.local. PTR demo._test._tcp.local.
+// is better than:
+// DNSServiceBrowse(_test._tcp.local., PTR) RESULT ADD interface 1:   23 _test._tcp.local. PTR demo._test._tcp.local.
+// DNSServiceBrowse(_test._tcp.local., PTR) RESULT REMOVE interface 1:   23 _test._tcp.local. PTR demo._test._tcp.local.
 #if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
     #define PUB_ADD_RMV                     "%{mdns:addrmv}d"
     #define ADD_RMV_PARAM(add_rmv_value)    (add_rmv_value)
 #else
     #define PUB_ADD_RMV                     PUB_S
     #define ADD_RMV_PARAM(add_rmv_value)    ((add_rmv_value) ? "add" : "rmv")
+#endif
+
+// Here we have the uppercase style so that it can be used to match the original mDNSResponder RESULT ADD/RMV all
+// uppercase.
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    #define PUB_ADD_RMV_U                   "%{mdns:addrmv_upper}d"
+    #define ADD_RMV_U_PARAM(add_rmv_value)  (add_rmv_value)
+#else
+    #define PUB_ADD_RMV_U                   PUB_S
+    #define ADD_RMV_U_PARAM(add_rmv_value)  ((add_rmv_value) ? "ADD" : "RMV")
 #endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)

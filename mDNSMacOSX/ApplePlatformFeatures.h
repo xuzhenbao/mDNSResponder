@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,24 +27,20 @@
     #define MDNSRESPONDER_SUPPORTS_APPLE_AUDIT_TOKEN                1
 #endif
 
+// Feature: Supports AWDL.
+// Radar:   <rdar://problem/110094554>
+// Enabled: Yes.
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_AWDL)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_AWDL                       1
+#endif
+
 // Feature: When flushing mDNS cache records received via AWDL, flush them immediately.
 // Radar:   <rdar://problem/91523757>
 // Enabled: Yes.
 
 #if !defined(MDNSRESPONDER_SUPPORTS_APPLE_AWDL_FAST_CACHE_FLUSH)
     #define MDNSRESPONDER_SUPPORTS_APPLE_AWDL_FAST_CACHE_FLUSH      1
-#endif
-
-// Feature: Background Assets Support
-// Radar:   <rdar://problem/91014171>
-// Enabled: iOS (non-reality) & macOS
-
-#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_BACKGROUND_ASSETS)
-    #if ((TARGET_OS_IOS ) || TARGET_OS_OSX)
-        #define MDNSRESPONDER_SUPPORTS_APPLE_BACKGROUND_ASSETS      1
-    #else
-        #define MDNSRESPONDER_SUPPORTS_APPLE_BACKGROUND_ASSETS      0
-    #endif
 #endif
 
 // Feature: Bonjour-On-Demand
@@ -116,6 +112,14 @@
     #define MDNSRESPONDER_SUPPORTS_APPLE_DNS_PROXY_DNS64            1
 #endif
 
+// Feature: DNS push support for Apple platforms
+// Radar:   <rdar://97679910>
+// Enabled: Yes.
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_DNS_PUSH)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_DNS_PUSH                   1
+#endif
+
 // Feature: DNS64 IPv6 synthesis.
 // Radar:   <rdar://problem/32297396>
 // Enabled: Yes, but only for iOS and macOS, which support the DNS proxy network extension.
@@ -170,6 +174,14 @@
     #define MDNSRESPONDER_SUPPORTS_APPLE_LOG_PRIVACY_LEVEL          1
 #endif
 
+// Feature: Exclude interface ap1 from in-NIC sleep proxy offloading.
+// Radar:   <rdar://109145606>
+// Enabled: On all Apple platforms
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_NO_NETWAKE_FOR_AP1)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_NO_NETWAKE_FOR_AP1         1
+#endif
+
 // Feature: No system wake for network access.
 // Radar:   <rdar://problem/28079659&55038229>
 // Enabled: Yes, but only for iOS and watchOS, which shouldn't act as sleep-proxy clients.
@@ -200,6 +212,14 @@
     #define MDNSRESPONDER_SUPPORTS_APPLE_OS_UNFAIR_LOCK             1
 #endif
 
+// Feature: Struct Padding Checks
+// Radar:   <rdar://108600998&108931243>
+// Enabled: Yes.
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_PADDING_CHECKS)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_PADDING_CHECKS             1
+#endif
+
 // Feature: Use mdns_querier objects for DNS transports.
 // Radar:   <rdar://problem/55746371>
 // Enabled: Yes.
@@ -222,6 +242,21 @@
 
 #if !defined(MDNSRESPONDER_SUPPORTS_APPLE_REACHABILITY_TRIGGER)
     #define MDNSRESPONDER_SUPPORTS_APPLE_REACHABILITY_TRIGGER       1
+#endif
+
+// Feature: Collect mDNS metrics to gauge multicast quality on attached networks.
+// Radar:   <rdar://108578861>
+// Enabled: Yes
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_RUNTIME_MDNS_METRICS)
+    #if !(defined(TARGET_OS_IOS) && defined(TARGET_OS_OSX) && defined(TARGET_OS_TV))
+        #error "Expected TARGET_OS_IOS && TARGET_OS_OSX && TARGET_OS_TV to be defined."
+    #endif
+    #if (TARGET_OS_IOS || TARGET_OS_OSX || TARGET_OS_TV)
+        #define MDNSRESPONDER_SUPPORTS_APPLE_RUNTIME_MDNS_METRICS   1
+    #else
+        #define MDNSRESPONDER_SUPPORTS_APPLE_RUNTIME_MDNS_METRICS   0
+    #endif
 #endif
 
 // Feature: Support more secure TSIG HMAC algorithms.
@@ -257,6 +292,14 @@
     #define MDNSRESPONDER_SUPPORTS_APPLE_SYMPTOMS                   1
 #endif
 
+// Feature: Tracker Debugging
+// Radar:   <rdar://problem/102778582>
+// Enabled: Yes. (depends on MDNSRESPONDER_SUPPORTS_APPLE_TRACKER_STATE)
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_TRACKER_DEBUGGING)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_TRACKER_DEBUGGING          1
+#endif
+
 // Feature: Tracker Reporting
 // Radar:   <rdar://problem/70222299>, <rdar://problem/74789124>
 // Enabled: Yes. (depends on MDNSRESPONDER_SUPPORTS_APPLE_AUDIT_TOKEN)
@@ -283,6 +326,22 @@
     #else
         #define MDNSRESPONDER_SUPPORTS_APPLE_TRUST_ENFORCEMENT      0
     #endif
+#endif
+
+// Feature: Unicast assist
+// Radar:   <rdar://problem/100207072>
+// Enabled: All
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_UNICAST_ASSIST)
+    #define MDNSRESPONDER_SUPPORTS_APPLE_UNICAST_ASSIST             1
+#endif
+
+// Feature: Unicast assist analytics
+// Radar:   <rdar://problem/103121312>
+// Enabled: All
+
+#if !defined(MDNSRESPONDER_SUPPORTS_APPLE_UNICAST_ASSIST_ANALYTICS)
+   #define MDNSRESPONDER_SUPPORTS_APPLE_UNICAST_ASSIST_ANALYTICS    1
 #endif
 
 // Feature: Unicast device discovery
@@ -338,7 +397,8 @@
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, CACHE_ANALYTICS) || \
     MDNSRESPONDER_SUPPORTS(APPLE, DNS_ANALYTICS)   || \
-    MDNSRESPONDER_SUPPORTS(APPLE, WAB_ANALYTICS)
+    MDNSRESPONDER_SUPPORTS(APPLE, WAB_ANALYTICS)   || \
+    MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
     #define MDNSRESPONDER_SUPPORTS_APPLE_ANALYTICS                  1
 #else
     #define MDNSRESPONDER_SUPPORTS_APPLE_ANALYTICS                  0
@@ -356,15 +416,36 @@
     #define MDNSRESPONDER_DISABLE_DNSSECv2_DEPENDENCY_CHECK_FOR_QUERIER  0
 #endif
 
+#if MDNSRESPONDER_SUPPORTS(APPLE, AWDL_FAST_CACHE_FLUSH)
+    #if !MDNSRESPONDER_SUPPORTS(APPLE, AWDL)
+        #error "MDNSRESPONDER_SUPPORTS(APPLE, AWDL_FAST_CACHE_FLUSH) depends on MDNSRESPONDER_SUPPORTS(APPLE, AWDL)."
+    #endif
+#endif
+
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
     #if !MDNSRESPONDER_SUPPORTS(APPLE, QUERIER) && !MDNSRESPONDER_DISABLE_DNSSECv2_DEPENDENCY_CHECK_FOR_QUERIER
         #error "MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2) depends on MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)."
     #endif
 #endif
 
+#if MDNSRESPONDER_SUPPORTS(APPLE, RANDOM_AWDL_HOSTNAME)
+    #if !MDNSRESPONDER_SUPPORTS(APPLE, AWDL)
+        #error "MDNSRESPONDER_SUPPORTS(APPLE, RANDOM_AWDL_HOSTNAME) depends on MDNSRESPONDER_SUPPORTS(APPLE, AWDL)."
+    #endif
+#endif
+
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
     #if !MDNSRESPONDER_SUPPORTS(APPLE, IPC_TLV)
         #error "MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS) depends on MDNSRESPONDER_SUPPORTS(APPLE, IPC_TLV)."
+    #endif
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    #if !MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+        #error "MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING) depends on MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)."
+    #endif
+    #if !MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_STATE)
+        #error "MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING) depends on MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_STATE)."
     #endif
 #endif
 
@@ -377,6 +458,12 @@
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
     #if !MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
         #error "MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT) depends on MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)."
+    #endif
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
+    #if !MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST)
+        #error "MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS) depends on MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST)."
     #endif
 #endif
 

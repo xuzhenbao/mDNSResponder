@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-file-style: "bsd"; c-basic-offset: 4; fill-column: 108; indent-tabs-mode: nil; -*-
  *
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,11 @@
 // Set mDNS_InstantiateInlines to tell mDNSEmbeddedAPI.h to instantiate inline functions, if necessary
 #define mDNS_InstantiateInlines 1
 #include "DNSCommon.h"
+#include "DebugServices.h"
+
+#if MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)
+#include "discover_resolver.h"
+#endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
 #include "dnssec_obj_rr_ds.h"   // For dnssec_obj_rr_ds_t.
@@ -29,6 +34,10 @@
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, OS_UNFAIR_LOCK)
 #include <os/lock.h> // For os_unfair_lock.
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+#include "system_utilities.h" //For is_apple_internal_build().
 #endif
 
 // Disable certain benign warnings with Microsoft compilers
@@ -312,6 +321,130 @@ mDNSlocal void PrintTypeBitmap(const mDNSu8 *bmap, int bitmaplen, char *const bu
     }
 }
 
+#define TXT_RECORD_SEPARATOR '|'
+
+mDNSlocal mDNSu8 mDNSLengthOfFirstUTF8Character(const mDNSu8 *bytes, mDNSu32 len);
+
+mDNSlocal const mDNSu8 *mDNSLocateFirstByteToEscape(const mDNSu8 *const bytes, const mDNSu32 bytesLen)
+{
+    for (const mDNSu8 *ptr = bytes, *const end = bytes + bytesLen; ptr < end;)
+    {
+        const mDNSu8 utf8CharacterLen = mDNSLengthOfFirstUTF8Character(ptr, (mDNSu32)(end - ptr));
+        if (utf8CharacterLen == 0)
+        {
+            return ptr;
+        }
+        else if (utf8CharacterLen == 1)
+        {
+            const char ch = *ptr;
+            if ((ch == '\\') || (ch == TXT_RECORD_SEPARATOR) || !mDNSIsPrintASCII(ch))
+            {
+                return ptr;
+            }
+        }
+        ptr += utf8CharacterLen;
+    }
+    return mDNSNULL;
+}
+
+mDNSlocal mDNSu32 putTXTRRCharacterString(char *const buffer, const mDNSu32 bufferLen, const mDNSu8 *const bytes,
+    const mDNSu32 bytesLen, const mDNSBool addSeparator, mDNSBool *const outTruncated)
+{
+    mDNSBool truncated = mDNSfalse;
+    mDNSu32 nWrites = 0;
+
+    if (addSeparator)
+    {
+        require_action_quiet(bufferLen > 1, exit, truncated = mDNStrue);
+        nWrites = mDNS_snprintf(buffer, bufferLen, "%c", TXT_RECORD_SEPARATOR);
+    }
+
+    for (const mDNSu8 *ptr = bytes, *const end = bytes + bytesLen; ptr < end;)
+    {
+        const mDNSu32 remainingLen = (mDNSu32)(end - ptr);
+        const mDNSu8 *const firstByteToEscape = mDNSLocateFirstByteToEscape(ptr, remainingLen);
+
+        // [ptr ... firstByteToEscape ... end]
+        // The bytes between [ptr, firstByteToEscape) are directly-printable.
+        const mDNSu32 normalBytesLenToPrint = (firstByteToEscape ? ((mDNSu32)(firstByteToEscape - ptr)) : remainingLen);
+        // Print UTF-8 characters in [ptr, firstByteToEscape).
+        if (normalBytesLenToPrint > 0)
+        {
+            const mDNSu32 currentNWrites = mDNS_snprintf(buffer + nWrites, bufferLen - nWrites, "%.*s",
+                normalBytesLenToPrint, ptr);
+            nWrites += currentNWrites;
+            require_action_quiet(currentNWrites == normalBytesLenToPrint, exit, truncated = mDNStrue);
+        }
+
+        if (firstByteToEscape)
+        {
+            // Print the *firstByteToEscape if it exists.
+            const mDNSu8 byteToEscape = *firstByteToEscape;
+
+            if ((byteToEscape == '\\') || (byteToEscape == TXT_RECORD_SEPARATOR))
+            {
+                // One escape character `\\`, one character being escaped, one `\0`.
+                require_action_quiet((bufferLen - nWrites) >= 3, exit, truncated = mDNStrue);
+                nWrites += mDNS_snprintf(buffer + nWrites, bufferLen - nWrites, "\\%c", byteToEscape);
+            }
+            else
+            {
+                // Two-byte hex prefix `\\x`, Two-byte hex value "HH" , one '\0'.
+                require_action_quiet((bufferLen - nWrites) >= 5, exit, truncated = mDNStrue);
+                nWrites += mDNS_snprintf(buffer + nWrites, bufferLen - nWrites, "\\x%02X", byteToEscape);
+            }
+            ptr = firstByteToEscape + 1;
+        }
+        else
+        {
+            // firstByteToEscape is NULL means that the remaining characters are printable.
+            ptr += remainingLen;
+        }
+    }
+
+exit:
+    if (outTruncated)
+    {
+        *outTruncated = truncated;
+    }
+    return nWrites;
+}
+
+mDNSlocal char *GetTXTRRDisplayString(const mDNSu8 *const rdata, const mDNSu32 rdLen, char *const buffer,
+    const mDNSu32 bufferLen)
+{
+    mDNSu32 currentLen = 0;
+#define RESERVED_BUFFER_LENGTH 5 // " <C>", " <T>" or " <M>" plus '\0'
+    require_quiet(bufferLen >= RESERVED_BUFFER_LENGTH, exit);
+
+    mDNSu32 adjustedBufferLen = bufferLen - RESERVED_BUFFER_LENGTH;
+
+    mDNSu32 characterStringLen;
+    mDNSBool malformed = mDNSfalse;
+    mDNSBool truncated = mDNSfalse;
+    mDNSBool addSeparator = mDNSfalse;
+    for (const mDNSu8 *src = rdata, *const end = rdata + rdLen; src < end && !truncated; src += characterStringLen)
+    {
+        characterStringLen = *src++;
+
+        if (((mDNSu32)(end - src)) < characterStringLen)
+        {
+            malformed = mDNStrue;
+            break;
+        }
+
+        currentLen += putTXTRRCharacterString((buffer + currentLen), (adjustedBufferLen - currentLen), src,
+            characterStringLen, addSeparator, &truncated);
+        addSeparator = mDNStrue;
+    }
+
+    const char statusCode = (malformed ? 'M' : (truncated ? 'T' : 'C'));
+    currentLen += mDNS_snprintf((buffer + currentLen), (bufferLen - currentLen), " <%c>", statusCode);
+
+exit:
+    return buffer + currentLen;
+}
+
 // Note slight bug: this code uses the rdlength from the ResourceRecord object, to display
 // the rdata from the RDataBody object. Sometimes this could be the wrong length -- but as
 // long as this routine is only used for debugging messages, it probably isn't a big problem.
@@ -338,28 +471,8 @@ mDNSexport char *GetRRDisplayString_rdb(const ResourceRecord *const rr, const RD
         break;
 
     case kDNSType_HINFO:    // Display this the same as TXT (show all constituent strings)
-    case kDNSType_TXT:  {
-        const mDNSu8 *t = rd->txt.c;
-        const mDNSu8 *const rdLimit = rd->data + rr->rdlength;
-        const char *separator = "";
-
-        while (t < rdLimit)
-        {
-            mDNSu32 characterStrLength = *t;
-            if (characterStrLength + 1 > (mDNSu32)(rdLimit - t)) // Character string goes out of boundary.
-            {
-                const mDNSu8 *const remainderStart = t + 1;
-                const mDNSu32 remainderLength = (mDNSu32)(rdLimit - remainderStart);
-                length += mDNS_snprintf(buffer + length, RemSpc, "%s%.*s<<OUT OF BOUNDARY CHARACTER STRING>>", separator,
-                    remainderLength, remainderStart);
-                (void)length; // Acknowledge "dead store" analyzer warning.
-                break;
-            }
-            length += mDNS_snprintf(buffer+length, RemSpc, "%s%.*s", separator, characterStrLength, t + 1);
-            separator = "¦";
-            t += 1 + characterStrLength;
-        }
-    }
+    case kDNSType_TXT:
+        GetTXTRRDisplayString(rd->txt.c, rr->rdlength, buffer + length, RemSpc);
         break;
 
     case kDNSType_AAAA: mDNS_snprintf(buffer+length, RemSpc, "%.16a", &rd->ipv6);       break;
@@ -557,6 +670,51 @@ mDNSexport mDNSu32 mDNSRandom(mDNSu32 max)      // Returns pseudo-random result 
     return ret;
 }
 
+// See <https://datatracker.ietf.org/doc/html/draft-eastlake-fnv-19#section-5>
+#define MDNSRESPONDER_FNV_32_BIT_OFFSET_BASIS   ((mDNSu32)0x811C9DC5)
+#define MDNSRESPONDER_FNV_32_BIT_PRIME          ((mDNSu32)0x01000193)
+
+mDNSexport mDNSu32 mDNS_NonCryptoHashUpdateBytes(const mDNSNonCryptoHash algorithm, const mDNSu32 previousHash,
+    const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    mDNSu32 hash = previousHash;
+
+    switch (algorithm) {
+        case mDNSNonCryptoHash_FNV1a:
+        {
+            for (mDNSu32 i = 0; i < len; i++)
+            {
+                hash ^= bytes[i];
+                hash *= MDNSRESPONDER_FNV_32_BIT_PRIME;
+            }
+        }
+            break;
+        case mDNSNonCryptoHash_SDBM: // See <http://www.cse.yorku.ca/~oz/hash.html>
+        {
+            for (mDNSu32 i = 0; i < len; i++)
+            {
+                // hash(i) = hash(i - 1) * 65599 + byte
+                hash = bytes[i] + (hash << 6) + (hash << 16) - hash;
+            }
+        }
+            break;
+    }
+
+    return hash;
+}
+
+mDNSexport mDNSu32 mDNS_NonCryptoHash(const mDNSNonCryptoHash algorithm, const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    switch (algorithm) {
+        case mDNSNonCryptoHash_FNV1a:
+            return mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, MDNSRESPONDER_FNV_32_BIT_OFFSET_BASIS, bytes,
+                len);
+        case mDNSNonCryptoHash_SDBM:
+            return mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, 0, bytes, len);
+    }
+    return 0;
+}
+
 mDNSexport mDNSBool mDNSSameAddress(const mDNSAddr *ip1, const mDNSAddr *ip2)
 {
     if (ip1->type == ip2->type)
@@ -579,6 +737,162 @@ mDNSexport mDNSBool mDNSAddrIsDNSMulticast(const mDNSAddr *ip)
     case mDNSAddrType_IPv6: return (mDNSBool)(mDNSSameIPv6Address(ip->ip.v6, AllDNSLinkGroup_v6.ip.v6));
     default: return(mDNSfalse);
     }
+}
+
+mDNSlocal mDNSBool mDNSByteInRange(const mDNSu8 byte, const mDNSu8 min, const mDNSu8 max)
+{
+    return ((byte >= min) && (byte <= max));
+}
+
+mDNSlocal mDNSBool mDNSisUTF8Tail(const mDNSu8 byte)
+{
+    // 0x80-0xBF is a common byte range for various well-formed UTF-8 byte sequences.
+    return mDNSByteInRange(byte, 0x80, 0xBF);
+}
+
+mDNSlocal mDNSBool mDNSBytesStartWithWellFormedUTF8OneByteSequence(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    // From Table 3-7. Well-Formed UTF-8 Byte Sequences of <https://www.unicode.org/versions/Unicode15.0.0/ch03.pdf>:
+    //
+    //     Code Points    | First Byte
+    //     ---------------+------------
+    //     U+0000..U+007F | 00..7F
+
+    return ((len >= 1) && mDNSByteInRange(bytes[0], 0x00, 0x7F));
+}
+
+mDNSlocal mDNSBool mDNSBytesStartWithWellFormedUTF8TwoByteSequence(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    // From Table 3-7. Well-Formed UTF-8 Byte Sequences of <https://www.unicode.org/versions/Unicode15.0.0/ch03.pdf>:
+    //
+    //     Code Points    | First Byte | Second Byte
+    //     ---------------+------------+-------------
+    //     U+0080..U+07FF | C2..DF     | 80..BF
+
+    return ((len >= 2) && mDNSByteInRange(bytes[0], 0xC2, 0xDF) && mDNSisUTF8Tail(bytes[1]));
+}
+
+mDNSlocal mDNSBool mDNSBytesStartWithWellFormedUTF8ThreeByteSequence(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    // From Table 3-7. Well-Formed UTF-8 Byte Sequences of <https://www.unicode.org/versions/Unicode15.0.0/ch03.pdf>:
+    //
+    //     Code Points    | First Byte | Second Byte | Third Byte
+    //     ---------------+------------+-------------+------------
+    //     U+0800..U+0FFF | E0         | A0..BF      | 80..BF
+    //     U+1000..U+CFFF | E1..EC     | 80..BF      | 80..BF
+    //     U+D000..U+D7FF | ED         | 80..9F      | 80..BF
+    //     U+E000..U+FFFF | EE..EF     | 80..BF      | 80..BF
+
+    if ((len >= 3) && mDNSisUTF8Tail(bytes[2]))
+    {
+        if (bytes[0] == 0xE0)
+        {
+            if (mDNSByteInRange(bytes[1], 0xA0, 0xBF))
+            {
+                return mDNStrue;
+            }
+        }
+        else if (mDNSByteInRange(bytes[0], 0xE1, 0xEC) || mDNSByteInRange(bytes[0], 0xEE, 0xEF))
+        {
+            if (mDNSisUTF8Tail(bytes[1]))
+            {
+                return mDNStrue;
+            }
+        }
+        else if (bytes[0] == 0xED)
+        {
+            if (mDNSByteInRange(bytes[1], 0x80, 0x9F))
+            {
+                return mDNStrue;
+            }
+        }
+    }
+    return mDNSfalse;
+}
+
+mDNSlocal mDNSBool mDNSBytesStartWithWellFormedUTF8FourByteSequence(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    // From Table 3-7. Well-Formed UTF-8 Byte Sequences of <https://www.unicode.org/versions/Unicode15.0.0/ch03.pdf>:
+    //
+    //     Code Points        | First Byte | Second Byte | Third Byte | Fourth Byte
+    //     -------------------+------------+-------------+------------+-------------
+    //     U+10000..U+3FFFF   | F0         | 90..BF      | 80..BF     | 80..BF
+    //     U+40000..U+FFFFF   | F1..F3     | 80..BF      | 80..BF     | 80..BF
+    //     U+100000..U+10FFFF | F4         | 80..8F      | 80..BF     | 80..BF
+
+    if ((len >= 4) && mDNSisUTF8Tail(bytes[2]) && mDNSisUTF8Tail(bytes[3]))
+    {
+        if (bytes[0] == 0xF0)
+        {
+            if (mDNSByteInRange(bytes[1], 0x90, 0xBF))
+            {
+                return mDNStrue;
+            }
+        }
+        else if (mDNSByteInRange(bytes[0], 0xF1, 0xF3))
+        {
+            if (mDNSisUTF8Tail(bytes[1]))
+            {
+                return mDNStrue;
+            }
+        }
+        else if (bytes[0] == 0xF4)
+        {
+            if (mDNSByteInRange(bytes[1], 0x80, 0x8F))
+            {
+                return mDNStrue;
+            }
+        }
+    }
+    return mDNSfalse;
+}
+
+mDNSlocal mDNSu8 mDNSLengthOfFirstUTF8Character(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    if (mDNSBytesStartWithWellFormedUTF8OneByteSequence(bytes, len))
+    {
+        return 1;
+    }
+    else if (mDNSBytesStartWithWellFormedUTF8TwoByteSequence(bytes, len))
+    {
+        return 2;
+    }
+    else if (mDNSBytesStartWithWellFormedUTF8ThreeByteSequence(bytes, len))
+    {
+        return 3;
+    }
+    else if (mDNSBytesStartWithWellFormedUTF8FourByteSequence(bytes, len))
+    {
+        return 4;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+mDNSlocal const mDNSu8 *mDNSLocateFirstMalformedUTF8Byte(const mDNSu8 *const bytes, const mDNSu32 byteLen)
+{
+    for (const mDNSu8 *ptr = bytes, *const end = bytes + byteLen; ptr < end;)
+    {
+        const mDNSu32 utf8CharacterLen = mDNSLengthOfFirstUTF8Character(ptr, (mDNSu32)(end - ptr));
+        if (utf8CharacterLen == 0)
+        {
+            return ptr;
+        }
+        ptr += utf8CharacterLen;
+    }
+    return mDNSNULL;
+}
+
+mDNSlocal mDNSBool mDNSAreUTF8Bytes(const mDNSu8 *const bytes, const mDNSu32 len)
+{
+    return (mDNSLocateFirstMalformedUTF8Byte(bytes, len) == mDNSNULL);
+}
+
+mDNSexport mDNSBool mDNSAreUTF8String(const char *const str)
+{
+    return mDNSAreUTF8Bytes((const mDNSu8 *)str, mDNSPlatformStrLen(str));
 }
 
 mDNSexport mDNSu32 GetEffectiveTTL(const uDNS_LLQType LLQType, mDNSu32 ttl)      // TTL in seconds
@@ -1357,7 +1671,7 @@ mDNSexport void mDNS_SetupResourceRecord(AuthRecord *rr, RData *RDataStorage, mD
     rr->resrec.rrclass           = kDNSClass_IN;
     rr->resrec.rroriginalttl     = ttl;
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-    rr->resrec.dnsservice        = NULL;
+    rr->resrec.metadata          = NULL;
 #else
     rr->resrec.rDNSServer        = mDNSNULL;
 #endif
@@ -1741,7 +2055,7 @@ mDNSlocal mDNSBool SameNameRecordAnswersQuestion(const ResourceRecord *const rr,
         LogMsg("SameNameRecordAnswersQuestion: ERROR!! called with LocalOnly ResourceRecord %p, Question %p", rr->InterfaceID, q->InterfaceID);
         return mDNSfalse;
     }
-    if (q->Suppressed)
+    if (q->Suppressed && (!q->ForceCNAMEFollows || (rr->rrtype != kDNSType_CNAME)))
         return mDNSfalse;
 
     if (rr->InterfaceID &&
@@ -1753,7 +2067,7 @@ mDNSlocal mDNSBool SameNameRecordAnswersQuestion(const ResourceRecord *const rr,
     {
         if (mDNSOpaque16IsZero(q->TargetQID)) return(mDNSfalse);
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-        if (rr->dnsservice != q->dnsservice) return(mDNSfalse);
+        if (mdns_cache_metadata_get_dns_service(rr->metadata) != q->dnsservice) return(mDNSfalse);
 #else
         const mDNSu32 idr = rr->rDNSServer ? rr->rDNSServer->resGroupID : 0;
         const mDNSu32 idq = q->qDNSServer ? q->qDNSServer->resGroupID : 0;
@@ -1934,7 +2248,7 @@ mDNSexport mDNSBool AnyTypeRecordAnswersQuestion(const AuthRecord *const ar, con
     if (!rr->InterfaceID)
     {
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-        if (rr->dnsservice != q->dnsservice) return(mDNSfalse);
+        if (mdns_cache_metadata_get_dns_service(rr->metadata) != q->dnsservice) return(mDNSfalse);
 #else
         const mDNSu32 idr = rr->rDNSServer ? rr->rDNSServer->resGroupID : 0;
         const mDNSu32 idq = q->qDNSServer ? q->qDNSServer->resGroupID : 0;
@@ -2425,13 +2739,27 @@ mDNSexport mDNSu8 *putRData(const DNSMessage *const msg, mDNSu8 *ptr, const mDNS
             for (i=wlen; i>0; i--) if (nsec[i-1]) break;
 
             ptr = putDomainNameAsLabels(msg, ptr, limit, rr->name);
-            if (!ptr) { LogInfo("putRData: Can't put name, Length %d, record %##s", limit - save, rr->name->c); return(mDNSNULL); }
+            if (!ptr)
+            {
+                goto mdns_nsec_exit;
+            }
             if (i)                          // Only put a block if at least one type exists for this name
             {
-                if (ptr + 2 + i > limit) { LogInfo("putRData: Can't put window, Length %d, i %d, record %##s", limit - ptr, i, rr->name->c); return(mDNSNULL); }
+                if (ptr + 2 + i > limit)
+                {
+                    ptr = mDNSNULL;
+                    goto mdns_nsec_exit;
+                }
                 *ptr++ = 0;
                 *ptr++ = (mDNSu8)i;
                 for (j=0; j<i; j++) *ptr++ = nsec[j];
+            }
+        mdns_nsec_exit:
+            if (!ptr)
+            {
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEBUG,
+                    "The mDNS message does not have enough space for the NSEC record, will add it to the next message (This is not an error message) -- "
+                    "remaining space: %ld, NSEC name: " PRI_DM_NAME, limit - save, DM_NAME_PARAM(rr->name));
             }
             return ptr;
         }
@@ -2706,17 +3034,14 @@ mDNSexport mDNSu32 DomainNameHashValue(const domainname *const name)
 
 mDNSexport void SetNewRData(ResourceRecord *const rr, RData *NewRData, mDNSu16 rdlength)
 {
-    domainname *target;
     if (NewRData)
     {
         rr->rdata    = NewRData;
         rr->rdlength = rdlength;
     }
-    // Must not try to get target pointer until after updating rr->rdata
-    target = GetRRDomainNameTarget(rr);
     rr->rdlength   = GetRDLength(rr, mDNSfalse);
     rr->rdestimate = GetRDLength(rr, mDNStrue);
-    rr->rdatahash  = target ? DomainNameHashValue(target) : RDataHashValue(rr);
+    rr->rdatahash  = RDataHashValue(rr);
 }
 
 mDNSexport const mDNSu8 *skipDomainName(const DNSMessage *const msg, const mDNSu8 *ptr, const mDNSu8 *const end)
@@ -3458,7 +3783,7 @@ mDNSexport const mDNSu8 *GetLargeResourceRecord(mDNS *const m, const DNSMessage 
 
     rr->resrec.InterfaceID       = InterfaceID;
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-    mdns_forget(&rr->resrec.dnsservice);
+    mdns_forget(&rr->resrec.metadata);
 #else
     rr->resrec.rDNSServer = mDNSNULL;
 #endif
@@ -3680,14 +4005,6 @@ mDNSexport void mDNS_snprintf_add(char **ptr, const char *lim, const char *fmt, 
 
 #define DNSTypeString(X) (((X) == kDNSType_A) ? "A" : DNSTypeName(X))
 
-#define ReadField16(PTR) ((mDNSu16)((((mDNSu16)((const mDNSu8 *)(PTR))[0]) << 8) | ((mDNSu16)((const mDNSu8 *)(PTR))[1])))
-#define ReadField32(PTR) \
-    ((mDNSu32)( \
-        (((mDNSu32)((const mDNSu8 *)(PTR))[0]) << 24) | \
-        (((mDNSu32)((const mDNSu8 *)(PTR))[1]) << 16) | \
-        (((mDNSu32)((const mDNSu8 *)(PTR))[2]) <<  8) | \
-         ((mDNSu32)((const mDNSu8 *)(PTR))[3])))
-
 mDNSlocal void DNSMessageDumpToLog(const DNSMessage *const msg, const mDNSu8 *const end)
 {
     domainname *name = mDNSNULL;
@@ -3834,6 +4151,737 @@ exit:
     return;
 }
 
+mDNSlocal mDNSBool DNSMessageIsResponse(const DNSMessage *const msg)
+{
+    return ((msg->h.flags.b[0] & kDNSFlag0_QR_Mask) == kDNSFlag0_QR_Response);
+}
+
+mDNSlocal mDNSBool DNSMessageIsQuery(const DNSMessage *const msg)
+{
+    return !DNSMessageIsResponse(msg);
+}
+
+// This function calculates and checks the hash value of the current DNS message if it matches a previous one already.
+mDNSlocal void DumpMDNSPacket_CalculateAndCheckIfMsgAppearsBefore(const DNSMessage *const msg, const mDNSu8 *const end,
+    const mDNSAddr *const srcaddr, const mDNSIPPort srcport, const mDNSAddr *const dstaddr, const mDNSIPPort dstport,
+    const mDNSu32 ifIndex, mDNSu32 *const outMsgHash, mDNSBool *const outMsgHashSame,
+    mDNSu32 *const outCompleteHash, mDNSBool *const outCompleteHashSame)
+{
+    // We calculate two hash values with different hash algorithms to avoid having collisions frequently.
+    const mDNSu32 msgLen = sizeof(DNSMessageHeader) + (mDNSu32)(end - msg->data);
+    const mDNSu32 msgHash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, msg->h.id.b, msgLen);
+    const mDNSu32 msg2ndHash = mDNS_NonCryptoHash(mDNSNonCryptoHash_SDBM, msg->h.id.b, msgLen);
+    mdns_assign(outMsgHash, msgHash);
+
+    mDNSu32 completeHash = msgHash;
+    mDNSu32 complete2ndHash = msg2ndHash;
+    if (srcaddr != mDNSNULL)
+    {
+        const mDNSu8 *const bytes = srcaddr->ip.v4.b;
+        const mDNSu32 len = sizeof(srcaddr->ip.v4.b);
+
+        completeHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, completeHash, bytes, len);
+        completeHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, completeHash, srcport.b,
+            sizeof(srcport.b));
+
+        complete2ndHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, complete2ndHash, bytes, len);
+        complete2ndHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, complete2ndHash, srcport.b,
+            sizeof(srcport.b));
+    }
+    if (dstaddr != mDNSNULL)
+    {
+        const mDNSu8 *const bytes = dstaddr->ip.v4.b;
+        const mDNSu32 len = sizeof(dstaddr->ip.v4.b);
+
+        completeHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, completeHash, bytes, len);
+        completeHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, completeHash, dstport.b,
+            sizeof(dstport.b));
+
+        complete2ndHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, complete2ndHash, bytes, len);
+        complete2ndHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, complete2ndHash, dstport.b,
+            sizeof(dstport.b));
+    }
+
+    mDNSu8 ifIndexBytes[4];
+    putVal32(ifIndexBytes, ifIndex);
+    completeHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, completeHash, ifIndexBytes,
+        sizeof(ifIndexBytes));
+    complete2ndHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_SDBM, complete2ndHash, ifIndexBytes,
+        sizeof(ifIndexBytes));
+    mdns_assign(outCompleteHash, completeHash);
+
+#define NUM_OF_SAVED_HASH_COUNT 20
+    mDNSu32 i;
+    mDNSu32 count;
+
+    static mDNSu32 previousMsgHashes[NUM_OF_SAVED_HASH_COUNT] = {0};
+    static mDNSu32 previousMsg2ndHashes[NUM_OF_SAVED_HASH_COUNT] = {0};
+    static mDNSu32 nextMsgHashSlot = 0;
+    static mDNSu32 nextMsgHashUninitializedSlot = 0;
+    check_compile_time_code(mdns_countof(previousMsgHashes) == mdns_countof(previousMsg2ndHashes));
+
+    mDNSBool msgHashSame = mDNSfalse;
+    count = Min(mdns_countof(previousMsgHashes), nextMsgHashUninitializedSlot);
+    for (i = 0; i < count; i++)
+    {
+        if (previousMsgHashes[i] == msgHash && previousMsg2ndHashes[i] == msg2ndHash)
+        {
+            msgHashSame = mDNStrue;
+            break;
+        }
+    }
+    if (!msgHashSame)
+    {
+        previousMsgHashes[nextMsgHashSlot] = msgHash;
+        previousMsg2ndHashes[nextMsgHashSlot] = msg2ndHash;
+        nextMsgHashSlot++;
+        nextMsgHashSlot %= mdns_countof(previousMsgHashes);
+        if (nextMsgHashUninitializedSlot < mdns_countof(previousMsgHashes))
+        {
+            nextMsgHashUninitializedSlot++;
+        }
+    }
+    mdns_assign(outMsgHashSame, msgHashSame);
+
+    static mDNSu32 previousCompleteHashes[NUM_OF_SAVED_HASH_COUNT] = {0};
+    static mDNSu32 previousComplete2ndHashes[NUM_OF_SAVED_HASH_COUNT] = {0};
+    static mDNSu32 nextCompleteHashSlot = 0;
+    static mDNSu32 nextCompleteHashUninitializedSlot = 0;
+    check_compile_time_code(mdns_countof(previousCompleteHashes) == mdns_countof(previousComplete2ndHashes));
+
+    mDNSBool completeHashSame = mDNSfalse;
+    count = Min(mdns_countof(previousCompleteHashes), nextCompleteHashUninitializedSlot);
+    for (i = 0; i < count; i++)
+    {
+        if (previousCompleteHashes[i] == completeHash && previousComplete2ndHashes[i] == complete2ndHash)
+        {
+            completeHashSame = mDNStrue;
+            break;
+        }
+    }
+    if (!completeHashSame)
+    {
+        previousCompleteHashes[nextCompleteHashSlot] = completeHash;
+        previousComplete2ndHashes[nextCompleteHashSlot] = complete2ndHash;
+        nextCompleteHashSlot++;
+        nextCompleteHashSlot %= mdns_countof(previousCompleteHashes);
+        if (nextCompleteHashUninitializedSlot < mdns_countof(previousCompleteHashes))
+        {
+            nextCompleteHashUninitializedSlot++;
+        }
+    }
+    mdns_assign(outCompleteHashSame, completeHashSame);
+}
+
+mDNSlocal mDNSBool DumpMDNSPacket_GetNameHashTypeClass(const DNSMessage *const msg, const mDNSu8 *ptr,
+    const mDNSu8 *const end, mDNSu32 *const outNameHash, mDNSu16 *const outType, mDNSu16 *const outClass)
+{
+    mDNSBool found;
+    domainname name;
+
+    ptr = getDomainName(msg, ptr, end, &name);
+    const mDNSu32 nameHash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, name.c, DomainNameLength(&name));
+    mdns_require_action_quiet(ptr, exit, found = mDNSfalse);
+
+    mdns_require_action_quiet(ptr + 4 <= end, exit, found = mDNSfalse);
+    const mDNSu16 type = ReadField16(&ptr[0]);
+    mDNSu16 class = ReadField16(&ptr[2]);
+
+    const mDNSBool isMDNS = mDNSOpaque16IsZero(msg->h.id);
+    if (isMDNS)
+    {
+        class &= kDNSClass_Mask;
+    }
+
+    mdns_assign(outNameHash, nameHash);
+    mdns_assign(outType, type);
+    mdns_assign(outClass, class);
+    found = mDNStrue;
+
+exit:
+    return found;
+}
+
+// Each name hash/type pair contains 4-byte uint32_t hash value and 2-byte uint16_t type value, in network byte order.
+#define DumpMDNSPacket_PairLen (sizeof(mDNSu32) + sizeof(mDNSu16))
+// Currently, we only log the first 10 pairs.
+#define DumpMDNSPacket_MaxPairCount 10
+// The buffer size to hold the bytes.
+#define DumpMDNSPacket_MaxBytesLen (DumpMDNSPacket_PairLen * DumpMDNSPacket_MaxPairCount)
+
+mDNSlocal mStatus DumpMDNSPacket_GetNameHashTypeArray(const DNSMessage *const msg, const mDNSu8 *const end,
+    mDNSu8 *const inOutNameHashTypeArray, const mDNSu32 maxByteCount, mDNSu32 *const outByteCount)
+{
+    mStatus err;
+    const mDNSu8 *ptr_to_read;
+    mDNSu8 *ptr_to_write = inOutNameHashTypeArray;
+    mDNSu32 pairCount = 0;
+    const mDNSu32 maxPairCount = maxByteCount / DumpMDNSPacket_PairLen;
+
+    const DNSMessageHeader *const hdr = &msg->h;
+
+    ptr_to_read = (const mDNSu8 *)msg->data;
+    for (mDNSu32 i = 0; i < hdr->numQuestions && pairCount < maxPairCount; i++, pairCount++)
+    {
+        mDNSu32 qnameHash;
+        mDNSu16 type;
+        const mDNSBool found =  DumpMDNSPacket_GetNameHashTypeClass(msg, ptr_to_read, end, &qnameHash, &type, mDNSNULL);
+        mdns_require_action_quiet(found, exit, err = mStatus_Invalid);
+
+        ptr_to_write = putVal32(ptr_to_write, qnameHash);
+        ptr_to_write = putVal16(ptr_to_write, type);
+
+        ptr_to_read = skipQuestion(msg, ptr_to_read, end);
+        mdns_require_action_quiet(ptr_to_read, exit, err = mStatus_Invalid);
+    }
+
+    for (mDNSu32 i = 0; i < hdr->numAnswers && pairCount < maxPairCount; i++, pairCount++)
+    {
+        mDNSu32 nameHash;
+        mDNSu16 type;
+        const mDNSBool found =  DumpMDNSPacket_GetNameHashTypeClass(msg, ptr_to_read, end, &nameHash, &type, mDNSNULL);
+        mdns_require_action_quiet(found, exit, err = mStatus_Invalid);
+
+        ptr_to_write = putVal32(ptr_to_write, nameHash);
+        ptr_to_write = putVal16(ptr_to_write, type);
+
+        ptr_to_read = skipResourceRecord(msg, ptr_to_read, end);
+        mdns_require_action_quiet(ptr_to_read, exit, err = mStatus_Invalid);
+    }
+
+    for (mDNSu32 i = 0; i < hdr->numAuthorities && pairCount < maxPairCount; i++, pairCount++)
+    {
+        mDNSu32 nameHash;
+        mDNSu16 type;
+        const mDNSBool found =  DumpMDNSPacket_GetNameHashTypeClass(msg, ptr_to_read, end, &nameHash, &type, mDNSNULL);
+        mdns_require_action_quiet(found, exit, err = mStatus_Invalid);
+
+        ptr_to_write = putVal32(ptr_to_write, nameHash);
+        ptr_to_write = putVal16(ptr_to_write, type);
+
+        ptr_to_read = skipResourceRecord(msg, ptr_to_read, end);
+        mdns_require_action_quiet(ptr_to_read, exit, err = mStatus_Invalid);
+    }
+
+    for (mDNSu32 i = 0; i < hdr->numAdditionals && pairCount < maxPairCount; i++, pairCount++)
+    {
+        mDNSu32 nameHash;
+        mDNSu16 type;
+        const mDNSBool found =  DumpMDNSPacket_GetNameHashTypeClass(msg, ptr_to_read, end, &nameHash, &type, mDNSNULL);
+        mdns_require_action_quiet(found, exit, err = mStatus_Invalid);
+
+        ptr_to_write = putVal32(ptr_to_write, nameHash);
+        ptr_to_write = putVal16(ptr_to_write, type);
+
+        ptr_to_read = skipResourceRecord(msg, ptr_to_read, end);
+        mdns_require_action_quiet(ptr_to_read, exit, err = mStatus_Invalid);
+    }
+
+    err = mStatus_NoError;
+exit:
+    mdns_assign(outByteCount, pairCount * DumpMDNSPacket_PairLen);
+    return err;
+}
+
+mDNSlocal void DumpMDNSPacket(const mDNSBool sent, const DNSMessage *const msg, const mDNSu8 *const end,
+    const mDNSAddr *const srcaddr, const mDNSIPPort srcport, const mDNSAddr *const dstaddr, const mDNSIPPort dstport,
+    const mDNSu32 ifIndex, const char *const ifName)
+{
+    const mDNSu32 msgLen = sizeof(DNSMessageHeader) + (mDNSu32)(end - msg->data);
+    const mDNSBool query = DNSMessageIsQuery(msg);
+
+    const mDNSBool unicastAssisted = (dstaddr && !mDNSAddrIsDNSMulticast(dstaddr) &&
+        mDNSSameIPPort(dstport, MulticastDNSPort));
+
+    mDNSu32 msgHash;            // Hash of the DNS message.
+    mDNSBool sameMsg;           // If the hash matches a previous DNS message.
+    mDNSu32 completeMsgHash;    // Hash of the DNS message, source address/port, destination address/port.
+    mDNSBool sameCompleteMsg;   // If the hash matches a previous DNS message that is sent from the same source host to
+                                // the same destination host.
+    DumpMDNSPacket_CalculateAndCheckIfMsgAppearsBefore(msg, end, srcaddr, srcport, dstaddr, dstport, ifIndex, &msgHash,
+        &sameMsg, &completeMsgHash, &sameCompleteMsg);
+
+    // The header fields are already in host byte order.
+    DNSMessageHeader hdr = msg->h;
+
+    // Check if it is IPv6 or IPv4 message.
+    mDNSBool ipv6Msg = mDNSfalse;
+    if (srcaddr && srcaddr->type == mDNSAddrType_IPv6)
+    {
+        ipv6Msg = mDNStrue;
+    }
+    else if (dstaddr && dstaddr->type == mDNSAddrType_IPv6)
+    {
+        ipv6Msg = mDNStrue;
+    }
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
+    // The os_log specifier requires network byte order data.
+    SwapDNSHeaderBytesWithHeader(&hdr);
+    const mDNSu32 IDFlags = ReadField32(hdr.id.b);
+    const uint64_t counts = ReadField64(&hdr.numQuestions);
+    SwapDNSHeaderBytesWithHeader(&hdr);
+#endif
+
+    // Get the (Name hash, Type) bytes array from the DNS message, where name is converted to a 4-byte hash value
+    // type is converted to a 2-byte value.
+    mDNSu8 nameHashTypeBytes[DumpMDNSPacket_MaxBytesLen];
+    mDNSu32 nameHashTypeBytesLen;
+    if (!sameMsg)
+    {
+        // Only calculate the name hash type bytes when we have not seen this message recently.
+        DumpMDNSPacket_GetNameHashTypeArray(msg, end, nameHashTypeBytes, sizeof(nameHashTypeBytes),
+            &nameHashTypeBytesLen);
+    }
+    else
+    {
+        nameHashTypeBytesLen = 0;
+    }
+
+    // Note:
+    // 1. There are two hash values printed for the message logging in `[Q(%x, %x)]`.
+    //    a) The first value is the FNV-1a hash of the entire DNS message, the first value can be used to easily
+    //       identify the same DNS message quickly.
+    //    b) The second value is the FNV-1a hash of the entire DNS message, plus source address, source port,
+    //       destination address, destination port and interface index. This value can be used to easily identify
+    //       repetitive message transmission.
+    //    c) The two hash values above are also used to avoid unnecessary duplicate logs by checking the hash values of
+    //       the recent DNS message (currently recent means recent 20 messages).
+    //    d) We use two separate hash algorithms to check if the message has occurred recently, but we only print
+    //       FNV-1a hash values.
+    // 2. For all "Send" events, we do not log destination address because it is always the corresponding multicast
+    //    address, there is no need to log them over and over again.
+    // 3. We print "query", "response" according to the type of the DNS message.
+    // 4. If we have not seen the DNS message before, the message header, the record count section will be printed. Also
+    //    the first 10 "(name hash, type)" pairs will be printed to provide more context.
+    // 5. For the "Receive" event, we log source address so that we know where the query or response comes from.
+
+
+    if (unicastAssisted) // unicast DNS
+    {
+        if (ipv6Msg)    // IPv6
+        {
+            if (sent)   // Send
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv6 mDNS query over unicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv6 mDNS query to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u", msgHash, completeMsgHash, dstaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent %u-byte IPv6 mDNS query to " PRI_IP_ADDR " over unicast via " PUB_S "/%u "
+                            "-- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES, msgHash,
+                            completeMsgHash, msgLen, dstaddr,  ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv6 mDNS response over unicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv6 mDNS response to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u", msgHash, completeMsgHash, dstaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent %u-byte IPv6 mDNS response to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, dstaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+            else        // Receive
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv6 mDNS query over unicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv6 mDNS query from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received %u-byte IPv6 mDNS query from " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, srcaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv6 mDNS response over unicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv6 mDNS response from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received %u-byte IPv6 mDNS response from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, srcaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+        }
+        else            // IPv4
+        {
+            if (sent)   // Send
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv4 mDNS query over unicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv4 mDNS query to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u", msgHash, completeMsgHash, dstaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent %u-byte IPv4 mDNS query to " PRI_IP_ADDR " over unicast via " PUB_S "/%u "
+                            "-- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES, msgHash,
+                            completeMsgHash, msgLen, dstaddr,  ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv4 mDNS response over unicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv4 mDNS response to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u", msgHash, completeMsgHash, dstaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent %u-byte IPv4 mDNS response to " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, dstaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+            else        // Receive
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv4 mDNS query over unicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv4 mDNS query from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received %u-byte IPv4 mDNS query from " PRI_IP_ADDR " over unicast via " PUB_S
+                            "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, srcaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv4 mDNS response over unicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv4 mDNS response from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received %u-byte IPv4 mDNS response from " PRI_IP_ADDR " over unicast via "
+                            PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, srcaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+        }
+    }
+    else // multicast DNS
+    {
+        if (ipv6Msg)    // IPv6
+        {
+            if (sent)   // Send
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv6 mDNS query over multicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv6 mDNS query over multicast via " PUB_S "/%u", msgHash,
+                            completeMsgHash, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent %u-byte IPv6 mDNS query over multicast via " PUB_S "/%u -- "
+                            DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv6 mDNS response over multicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv6 mDNS response over multicast via " PUB_S "/%u", msgHash,
+                            completeMsgHash, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent %u-byte IPv6 mDNS response over multicast via " PUB_S "/%u -- "
+                            DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+            else        // Receive
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv6 mDNS query over multicast", msgHash,
+                            completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv6 mDNS query from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName,
+                            ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received %u-byte IPv6 mDNS query from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS
+                            " " MDNS_NAME_HASH_TYPE_BYTES, msgHash,
+                            completeMsgHash, msgLen, srcaddr, ifName, ifIndex,
+                            DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv6 mDNS response over multicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv6 mDNS response from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName,
+                            ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received %u-byte IPv6 mDNS response from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS
+                            " " MDNS_NAME_HASH_TYPE_BYTES, msgHash, completeMsgHash, msgLen, srcaddr, ifName,
+                            ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+        }
+        else            // IPv4
+        {
+            if (sent)   // Send
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv4 mDNS query over multicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent a previous IPv4 mDNS query over multicast via " PUB_S "/%u", msgHash,
+                            completeMsgHash, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Sent %u-byte IPv4 mDNS query over multicast via " PUB_S "/%u -- "
+                            DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv4 mDNS response over multicast", msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent a previous IPv4 mDNS response over multicast via " PUB_S "/%u", msgHash,
+                            completeMsgHash, ifName, ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Sent %u-byte IPv4 mDNS response over multicast via " PUB_S "/%u -- "
+                            DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " " MDNS_NAME_HASH_TYPE_BYTES,
+                            msgHash, completeMsgHash, msgLen, ifName, ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags),
+                            DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+            else        // Receive
+            {
+                if (query)  // Query
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv4 mDNS query over multicast", msgHash,
+                            completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received a previous IPv4 mDNS query from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName,
+                            ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[A(%x, %x)] Received %u-byte IPv4 mDNS query from " PRI_IP_ADDR " over multicast"
+                            " via " PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS " "
+                            MDNS_NAME_HASH_TYPE_BYTES, msgHash, completeMsgHash, msgLen, srcaddr, ifName,
+                            ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+                else        // Response
+                {
+                    if (sameCompleteMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv4 mDNS response over multicast",
+                            msgHash, completeMsgHash);
+                    }
+                    else if (sameMsg)
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received a previous IPv4 mDNS response from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u", msgHash, completeMsgHash, srcaddr, ifName,
+                            ifIndex);
+                    }
+                    else
+                    {
+                        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                            "[Q(%x, %x)] Received %u-byte IPv4 mDNS response from " PRI_IP_ADDR
+                            " over multicast via " PUB_S "/%u -- " DNS_MSG_ID_FLAGS ", counts: " DNS_MSG_COUNTS
+                            " " MDNS_NAME_HASH_TYPE_BYTES, msgHash, completeMsgHash, msgLen, srcaddr, ifName,
+                            ifIndex, DNS_MSG_ID_FLAGS_PARAM(hdr, IDFlags), DNS_MSG_COUNTS_PARAM(hdr, counts),
+                            MDNS_NAME_HASH_TYPE_BYTES_PARAM(nameHashTypeBytes, nameHashTypeBytesLen));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Note: DumpPacket expects the packet header fields in host byte order, not network byte order
 mDNSexport void DumpPacket(mStatus status, mDNSBool sent, const char *transport,
     const mDNSAddr *srcaddr, mDNSIPPort srcport,const mDNSAddr *dstaddr, mDNSIPPort dstport, const DNSMessage *const msg,
@@ -3841,21 +4889,43 @@ mDNSexport void DumpPacket(mStatus status, mDNSBool sent, const char *transport,
 {
     const mDNSAddr zeroIPv4Addr = { mDNSAddrType_IPv4, {{{ 0 }}} };
     char action[32];
-    const char* interfaceName = "interface";
 
     if (!status) mDNS_snprintf(action, sizeof(action), sent ? "Sent" : "Received");
     else         mDNS_snprintf(action, sizeof(action), "ERROR %d %sing", status, sent ? "Send" : "Receiv");
 
-#if MDNSRESPONDER_SUPPORTS(APPLE, OS_LOG)
-    interfaceName = InterfaceNameForID(&mDNSStorage, interfaceID);
+#if __APPLE__
+    const mDNSu32 interfaceIndex = IIDPrintable(interfaceID);
+    const char *const interfaceName = InterfaceNameForID(&mDNSStorage, interfaceID);
+#else
+    const mDNSu32 interfaceIndex = mDNSPlatformInterfaceIndexfromInterfaceID(&mDNSStorage, interfaceID, mDNStrue);
+    const char *const interfaceName = "interface";
 #endif
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-        "[Q%u] " PUB_S " " PUB_S " DNS Message %lu bytes from " PRI_IP_ADDR ":%d to " PRI_IP_ADDR ":%d via " PUB_S " (%p)",
-        mDNSVal16(msg->h.id), action, transport, (unsigned long)(end - (const mDNSu8 *)msg),
-        srcaddr ? srcaddr : &zeroIPv4Addr, mDNSVal16(srcport), dstaddr ? dstaddr : &zeroIPv4Addr, mDNSVal16(dstport),
-        interfaceName, interfaceID);
-    DNSMessageDumpToLog(msg, end);
+    if (!mDNSOpaque16IsZero(msg->h.id))
+    {
+        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[Q%u] " PUB_S " " PUB_S " DNS Message %lu bytes from "
+            PRI_IP_ADDR ":%d to " PRI_IP_ADDR ":%d via " PUB_S " (%p)", mDNSVal16(msg->h.id), action, transport,
+            (unsigned long)(end - (const mDNSu8 *)msg), srcaddr ? srcaddr : &zeroIPv4Addr, mDNSVal16(srcport),
+            dstaddr ? dstaddr : &zeroIPv4Addr, mDNSVal16(dstport), interfaceName, interfaceID);
+        DNSMessageDumpToLog(msg, end);
+    }
+    else
+    {
+        DumpMDNSPacket(sent, msg, end, srcaddr, srcport, dstaddr, dstport, interfaceIndex, interfaceName);
+        if (status)
+        {
+            if (sent)
+            {
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
+                    "Sending mDNS message failed - mStatus: %d", status);
+            }
+            else
+            {
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
+                    "Receiving mDNS message failed - mStatus: %d", status);
+            }
+        }
+    }
 }
 
 // ***************************************************************************
@@ -3953,38 +5023,40 @@ mDNSexport mStatus mDNSSendDNSMessage(mDNS *const m, DNSMessage *const msg, mDNS
     // Swap the integer values back the way they were (remember that numAdditionals may have been changed by putHINFO and/or SignMessage)
     SwapDNSHeaderBytes(msg);
 
-    // Dump the packet with the HINFO and TSIG
-    mDNSBool dumpMessage = mDNSfalse;
-    if (mDNS_PacketLoggingEnabled)
+    char *transport = "UDP";
+    mDNSIPPort portNumber = udpSrc ? udpSrc->port : MulticastDNSPort;
+    if (tcpSrc)
     {
-        // Dump non-mDNS messages, which have non-zero message IDs.
-        dumpMessage = !mDNSOpaque16IsZero(msg->h.id);
-#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_DISCOVERY)
-        // Also dump mDNS messages that are sent to an address that isn't an mDNS multicast address.
-        dumpMessage = dumpMessage || (dst && !mDNSAddrIsDNSMulticast(dst) && mDNSSameIPPort(dstport, MulticastDNSPort));
-#endif
+        if (tcpSrc->flags)
+            transport = "TLS";
+        else
+            transport = "TCP";
+        portNumber = tcpSrc->port;
     }
-
-    if (dumpMessage)
-    {
-        char *transport = "UDP";
-        mDNSIPPort portNumber = udpSrc ? udpSrc->port : MulticastDNSPort;
-        if (tcpSrc)
-        {
-            if (tcpSrc->flags)
-                transport = "TLS";
-            else
-                transport = "TCP";
-            portNumber = tcpSrc->port;
-        }
-        DumpPacket(status, mDNStrue, transport, mDNSNULL, portNumber, dst, dstport, msg, end, InterfaceID);
-    }
+    DumpPacket(status, mDNStrue, transport, mDNSNULL, portNumber, dst, dstport, msg, end, InterfaceID);
 
     // put the number of additionals back the way it was
     msg->h.numAdditionals = numAdditionals;
 
     return(status);
 }
+
+// ***************************************************************************
+// MARK: - DNSQuestion Functions
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+mDNSBool DNSQuestionNeedsSensitiveLogging(const DNSQuestion *const q)
+{
+    return is_apple_internal_build() && (q->logPrivacyLevel == dnssd_log_privacy_level_private);
+}
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+mDNSBool DNSQuestionCollectsMDNSMetric(const DNSQuestion *const q)
+{
+    return (!q->DuplicateOf && mDNSOpaque16IsZero(q->TargetQID));
+}
+#endif
 
 // ***************************************************************************
 // MARK: - RR List Management & Task Management
@@ -4223,6 +5295,11 @@ mDNSlocal mDNSs32 GetNextScheduledEvent(const mDNS *const m)
         }
     }
 
+#if MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)
+    const mDNSs32 nextResolverDiscoveryEvent = ResolverDiscovery_GetNextScheduledEvent();
+    if (nextResolverDiscoveryEvent && (e - nextResolverDiscoveryEvent > 0)) e = nextResolverDiscoveryEvent;
+#endif
+
     // NextScheduledSPRetry only valid when DelaySleep not set
     if (!m->DelaySleep && m->SleepLimit && e - m->NextScheduledSPRetry > 0) e = m->NextScheduledSPRetry;
     if (m->DelaySleep && e - m->DelaySleep > 0) e = m->DelaySleep;
@@ -4252,6 +5329,13 @@ mDNSlocal mDNSs32 GetNextScheduledEvent(const mDNS *const m)
     if (m->NextUpdateDNSSECValidatedCache && (e - m->NextUpdateDNSSECValidatedCache > 0))
     {
         e = m->NextUpdateDNSSECValidatedCache;
+    }
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+    if (m->NextMDNSResponseDelayReport && (e - m->NextMDNSResponseDelayReport > 0))
+    {
+        e = m->NextMDNSResponseDelayReport;
     }
 #endif
 

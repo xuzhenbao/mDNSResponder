@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 2011-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2011-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,14 @@
 #include "dnsproxy.h"
 #include "mrcs_dns_proxy.h"
 #include "mrcs_server.h"
-#include "mdns_strict.h"
 #include "mDNSMacOSX.h"
 #include <AssertMacros.h>
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNS_PROXY_DNS64)
 #include <nw/private.h>
 #endif
+
+#include "mdns_strict.h"
 
 #ifndef UNICAST_DISABLED
 
@@ -840,6 +841,7 @@ mDNSlocal void ProxyCallbackCommon(void *socket, DNSMessage *const msg, const mD
     pc->q.ReturnIntermed  = mDNStrue;
     pc->q.ProxyQuestion   = mDNStrue;
     pc->q.responseFlags   = zeroID;
+    pc->q.euid            = mrcs_dns_proxy_get_euid(pc->proxy);
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNS_PROXY_DNS64)
     pc->qtype = pc->q.qtype;
     const nw_nat64_prefix_t * const nat64_prefix = mrcs_dns_proxy_get_nat64_prefix(pc->proxy);

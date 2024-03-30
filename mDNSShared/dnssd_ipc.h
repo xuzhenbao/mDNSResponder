@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 2003-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2023 Apple Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -113,7 +113,10 @@ extern char *win32_strerror(int inErrorCode);
 #define IPC_TLV_TYPE_SERVICE_ATTR_FAILOVER_POLICY   4 // A uint32 for a DNSServiceFailoverPolicy value.
 #define IPC_TLV_TYPE_SERVICE_ATTR_TIMESTAMP         5 // A uint32 value for the time, in seconds, since Jan 1st 1970 UTC.
 #define IPC_TLV_TYPE_SERVICE_ATTR_VALIDATION_POLICY 6 // A uint32 for a DNSServiceValidationPolicy value.
-#define IPC_TLV_TYPE_SERVICE_ATTR_VALIDATION_DATA   7 // Validation data.
+#define IPC_TLV_TYPE_SERVICE_ATTR_VALIDATION_DATA   7 // A ptr for the validation data.
+#define IPC_TLV_TYPE_GET_TRACKER_STR                8 // A uint8. If non-zero, include tracker domain if applicable.
+#define IPC_TLV_TYPE_SERVICE_ATTR_TRACKER_STR       9 // A null-terminated string. The domain (original hostname or resolved CNAME)
+                                                      // that was identified as a tracker
 
 // Structure packing macro. If we're not using GNUC, it's not fatal. Most compilers naturally pack the on-the-wire
 // structures correctly anyway, so a plain "struct" is usually fine. In the event that structures are not packed
@@ -146,7 +149,7 @@ typedef enum
     getproperty_request,    // New in B4W 1.0.4
     port_mapping_request,   // New in Leopard and B4W 2.0
     addrinfo_request,
-    send_bpf,               // New in SL
+    send_bpf_OBSOLETE,      // New in SL (obsolete in 2023)
     getpid_request,
     release_request,
     connection_delegate_request,
@@ -222,13 +225,17 @@ const uint8_t *get_rdata(const uint8_t **ptr, const uint8_t *end, int rdlen);  /
 // rdata is not copied from buffer.
 
 size_t get_required_tlv_length(uint16_t value_length);
+size_t get_required_tlv_string_length(const char *str_value);
 size_t get_required_tlv_uint8_length(void);
 size_t get_required_tlv_uint32_length(void);
 void put_tlv(uint16_t type, uint16_t length, const uint8_t *value, uint8_t **ptr, const uint8_t *limit);
+void put_tlv_string(const uint16_t type, const char *const str_value, uint8_t **const ptr, const uint8_t *const limit,
+    int *const out_error);
 void put_tlv_uint8(uint16_t type, uint8_t u8, uint8_t **ptr, const uint8_t *limit);
 void put_tlv_uint16(uint16_t type, uint16_t u16, uint8_t **ptr, const uint8_t *limit);
 void put_tlv_uint32(uint16_t type, uint32_t u32, uint8_t **ptr, const uint8_t *limit);
 const uint8_t *get_tlv(const uint8_t *src, const uint8_t *end, uint16_t type, size_t *out_length);
+const char *get_tlv_string(const uint8_t *const start, const uint8_t *const end, const uint16_t type);
 uint32_t get_tlv_uint32(const uint8_t *src, const uint8_t *end, uint16_t type, int *out_error);
 
 void ConvertHeaderBytes(ipc_msg_hdr *hdr);

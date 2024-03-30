@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -289,19 +289,6 @@ dnssd_xpc_parameters_get_interface_index(xpc_object_t params, bool * _Nullable o
 
 /*!
  *	@brief
- *		Gets need_auth_tags boolean value from a command parameters dictionary.
- *
- *	@param params
- *		Command parameters dictionary.
- *
- *	@result
- *		A boolean value.
- */
-bool
-dnssd_xpc_parameters_get_need_authentication_tags(xpc_object_t params);
-
-/*!
- *	@brief
  *		Gets need encryption boolean value from a command parameters dictionary.
  *
  *	@param params
@@ -518,19 +505,6 @@ dnssd_xpc_parameters_set_interface_index(xpc_object_t params, uint32_t interface
 
 /*!
  *	@brief
- *		Sets whether mDNSResponder should include an authentication tag for each hostname resolution.
- *
- *	@param params
- *		Command parameters dictionary.
- *
- *	@param need
- *		Pass <code>true</code> to enable this behavior. Pass <code>false</code> to disable it.
- */
-void
-dnssd_xpc_parameters_set_need_authentication_tags(xpc_object_t params, bool need);
-
-/*!
- *	@brief
  *		Specifies whether or not queries must use encrypted transports to the next DNS server.
  *
  *	@param params
@@ -645,19 +619,6 @@ dnssd_xpc_parameters_set_validation_data(xpc_object_t params, const uint8_t *dat
  */
 void
 dnssd_xpc_parameters_set_prohibit_encrypted_dns(xpc_object_t params, bool prohibit);
-
-/*!
- *	@brief
- *		Gets authentication tag from a command result dictionary.
- *
- *	@param result
- *		The command result dictionary.
- *
- *	@result
- *		Authentication tag, if present, as an XPC data object. Otherwise, NULL.
- */
-xpc_object_t _Nullable
-dnssd_xpc_result_get_authentication_tag_object(xpc_object_t result);
 
 /*!
  *	@brief
@@ -864,6 +825,19 @@ dnssd_xpc_result_get_tracker_is_approved(xpc_object_t result);
 
 /*!
  *	@brief
+ *		Gets whether or not we can block requests to this tracker.
+ *
+ *	@param result
+ *		The command result dictionary.
+ *
+ *	@result
+ *		A boolean indicating whether we can block requests to this tracker.
+ */
+bool
+dnssd_xpc_result_get_tracker_can_block_request(xpc_object_t result);
+
+/*!
+ *	@brief
  *		Gets the reason why a result is negative from a command result dictionary.
  *
  *	@param result
@@ -890,19 +864,16 @@ dnssd_xpc_result_get_validation_data_object(xpc_object_t result);
 
 /*!
  *	@brief
- *		Sets the authentication tag in a command result dictionary.
+ *		Gets the Extended DNS Error dictionary from a command result dictionary.
  *
  *	@param result
  *		The command result dictionary.
  *
- *	@param auth_tag_ptr
- *		Pointer to the authentication tag.
- *
- *	@param auth_tag_len
- *		Length of the authentication tag.
+ * 	@result
+ *		An Extended DNS Error dictionary, if present. Otherwise, NULL.
  */
-void
-dnssd_xpc_result_set_authentication_tag(xpc_object_t result, const void *auth_tag_ptr, size_t auth_tag_len);
+mdns_xpc_dictionary_t _Nullable
+dnssd_xpc_result_get_extended_dns_error(xpc_object_t result);
 
 /*!
  *	@brief
@@ -1091,6 +1062,19 @@ dnssd_xpc_result_set_tracker_is_approved(xpc_object_t result, bool approved);
 
 /*!
  *	@brief
+ *		Sets whether or not we can safely block requests to this tracker.
+ *
+ *	@param result
+ *		The command result dictionary.
+ *
+ *	@param can_block
+ *		A boolean indicating if we can block requests to this tracker.
+ */
+void
+dnssd_xpc_result_set_tracker_can_block_request(xpc_object_t result, bool can_block);
+
+/*!
+ *	@brief
  *		Sets the reason why a result is negative in a command result dictionary.
  *
  *	@param result
@@ -1117,6 +1101,51 @@ dnssd_xpc_result_set_negative_reason(xpc_object_t result, dnssd_negative_reason_
  */
 void
 dnssd_xpc_result_set_validation_data(xpc_object_t result, const uint8_t *data_ptr, size_t data_len);
+
+/*!
+ *	@brief
+ *		Sets the Extended DNS Error code and text in a command result dictionary.
+ *
+ *	@param result
+ *		The command result dictionary.
+ *
+ *	@param code
+ *		The Extended DNS Error code.
+ *
+ *	@param extra_text
+ *		The Extended DNS Error code extra text.
+ */
+void
+dnssd_xpc_result_set_extended_dns_error(xpc_object_t result, uint16_t code, mdns_xpc_string_t extra_text);
+
+/*!
+ *	@brief
+ *		Gets the Extended DNS Error code from a dictionary.
+ *
+ *	@param ede
+ *		An Extended DNS Error dictionary.
+ *
+ *	@param out_valid
+ *		If non-NULL, set to true if value is present and of correct type, otherwise, set to false.
+ *
+ *	@result
+ *		The Extended DNS Error code, if valid, otherwise 0.
+ */
+uint16_t
+dnssd_xpc_extended_dns_error_get_code(mdns_xpc_dictionary_t ede, bool * _Nullable out_valid);
+
+/*!
+ *	@brief
+ *		Gets the Extended DNS Error extra text from a dictionary.
+ *
+ *	@param ede
+ *		An Extended DNS Error dictionary.
+ *
+ *	@result
+ *		The Extended DNS Error extra text, if valid, otherwise NULL.
+ */
+mdns_xpc_string_t
+dnssd_xpc_extended_dns_error_get_text(mdns_xpc_dictionary_t ede);
 
 __END_DECLS
 

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-file-style: "bsd"; c-basic-offset: 4; fill-column: 108; indent-tabs-mode: nil; -*-
  *
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,8 +43,6 @@
 #if defined(__x86_64__) && __x86_64__
 #include <smmintrin.h>
 #endif
-
-#include "mdns_strict.h"
 
 #include <mdns/power.h>
 #include <mdns/tcpinfo.h>
@@ -98,7 +96,7 @@
 
 #include <SystemConfiguration/SCPrivate.h>
 
-
+#include <Security/oidsalg.h> // To include the deprecated symbol `CSSMOID_APPLE_X509_BASIC`.
 #include "system_utilities.h"
 
 // Include definition of opaque_presence_indication for KEV_DL_NODE_PRESENCE handling logic.
@@ -113,6 +111,9 @@
 #ifdef UNIT_TEST
 #include "unittest.h"
 #endif
+
+
+#include "mdns_strict.h"
 
 #define mDNS_IOREG_KEY               "mDNS_KEY"
 #define mDNS_IOREG_VALUE             "2009-07-30"
@@ -192,10 +193,14 @@ static CFArrayRef privateDnsArray = NULL;
 // to run up the user's bill sending multicast traffic over a link where there's only a single device at the
 // other end, and that device (e.g. a modem bank) is probably not answering Multicast DNS queries anyway.
 
+
 #if MDNSRESPONDER_SUPPORTS(APPLE, BONJOUR_ON_DEMAND)
-#define MulticastInterface(i) ((i)->m->BonjourEnabled && ((i)->ifa_flags & IFF_MULTICAST) && !((i)->ifa_flags & IFF_POINTOPOINT))
+#define MulticastInterface(i) ((i)->m->BonjourEnabled               && \
+                              ((i)->ifa_flags & IFF_MULTICAST)      && \
+                              !((i)->ifa_flags & IFF_POINTOPOINT))
 #else
-#define MulticastInterface(i) (((i)->ifa_flags & IFF_MULTICAST) && !((i)->ifa_flags & IFF_POINTOPOINT))
+#define MulticastInterface(i) (((i)->ifa_flags & IFF_MULTICAST)     && \
+                              !((i)->ifa_flags & IFF_POINTOPOINT))
 #endif
 #define SPSInterface(i)       ((i)->ifinfo.McastTxRx && !((i)->ifa_flags & IFF_LOOPBACK) && !(i)->D2DInterface)
 
@@ -644,6 +649,30 @@ mDNSlocal uint32_t GetIFTFamily(const char * _Nonnull if_name, uint32_t *out_sub
     }
     close(s);
     return ift_family;
+}
+
+mDNSlocal uint32_t GetIFRFunctionalType(const char * const _Nonnull if_name)
+{
+    uint32_t type = IFRTYPE_FUNCTIONAL_UNKNOWN;
+
+    const int info_socket = socket(AF_INET6, SOCK_DGRAM, 0);
+    mdns_require_quiet(info_socket != -1, exit);
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    mdns_strlcpy(ifr.ifr_name, if_name, sizeof(ifr.ifr_name));
+
+    const int ioctl_ret = ioctl(info_socket, SIOCGIFFUNCTIONALTYPE, (caddr_t)&ifr);
+    mdns_require_quiet(ioctl_ret != -1, exit);
+
+    type = ifr.ifr_functional_type;
+
+exit:
+    if (info_socket != -1)
+    {
+        close(info_socket);
+    }
+    return type;
 }
 
 // MARK: - UDP & TCP send & receive
@@ -1263,23 +1292,27 @@ mDNSlocal OSStatus tlsSetupSock(TCPSocket *sock, SSLProtocolSide pside, SSLConne
 {
     char domname_cstr[MAX_ESCAPED_DOMAIN_NAME];
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     sock->tlsContext = SSLCreateContext(kCFAllocatorDefault, pside, ctype);
+    mdns_clang_ignore_warning_end();
     if (!sock->tlsContext)
     {
         LogMsg("ERROR: tlsSetupSock: SSLCreateContext failed");
         return(mStatus_UnknownErr);
     }
 
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     mStatus err = SSLSetIOFuncs(sock->tlsContext, tlsReadSock, tlsWriteSock);
+    mdns_clang_ignore_warning_end();
     if (err)
     {
         LogMsg("ERROR: tlsSetupSock: SSLSetIOFuncs failed with error code: %d", err);
         goto fail;
     }
 
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SSLSetConnection(sock->tlsContext, (SSLConnectionRef) sock);
+    mdns_clang_ignore_warning_end();
     if (err)
     {
         LogMsg("ERROR: tlsSetupSock: SSLSetConnection failed with error code: %d", err);
@@ -1287,7 +1320,9 @@ mDNSlocal OSStatus tlsSetupSock(TCPSocket *sock, SSLProtocolSide pside, SSLConne
     }
 
     // Set the default ciphersuite configuration
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SSLSetSessionConfig(sock->tlsContext, CFSTR("default"));
+    mdns_clang_ignore_warning_end();
     if (err)
     {
         LogMsg("ERROR: tlsSetupSock: SSLSetSessionConfig failed with error code: %d", err);
@@ -1304,13 +1339,14 @@ mDNSlocal OSStatus tlsSetupSock(TCPSocket *sock, SSLProtocolSide pside, SSLConne
     }
 
     ConvertDomainNameToCString(sock->hostname, domname_cstr);
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SSLSetPeerDomainName(sock->tlsContext, domname_cstr, strlen(domname_cstr));
+    mdns_clang_ignore_warning_end();
     if (err)
     {
         LogMsg("ERROR: tlsSetupSock: SSLSetPeerDomainname: %s failed with error code: %d", domname_cstr, err);
         goto fail;
     }
-#pragma clang diagnostic pop
     return(err);
 
 fail:
@@ -1376,10 +1412,10 @@ mDNSlocal void *doSSLHandshake(TCPSocket *sock)
 {
     // Warning: Touching sock without the kqueue lock!
     // We're protected because sock->handshake == handshake_in_progress
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     mStatus err = SSLHandshake(sock->tlsContext);
-#pragma clang diagnostic pop
+    mdns_clang_ignore_warning_end();
+
     KQueueLock();
     debugf("doSSLHandshake %p: got lock", sock); // Log *after* we get the lock
 
@@ -1502,15 +1538,15 @@ mDNSlocal void tcpKQSocketCallback(int fd, short filter, void *context, __unused
             if (!sock->setup)
             {
                 sock->setup = mDNStrue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+                mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
                 sock->err = tlsSetupSock(sock, kSSLClientSide, kSSLStreamType);
+                mdns_clang_ignore_warning_end();
                 if (sock->err)
                 {
                     LogMsg("ERROR: tcpKQSocketCallback: tlsSetupSock failed with error code: %d", sock->err);
                     return;
                 }
-#pragma clang diagnostic pop
             }
             if (sock->handshake == handshake_required)
             {
@@ -1621,7 +1657,7 @@ mDNSexport int KQueueSet(int fd, u_short flags, short filter, KQueueEntry *const
     return (kevent(KQueueFD, &new_event, 1, NULL, 0, NULL) < 0) ? errno : 0;
 }
 
-mDNSexport void KQueueLock()
+mDNSexport void KQueueLock(void)
 {
     mDNS *const m = &mDNSStorage;
     pthread_mutex_lock(&m->p->BigMutex);
@@ -1632,7 +1668,6 @@ mDNSexport void KQueueUnlock(const char* task)
 {
     mDNS *const m = &mDNSStorage;
     mDNSs32 end = mDNSPlatformRawTime();
-    (void)task;
     if (end - m->p->BigMutexStartTime >= WatchDogReportingThreshold)
     {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING,
@@ -1907,17 +1942,17 @@ mDNSexport TCPSocket *mDNSPlatformTCPAccept(TCPSocketFlags flags, int fd)
     if (flags & kTCPSocketFlags_UseTLS)
     {
 #ifndef NO_SECURITYFRAMEWORK
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
         if (!ServerCerts) { LogMsg("ERROR: mDNSPlatformTCPAccept: unable to find TLS certificates"); err = mStatus_UnknownErr; goto exit; }
 
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         err = tlsSetupSock(sock, kSSLServerSide, kSSLStreamType);
+        mdns_clang_ignore_warning_end();
         if (err) { LogMsg("ERROR: mDNSPlatformTCPAccept: tlsSetupSock failed with error code: %d", err); goto exit; }
 
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         err = SSLSetCertificate(sock->tlsContext, ServerCerts);
+        mdns_clang_ignore_warning_end();
         if (err) { LogMsg("ERROR: mDNSPlatformTCPAccept: SSLSetCertificate failed with error code: %d", err); goto exit; }
-#pragma clang diagnostic pop
 #else
         err = mStatus_UnsupportedErr;
 #endif /* NO_SECURITYFRAMEWORK */
@@ -2035,12 +2070,12 @@ mDNSexport void mDNSPlatformTCPCloseConnection(TCPSocket *sock)
                 sock->handshake = handshake_to_be_closed;
                 return;
             }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
             SSLClose(sock->tlsContext);
+            mdns_clang_ignore_warning_end();
+
             MDNS_DISPOSE_CF_OBJECT(sock->tlsContext);
         }
-#pragma clang diagnostic pop
 #endif /* NO_SECURITYFRAMEWORK */
         if (sock->fd != -1) {
             shutdown(sock->fd, 2);
@@ -2071,10 +2106,10 @@ mDNSexport long mDNSPlatformReadTCP(TCPSocket *sock, void *buf, unsigned long bu
         else if (sock->handshake != handshake_completed) LogMsg("mDNSPlatformReadTCP called with unexpected SSLHandshake status: %d", sock->handshake);
 
         //LogMsg("Starting SSLRead %d %X", sock->fd, fcntl(sock->fd, F_GETFL, 0));
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         mStatus err = SSLRead(sock->tlsContext, buf, buflen, (size_t *)&nread);
-#pragma clang diagnostic pop
+        mdns_clang_ignore_warning_end();
+
         //LogMsg("SSLRead returned %d (%d) nread %d buflen %d", err, errSSLWouldBlock, nread, buflen);
         if (err == errSSLClosedGraceful) { nread = 0; *closed = mDNStrue; }
         else if (err && err != errSSLWouldBlock)
@@ -2108,10 +2143,9 @@ mDNSexport long mDNSPlatformWriteTCP(TCPSocket *sock, const char *msg, unsigned 
         if (sock->handshake == handshake_in_progress) return 0;
         else if (sock->handshake != handshake_completed) LogMsg("mDNSPlatformWriteTCP called with unexpected SSLHandshake status: %d", sock->handshake);
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         mStatus err = SSLWrite(sock->tlsContext, msg, len, &processed);
-#pragma clang diagnostic pop
+        mdns_clang_ignore_warning_end();
 
         if (!err) nsent = (long)processed;
         else if (err == errSSLWouldBlock) nsent = 0;
@@ -2400,18 +2434,20 @@ mDNSlocal CFArrayRef CopyCertChain(SecIdentityRef identity)
     else
     {
         SecPolicySearchRef searchRef;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         err = SecPolicySearchCreate(CSSM_CERT_X_509v3, &CSSMOID_APPLE_X509_BASIC, NULL, &searchRef);
-#pragma clang diagnostic pop
+        mdns_clang_ignore_warning_end();
+
        if (err || !searchRef) LogMsg("CopyCertChain: SecPolicySearchCreate() returned %d", (int) err);
         else
         {
             SecPolicyRef policy;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+            mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
             err = SecPolicySearchCopyNext(searchRef, &policy);
-#pragma clang diagnostic pop
+            mdns_clang_ignore_warning_end();
+
             if (err || !policy) LogMsg("CopyCertChain: SecPolicySearchCopyNext() returned %d", (int) err);
             else
             {
@@ -2424,20 +2460,21 @@ mDNSlocal CFArrayRef CopyCertChain(SecIdentityRef identity)
                     if (err || !trust) LogMsg("CopyCertChain: SecTrustCreateWithCertificates() returned %d", (int) err);
                     else
                     {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#pragma clang diagnostic ignored "-Wnonnull"
+                        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
+                        mdns_clang_ignore_warning_begin(-Wnonnull);
                         err = SecTrustEvaluate(trust, NULL);
-#pragma clang diagnostic pop
+                        mdns_clang_ignore_warning_end();
+                        mdns_clang_ignore_warning_end();
                         if (err) LogMsg("CopyCertChain: SecTrustEvaluate() returned %d", (int) err);
                         else
                         {
                             CFArrayRef rawCertChain;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+                            mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
                             CSSM_TP_APPLE_EVIDENCE_INFO *statusChain = NULL;
                             err = SecTrustGetResult(trust, NULL, &rawCertChain, &statusChain);
-#pragma clang diagnostic pop
+                            mdns_clang_ignore_warning_end();
+
                             if (err || !rawCertChain || !statusChain) LogMsg("CopyCertChain: SecTrustGetResult() returned %d", (int) err);
                             else
                             {
@@ -2481,16 +2518,17 @@ mDNSexport mStatus mDNSPlatformTLSSetupCerts(void)
     SecIdentitySearchRef srchRef = nil;
     OSStatus err;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     // search for "any" identity matching specified key use
     // In this app, we expect there to be exactly one
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SecIdentitySearchCreate(NULL, CSSM_KEYUSE_DECRYPT, &srchRef);
+    mdns_clang_ignore_warning_end();
     if (err) { LogMsg("ERROR: mDNSPlatformTLSSetupCerts: SecIdentitySearchCreate returned %d", (int) err); return err; }
 
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SecIdentitySearchCopyNext(srchRef, &identity);
+    mdns_clang_ignore_warning_end();
     if (err) { LogMsg("ERROR: mDNSPlatformTLSSetupCerts: SecIdentitySearchCopyNext returned %d", (int) err); return err; }
-#pragma clang diagnostic pop
 
     if (CFGetTypeID(identity) != SecIdentityGetTypeID())
     { LogMsg("ERROR: mDNSPlatformTLSSetupCerts: SecIdentitySearchCopyNext CFTypeID failure"); return mStatus_UnknownErr; }
@@ -2723,6 +2761,17 @@ mDNSlocal mDNSBool NetWakeInterface(NetworkInterfaceInfoOSX *i)
             "NetWakeInterface: returning false for " PUB_S, i->ifinfo.ifname);
         return(mDNSfalse);
     }
+#if MDNSRESPONDER_SUPPORTS(APPLE, NO_NETWAKE_FOR_AP1)
+    // As a workaround for ap1 being a virtual interface that shares its in-NIC sleep proxy capability with a
+    // physical network interface, exclude ap1 from any in-NIC sleep proxy offloading to avoid clobbering the
+    // physical interface's in-NIC sleep proxy offloading.
+    if (strcmp(i->ifinfo.ifname, "ap1") == 0)
+    {
+        LogRedact(MDNS_LOG_CATEGORY_SPS, MDNS_LOG_DEFAULT,
+            "NetWakeInterface: returning false for " PUB_S, i->ifinfo.ifname);
+        return(mDNSfalse);
+    }
+#endif
 
     // If the interface supports TCPKeepalive, it is capable of waking up for a magic packet
     // This check is needed since the SIOCGIFWAKEFLAGS ioctl returns wrong values for WOMP capability
@@ -2827,6 +2876,17 @@ mDNSlocal mDNSBool isExcludedInterface(int sockFD, char * ifa_name)
         return mDNSfalse;
 }
 
+#if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+mDNSlocal mDNSBool collectsRuntimeMDNSMetricsForThisInterface(const NetworkInterfaceInfoOSX * const ifInfoOSX)
+{
+    const NetworkInterfaceInfo * const ifInfo = &ifInfoOSX->ifinfo;
+
+    // Only collects mDNS metrics when the Wi-Fi interface that supports mDNS.
+    // We also ignore loopback interface, because it is lossless.
+    return (ifInfo->McastTxRx && (!ifInfo->Loopback) &&
+            (ifInfoOSX->if_functional_type == IFRTYPE_FUNCTIONAL_WIFI_INFRA));
+}
+#endif
 
 // Returns pointer to newly created NetworkInterfaceInfoOSX object, or
 // pointer to already-existing NetworkInterfaceInfoOSX object found in list, or
@@ -2874,7 +2934,7 @@ mDNSlocal NetworkInterfaceInfoOSX *AddInterfaceToList(const struct ifaddrs *ifa,
                 (*p)->Exists = MulticastStateChanged; // State change; need to deregister and reregister this interface
             }
             else
-                 (*p)->Exists = mDNStrue;
+                (*p)->Exists = mDNStrue;
 
             // If interface was not in getifaddrs list last time we looked, but it is now, update 'AppearanceTime' for this record
             if ((*p)->LastSeen != utc) (*p)->AppearanceTime = utc;
@@ -2899,6 +2959,16 @@ mDNSlocal NetworkInterfaceInfoOSX *AddInterfaceToList(const struct ifaddrs *ifa,
             }
             // Reset the flag if it has changed this time.
             (*p)->ifinfo.IgnoreIPv4LL = ((eflags & IFEF_ARPLL) != 0) ? mDNSfalse : mDNStrue;
+
+        #if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+            if (collectsRuntimeMDNSMetricsForThisInterface(*p))
+            {
+                if (!(*p)->ifinfo.delayHistogram)
+                {
+                    (*p)->ifinfo.delayHistogram = mdns_multicast_delay_histogram_create();
+                }
+            }
+        #endif
 
             return(*p);
         }
@@ -2958,6 +3028,8 @@ mDNSlocal NetworkInterfaceInfoOSX *AddInterfaceToList(const struct ifaddrs *ifa,
     i->BPF_mcfd        = -1;
     i->BPF_len         = 0;
     i->Registered      = mDNSNULL;
+    i->ift_family      = GetIFTFamily(i->ifinfo.ifname, &i->ift_subfamily);
+    i->if_functional_type = GetIFRFunctionalType(i->ifinfo.ifname);
 
     // MulticastInterface() depends on the "m" and "ifa_flags" values being initialized above.
     i->ifinfo.McastTxRx   = MulticastInterface(i);
@@ -2966,7 +3038,6 @@ mDNSlocal NetworkInterfaceInfoOSX *AddInterfaceToList(const struct ifaddrs *ifa,
     GetMAC(&i->ifinfo.MAC, scope_id);
     if (i->ifinfo.NetWake && !i->ifinfo.MAC.l[0])
         LogMsg("AddInterfaceToList: Bad MAC address %.6a for %d %s %#a", &i->ifinfo.MAC, scope_id, i->ifinfo.ifname, &ip);
-    i->ift_family = GetIFTFamily(i->ifinfo.ifname, &i->ift_subfamily);
     // Workaround: For tvOS, never prevent sleep for USB Ethernet interfaces. tvOS instantiates USB Ethernet interfaces
     // with actual IP addresses even though there aren't always physical network interfaces backing them up. This is a
     // problem because when an Apple TV wants to sleep, but has outstanding Bonjour services, the mDNS core will typically
@@ -2981,13 +3052,21 @@ mDNSlocal NetworkInterfaceInfoOSX *AddInterfaceToList(const struct ifaddrs *ifa,
         i->ifinfo.MustNotPreventSleep = mDNStrue;
     }
 
+#if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+    if (collectsRuntimeMDNSMetricsForThisInterface(i))
+    {
+        mdns_forget(&i->ifinfo.delayHistogram);
+        i->ifinfo.delayHistogram = mdns_multicast_delay_histogram_create();
+    }
+#endif
+
     *p = i;
     return(i);
 }
 
 // MARK: - Power State & Configuration Change Management
 
-mDNSlocal mStatus ReorderInterfaceList()
+mDNSlocal mStatus ReorderInterfaceList(void)
 {
     // Disable Reorder lists till <rdar://problem/30071012> is fixed to prevent spurious name conflicts
 #ifdef PR_30071012_FIXED
@@ -3513,6 +3592,9 @@ mDNSlocal int ClearInactiveInterfaces(mDNSs32 utc)
             if (delete)
             {
                 *p = i->next;
+            #if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+                mdns_forget(&i->ifinfo.delayHistogram);
+            #endif
                 freeL("NetworkInterfaceInfoOSX", i);
                 continue;   // After deleting this object, don't want to do the "p = &i->next;" thing at the end of the loop
             }
@@ -4946,7 +5028,7 @@ mDNSlocal void NetworkChanged(SCDynamicStoreRef store, CFArrayRef changedKeys, v
 
                 // The 4th label (index = 3) should be the interface name.
                 if (CFStringGetCString(CFArrayGetValueAtIndex(labels, 3), buf, sizeof(buf), kCFStringEncodingUTF8)
-                    && (strstr(buf, "p2p") || (getExtendedFlags(buf) & (IFEF_DIRECTLINK | IFEF_AWDL)) || IsCarPlaySSID(buf)))
+                    && (strstr(buf, "p2p") || (getExtendedFlags(buf) & (IFEF_DIRECTLINK | IFEF_AWDL)) || util_is_car_play(buf)))
                 {
                     LogInfo("NetworkChanged: interface %s qualifies for reduced change handling delay", buf);
                     c_fast++;
@@ -5161,7 +5243,11 @@ mDNSlocal OSStatus KeychainChanged(SecKeychainEvent keychainEvent, SecKeychainCa
     LogInfo("***   Keychain Changed   ***");
     mDNS *const m = (mDNS *const)context;
     SecKeychainRef skc;
+
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     OSStatus err = SecKeychainCopyDefault(&skc);
+    mdns_clang_ignore_warning_end();
+
     if (!err)
     {
         if (info->keychain == skc)
@@ -5173,12 +5259,19 @@ mDNSlocal OSStatus KeychainChanged(SecKeychainEvent keychainEvent, SecKeychainCa
                 UInt32 tags[3] = { kSecTypeItemAttr, kSecServiceItemAttr, kSecAccountItemAttr };
                 SecKeychainAttributeInfo attrInfo = { 3, tags, NULL };  // Count, array of tags, array of formats
                 SecKeychainAttributeList *a = NULL;
+
+                mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
                 err = SecKeychainItemCopyAttributesAndData(info->item, &attrInfo, NULL, &a, NULL, NULL);
+                mdns_clang_ignore_warning_end();
+
                 if (!err)
                 {
                     relevant = ((a->attr[0].length == 4 && (!strncasecmp(a->attr[0].data, "ddns", 4) || !strncasecmp(a->attr[0].data, "sndd", 4))) ||
                                 (a->attr[1].length >= mDNSPlatformStrLen(dnsprefix) && (!strncasecmp(a->attr[1].data, dnsprefix, mDNSPlatformStrLen(dnsprefix)))));
+
+                    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
                     SecKeychainItemFreeAttributesAndData(a, NULL);
+                    mdns_clang_ignore_warning_end();
                 }
             }
             if (relevant)
@@ -6456,7 +6549,9 @@ mDNSlocal mStatus mDNSPlatformInit_setup(mDNS *const m)
 
     // Explicitly ensure that our Keychain operations utilize the system domain.
 #ifndef NO_SECURITYFRAMEWORK
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     SecKeychainSetPreferenceDomain(kSecPreferencesDomainSystem);
+    mdns_clang_ignore_warning_end();
 #endif
 
     mDNS_Lock(m);
@@ -6465,7 +6560,10 @@ mDNSlocal mStatus mDNSPlatformInit_setup(mDNS *const m)
     mDNS_Unlock(m);
 
 #ifndef NO_SECURITYFRAMEWORK
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     err = SecKeychainAddCallback(KeychainChanged, kSecAddEventMask|kSecDeleteEventMask|kSecUpdateEventMask, m);
+    mdns_clang_ignore_warning_end();
+
     if (err) { LogMsg("mDNSPlatformInit_setup: SecKeychainAddCallback failed %d", err); return(err); }
 #endif
 
@@ -6568,6 +6666,7 @@ mDNSlocal mStatus mDNSPlatformInit_setup(mDNS *const m)
         mdns_trust_init();
    }
 #endif
+
 
     return(mStatus_NoError);
 }
@@ -6870,7 +6969,7 @@ mDNSexport mDNSBool mDNSPlatformInterfaceIsD2D(mDNSInterfaceID InterfaceID)
     return (mDNSBool) info->D2DInterface;
 }
 
-#if MDNSRESPONDER_SUPPORTS(APPLE, RANDOM_AWDL_HOSTNAME) || MDNSRESPONDER_SUPPORTS(APPLE, AWDL_FAST_CACHE_FLUSH)
+#if MDNSRESPONDER_SUPPORTS(APPLE, AWDL)
 mDNSexport mDNSBool mDNSPlatformInterfaceIsAWDL(const mDNSInterfaceID interfaceID)
 {
     return ((
@@ -6881,9 +6980,22 @@ mDNSexport mDNSBool mDNSPlatformInterfaceIsAWDL(const mDNSInterfaceID interfaceI
 #endif
 
 // Filter records send over P2P (D2D) type interfaces
+// Filters all records on interfaces marked as a privacy risk
 // Note that the terms P2P and D2D are used synonymously in the current code and comments.
 mDNSexport mDNSBool mDNSPlatformValidRecordForInterface(const AuthRecord *rr, mDNSInterfaceID InterfaceID)
 {
+    if (InterfaceID != mDNSInterface_Any)
+    {
+        const NetworkInterfaceInfoOSX *const intf = IfindexToInterfaceInfoOSX(InterfaceID);
+        if (intf && intf->isPrivacyRisk)
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEBUG, "mDNSPlatformValidRecordForInterface: Filtering privacy risk -- "
+                "name: " PRI_DM_NAME ", ifname: " PUB_S ", ifid: %d", DM_NAME_PARAM(rr->resrec.name),
+                intf->ifinfo.ifname, IIDPrintable(intf->ifinfo.InterfaceID));
+            return mDNSfalse;
+        }
+    }
+
     // For an explicit match to a valid interface ID, return true.
     if (rr->resrec.InterfaceID == InterfaceID)
         return mDNStrue;
@@ -6962,7 +7074,7 @@ mDNSexport void mDNSPlatformFormatTime(unsigned long te, mDNSu8 *buf, int bufsiz
     strftime((char *)buf, bufsize, "%Y%m%d%H%M%S", &tmTime);
 }
 
-mDNSexport mDNSs32 mDNSPlatformGetPID()
+mDNSexport mDNSs32 mDNSPlatformGetPID(void)
 {
     return getpid();
 }
@@ -7079,8 +7191,8 @@ mDNSexport void GetRandomUUIDLocalHostname(domainname *hostname)
 }
 #endif
 
-#if MDNSRESPONDER_SUPPORTS(APPLE, DNS_ANALYTICS)
-mDNSexport void uDNSMetricsClear(uDNSMetrics *const metrics)
+#if MDNSRESPONDER_SUPPORTS(APPLE, DNS_ANALYTICS) || MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+mDNSexport void DNSMetricsClear(DNSMetrics *const metrics)
 {
     mDNSPlatformMemZero(metrics, (mDNSu32)sizeof(*metrics));
 }

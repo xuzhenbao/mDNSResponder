@@ -1594,7 +1594,7 @@ static char *gettype(char *buffer, char *typ)
 
 #define STRING_64_BYTES "_123456789012345678901234567890123456789012345678901234567890123"
 
-static int API_string_limit_test()
+static int API_string_limit_test(void)
 {
     const char * regtype;
     DNSServiceRef sdRef = NULL;
@@ -1643,7 +1643,7 @@ static int API_string_limit_test()
     return 0;
 }
 
-static int API_NULL_input_test()
+static int API_NULL_input_test(void)
 {
     printf("Running basic API input range tests with various pointer parameters set to NULL:\n");
 
@@ -1947,7 +1947,7 @@ static int API_NULL_input_test()
     return 0;
 }
 
-static int API_input_range_test()
+static int API_input_range_test(void)
 {
 
     if (API_string_limit_test())

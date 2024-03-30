@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 1997-2004 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1997-2023 Apple Computer, Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -153,6 +153,7 @@ extern "C" {
         #include    <netinet/in.h>
         #include    <arpa/inet.h>
         #include    <fcntl.h>
+        #include    <MacTypes.h>
         #include    <pthread.h>
         #include    <sys/ioctl.h>
         #include    <sys/socket.h>

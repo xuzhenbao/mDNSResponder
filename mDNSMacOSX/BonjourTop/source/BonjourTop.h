@@ -520,8 +520,8 @@ public:
 
     BJ_UINT64 m_nFrameCount;
     BJ_UINT64 m_nTotalBytes;
-    long m_StartTime;
-    long m_EndTime;
+    time_t m_StartTime;
+    time_t m_EndTime;
     BJ_UINT64 m_MinAnswerCountForTruncatedFrames;
     BJ_UINT64 m_AvgAnswerCountForTruncatedFrames;
     BJ_UINT64 m_MaxAnswerCountForTruncatedFrames;

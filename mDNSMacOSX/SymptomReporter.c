@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2015-2019, 2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include "SymptomReporter.h"
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, SYMPTOMS) && !MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-#include "mdns_strict.h"
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <stddef.h>
@@ -25,6 +24,7 @@
 #include <sys/socket.h>
 #include <AvailabilityMacros.h>
 #include <SymptomReporter/SymptomReporter.h>
+#include "mdns_strict.h"
 
 #define SYMPTOM_REPORTER_mDNSResponder_NUMERIC_ID  101
 #define SYMPTOM_REPORTER_mDNSResponder_TEXT_ID     "com.apple.mDNSResponder"

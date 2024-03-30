@@ -1,6 +1,6 @@
 /* dso.h
  *
- * Copyright (c) 2018-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 #include "nullability.h"
 
 // Maximum number of additional TLVs we support in a DSO message.
-#define MAX_ADDITLS           10
+#define MAX_ADDITLS           2
 
 // Use 0 to represent an invalid ID for the object dso_connect_t.
 #define DSO_STATE_INVALID_SERIAL 0
@@ -71,6 +71,9 @@ typedef enum {
     kDSOType_SRPLTimeOffset = 0xF916,
     kDSOType_SRPLKeyID = 0xF917,
     kDSOType_SRPLServerStableID = 0xF918,
+    kDSOType_SRPLVersion = 0xF919,
+    kDSOType_SRPLDomainName = 0xF91a,
+    kDSOType_SRPLNewPartner = 0xF91b,
 } dso_message_types_t;
 
 // When a DSO message arrives, or one that was sent is acknowledged, or the state of the DSO connection
@@ -119,6 +122,8 @@ typedef struct dso_disconnect_context {
 typedef struct dso_keepalive_context {
     uint32_t inactivity_timeout;
     uint32_t keepalive_interval;
+    uint16_t xid;
+    bool send_response;
 } dso_keepalive_context_t;
 
 // Structure to represent received DSO TLVs
@@ -178,30 +183,32 @@ typedef bool (*dso_life_cycle_context_callback_t)(const dso_life_cycle_t life_cy
 // DNS Stateless Operations state
 struct dso_state {
     dso_state_t *next;
-    void *context;                   // The context of the next layer up (e.g., a Discovery Proxy)
+    void *context;                     // The context of the next layer up (e.g., a Discovery Proxy)
     // The callback gets called when dso_state_t is created, canceled or freed.
     dso_life_cycle_context_callback_t context_callback;
-    dso_event_callback_t cb;         // Called when an event happens
+    dso_event_callback_t cb;           // Called when an event happens
 
     // Transport state; handled separately for reusability
-    dso_transport_t *transport;		 // The transport (e.g., dso-transport.c or other).
+    dso_transport_t *transport;        // The transport (e.g., dso-transport.c or other).
     dso_transport_finalize_t transport_finalize;
 
-    uint32_t serial;                 // Unique serial number which can be used after the DSO has been dropped.
-    bool is_server;                  // True if the endpoint represented by this DSO state is a server
-                                     // (according to the DSO spec)
-    bool has_session;                // True if DSO session establishment has happened for this DSO endpoint
-    event_time_t response_awaited;   // If we are waiting for a session-establishing response, when it's
-                                     // expected; otherwise zero.
-    uint32_t keepalive_interval;     // Time between keepalives (to be sent, on client, expected, on server)
-    uint32_t inactivity_timeout;     // Session can't be inactive more than this amount of time.
-    event_time_t keepalive_due;      // When the next keepalive is due (to be received or sent)
-    event_time_t inactivity_due;     // When next activity has to happen for connection to remain active
-    dso_activity_t *activities;      // Outstanding DSO activities.
+    uint32_t serial;                   // Unique serial number which can be used after the DSO has been dropped.
+    bool is_server;                    // True if the endpoint represented by this DSO state is a server
+                                       // (according to the DSO spec)
+    bool has_session;                  // True if DSO session establishment has happened for this DSO endpoint
+    event_time_t response_awaited;     // If we are waiting for a session-establishing response, when it's
+                                       // expected; otherwise zero.
+    uint32_t keepalive_interval;       // Time between keepalives (to be sent, on client, expected, on server)
+    uint32_t inactivity_timeout;       // Session can't be inactive more than this amount of time.
+    event_time_t keepalive_due;        // When the next keepalive is due (to be received or sent)
+    event_time_t inactivity_due;       // When next activity has to happen for connection to remain active
+    dso_activity_t *activities;        // Outstanding DSO activities.
 
-    dso_tlv_t primary;               // Primary TLV for current message
-    dso_tlv_t additl[MAX_ADDITLS];   // Additional TLVs
-    int num_additls;                 // Number of additional TLVs in this message
+    dso_tlv_t primary;                 // Primary TLV for current message
+    dso_tlv_t *additl;                 // Additional TLVs
+    unsigned num_additls;              // Number of additional TLVs in this message
+    unsigned max_additls;              // Maximum number of additional TLVs this DSO state can represent
+    dso_tlv_t additl_buf[MAX_ADDITLS]; // Initial buffer for additional TLVs.
 
     char *remote_name;
 
@@ -215,9 +222,11 @@ dso_state_t *dso_state_create(bool is_server, int max_outstanding_queries, const
                         dso_transport_t *transport);
 dso_state_t *dso_find_by_serial(uint32_t serial);
 void dso_state_cancel(dso_state_t *dso);
+void dso_cleanup(bool call_callbacks);
 int32_t dso_idle(void *context, int32_t now, int32_t next_timer_event);
 void dso_set_event_context(dso_state_t *dso, void *context);
 void dso_set_event_callback(dso_state_t *dso, dso_event_callback_t callback);
+void dso_set_life_cycle_callback(dso_state_t *dso, dso_life_cycle_context_callback_t callback);
 void dso_start_tlv(dso_message_t *state, int opcode);
 void dso_add_tlv_bytes(dso_message_t *state, const uint8_t *bytes, size_t len);
 void dso_add_tlv_bytes_no_copy(dso_message_t *state, const uint8_t *bytes, size_t len);
@@ -229,7 +238,8 @@ dso_activity_t *dso_find_activity(dso_state_t *dso, const char *name, const char
 dso_activity_t *dso_add_activity(dso_state_t *dso, const char *name, const char *activity_type,
                                             void *context, void (*finalize)(dso_activity_t *));
 void dso_drop_activity(dso_state_t *dso, dso_activity_t *activity);
-uint32_t dso_ignore_further_responses(dso_state_t *dso, void *context);
+uint32_t dso_ignore_further_responses(dso_state_t *dso, const void *context);
+uint32_t dso_connections_reset_outstanding_query_context(const void *context);
 bool dso_make_message(dso_message_t *state, uint8_t *outbuf, size_t outbuf_size, dso_state_t *dso,
                       bool unidirectional, bool response, uint16_t xid, int rcode, void *callback_state);
 size_t dso_message_length(dso_message_t *state);

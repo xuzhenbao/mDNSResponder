@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2019, 2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,6 +85,13 @@ dnssd_analytics_update_cache_usage_counts(uint32_t inHitMulticastCount, uint32_t
 	uint32_t inHitUnicastCount, uint32_t inMissUnicastCount);
 
 #endif // CACHE_ANALYTICS
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_ASSIST_ANALYTICS)
+
+void
+dnssd_analytics_update_unicast_assist(bool assist, bool unicast);
+
+#endif // UNICAST_ASSIST_ANALYTICS
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, WAB_ANALYTICS)
 

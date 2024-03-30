@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-file-style: "bsd"; c-basic-offset: 4; fill-column: 108; indent-tabs-mode: nil; -*-
  *
- * Copyright (c) 2004-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2004-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -790,4 +790,44 @@ mDNSexport void getLocalTimestampNow(char *const outBuffer, const mDNSu32 buffer
     struct timeval now;
     gettimeofday(&now, mDNSNULL);
     getLocalTimestampFromTimeval(&now, outBuffer, bufferLen);
+}
+
+mDNSexport mDNSu32 getMillisecondsFromTicks(const mDNSs32 ticks)
+{
+    if (ticks <= 0)
+    {
+        return 0;
+    }
+    mDNSu32 adjusted_ticks = ((mDNSu32)ticks);
+
+    const mDNSu32 maxMilliseconds = UINT_MAX;
+    // Number of whole seconds in 2^32 - 1 milliseconds.
+    const mDNSu32 maxWholeSecs = maxMilliseconds / MSEC_PER_SEC;
+    // Number of remaining milliseconds in 2^32 - 1 milliseconds.
+    const mDNSu32 maxReminderMs = maxMilliseconds % MSEC_PER_SEC;
+
+    // Max number of seconds that can be represented by the max ticks argument (2^31 - 1)
+    const mDNSu32 maxWholeSecsFromMaxTicks = (INT_MAX / (mDNSu32)mDNSPlatformOneSecond);
+    // If maxWholeSecs is less than the number of seconds that can be represented by the max ticks argument (2^31 - 1),
+    // then there's possibility of overflow, in which case, we need to clamp the number ticks that can be converted to
+    // milliseconds.
+    if (maxWholeSecs <= maxWholeSecsFromMaxTicks)
+    {
+        // Calculate the maximum number of ticks that will not exceed 2^32 - 1 milliseconds.
+        const mDNSu32 maxWholeSecsTicks = maxWholeSecs * ((mDNSu32)mDNSPlatformOneSecond);
+        const mDNSu32 maxReminderMsTicks = (maxReminderMs * ((mDNSu32)mDNSPlatformOneSecond)) / MSEC_PER_SEC;
+        const mDNSu32 maxTicks = maxWholeSecsTicks + maxReminderMsTicks;
+        // If the ticks argument is greater than the maximum value above, clamp it.
+        if (adjusted_ticks > maxTicks)
+        {
+            adjusted_ticks = maxTicks;
+        }
+    }
+
+    const mDNSu32 wholeSeconds = (adjusted_ticks / ((mDNSu32)mDNSPlatformOneSecond));
+    const mDNSu32 reminderTicks = (adjusted_ticks % ((mDNSu32)mDNSPlatformOneSecond));
+    const mDNSu32 reminderMs = (reminderTicks * ((mDNSs32)MSEC_PER_SEC)) / ((mDNSu32)mDNSPlatformOneSecond);
+    const mDNSu32 milliseconds = (wholeSeconds * MSEC_PER_SEC) + reminderMs;
+
+    return milliseconds;
 }

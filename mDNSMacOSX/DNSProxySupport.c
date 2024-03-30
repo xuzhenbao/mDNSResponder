@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2011-2020, 2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,13 @@
 
 #include "mDNSEmbeddedAPI.h"
 #include "mDNSMacOSX.h"
-#include "mdns_strict.h"
 
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/event.h>
 #include <netinet/tcp.h>
+
+#include "mdns_strict.h"
 
 extern mDNS mDNSStorage;
 

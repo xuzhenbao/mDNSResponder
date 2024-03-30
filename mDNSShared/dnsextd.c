@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1988,7 +1988,7 @@ mDNSlocal void GenLLQEvents(DaemonInfo *d)
             if (!args) { LogErr("GenLLQEvents", "malloc"); return; }
             args->d = d;
             args->a = a;
-            if (pthread_create(&a->tid, NULL, UpdateAnswerList, args) < 0) { LogErr("GenLLQEvents", "pthread_create"); return; }
+            if (pthread_create(&a->tid, NULL, UpdateAnswerList, args) != 0) { LogErr("GenLLQEvents", "pthread_create"); return; }
             usleep(1);
             a = a->next;
         }

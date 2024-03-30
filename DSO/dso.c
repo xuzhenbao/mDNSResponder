@@ -1,6 +1,6 @@
 /* dso.c
  *
- * Copyright (c) 2018-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,6 @@
 
 #include "DNSCommon.h"
 #include "mDNSEmbeddedAPI.h"
-#include "mdns_strict.h"
 #include "dso.h"
 #include "DebugServices.h"   // For check_compile_time
 
@@ -63,6 +62,8 @@ extern uint16_t srp_random16(void);
         #define INFO(fmt, ...)
 
 #endif // STANDALONE
+
+#include "mdns_strict.h"
 
 //*************************************************************************************************************
 // Remaining work TODO
@@ -134,7 +135,7 @@ void dso_state_cancel(dso_state_t *dso)
     }
 }
 
-int32_t dso_idle(void *context, int32_t now, int32_t next_timer_event)
+void dso_cleanup(bool call_callbacks)
 {
     dso_state_t *dso, *dnext;
     dso_activity_t *ap, *anext;
@@ -155,18 +156,28 @@ int32_t dso_idle(void *context, int32_t now, int32_t next_timer_event)
         }
         LogMsg("[DSO%u] dso_state_t finalizing - "
                "dso: %p, remote name: %s, dso->context: %p", dso->serial, dso, dso->remote_name, dso->context);
-        if (dso->cb) {
+        if (dso->cb && call_callbacks) {
             // Because dso->context is the DNSPushServer that uses the current dso_state_t *dso
             // (server->connection) and the server has been canceled by CancelDNSPushServer(), the
             // current dso is not used and cannot be recovered (or reconnected). The only thing we can do is to finalize
             // it.
             dso->cb(dso->context, NULL, dso, kDSOEventType_Finalize);
         } else {
+            if (dso->additl != dso->additl_buf) {
+                mdns_free(dso->additl);
+            }
             mdns_free(dso);
         }
         // Do not touch dso after this point, because it has been freed.
     }
     dso_connections_needing_cleanup = NULL;
+}
+
+int32_t dso_idle(void *context, int32_t now, int32_t next_timer_event)
+{
+    dso_state_t *dso, *dnext;
+
+    dso_cleanup(true);
 
     // Do keepalives.
     for (dso = dso_connections; dso; dso = dnext) {
@@ -201,6 +212,11 @@ int32_t dso_idle(void *context, int32_t now, int32_t next_timer_event)
 void dso_set_event_context(dso_state_t *dso, void *context)
 {
     dso->context = context;
+}
+
+void dso_set_life_cycle_callback(dso_state_t *dso, dso_life_cycle_context_callback_t callback)
+{
+    dso->context_callback = callback;
 }
 
 void dso_set_event_callback(dso_state_t *dso, dso_event_callback_t callback)
@@ -262,6 +278,10 @@ dso_state_t *dso_state_create(bool is_server, int max_outstanding_queries, const
     // DSO_STATE_INVALID_SERIAL(0) is used to identify invalid dso_state_t.
     static uint32_t dso_state_serial = DSO_STATE_INVALID_SERIAL + 1;
     dso->serial = dso_state_serial++;
+
+    // Set up additional additional pointer.
+    dso->additl = dso->additl_buf;
+    dso->max_additls = MAX_ADDITLS;
 
     dso->next = dso_connections;
     dso_connections = dso;
@@ -528,7 +548,7 @@ void dso_drop_activity(dso_state_t *dso, dso_activity_t *activity)
     mdns_free(activity);
 }
 
-uint32_t dso_ignore_further_responses(dso_state_t *dso, void *context)
+uint32_t dso_ignore_further_responses(dso_state_t *dso, const void *const context)
 {
     dso_outstanding_query_state_t *midState = dso->outstanding_queries;
     int i;
@@ -545,6 +565,22 @@ uint32_t dso_ignore_further_responses(dso_state_t *dso, void *context)
     }
 
     return disassociated_count;
+}
+
+uint32_t dso_connections_reset_outstanding_query_context(const void *const context)
+{
+    uint32_t reset_count = 0;
+
+    if (context == NULL) {
+        goto exit;
+    }
+
+    for (dso_state_t *dso_state = dso_connections; dso_state; dso_state = dso_state->next) {
+        reset_count += dso_ignore_further_responses(dso_state, context);
+    }
+
+exit:
+    return reset_count;
 }
 
 bool dso_make_message(dso_message_t *state, uint8_t *outbuf, size_t outbuf_size, dso_state_t *dso,
@@ -613,8 +649,13 @@ bool dso_make_message(dso_message_t *state, uint8_t *outbuf, size_t outbuf_size,
                 }
             }
         } while (!msg_id_ok);
+        if (avail == -1) {
+            LogMsg("dso_make_message: FATAL: no slots available even though there's supposedly space.");
+            return false;
+        }
         midState->queries[avail].id = message_id;
         midState->queries[avail].context = callback_state;
+        LogMsg("dso_make_message: added query xid %x into slot %x, context %p", message_id, avail, callback_state);
         midState->outstanding_query_count++;
         msg_header->id.NotAnInteger = message_id;
         state->outstanding_query_number = avail;
@@ -666,6 +707,8 @@ void dso_keepalive(dso_state_t *dso, const DNSMessageHeader *header)
     memcpy(&context, dso->primary.payload, dso->primary.length);
     context.inactivity_timeout = ntohl(context.inactivity_timeout);
     context.keepalive_interval = ntohl(context.keepalive_interval);
+    context.xid = header->id.NotAnInteger;
+    context.send_response = true;
     if (context.inactivity_timeout > FutureTime || context.keepalive_interval > FutureTime) {
         LogMsg("[DSO%u] inactivity_timeoutl[%u] keepalive_interva[%u] is unreasonably large.",
                dso->serial, context.inactivity_timeout, context.keepalive_interval);
@@ -684,13 +727,18 @@ void dso_keepalive(dso_state_t *dso, const DNSMessageHeader *header)
             }
             dso->cb(dso->context, &context, dso, kDSOEventType_KeepaliveRcvd);
         }
-        dso_send_simple_response(dso, kDNSFlag1_RC_NoErr, header, "No Error");
+        if (context.send_response) {
+            dso_send_simple_response(dso, kDNSFlag1_RC_NoErr, header, "No Error");
+        }
     } else {
         if (dso->keepalive_interval > context.keepalive_interval) {
             dso->keepalive_interval = context.keepalive_interval;
         }
         if (dso->inactivity_timeout > context.inactivity_timeout) {
             dso->inactivity_timeout = context.inactivity_timeout;
+        }
+        if (dso->cb) {
+            dso->cb(dso->context, &context, dso, kDSOEventType_KeepaliveRcvd);
         }
         // Client does not send response.
     }
@@ -801,43 +849,64 @@ void dso_message_received(dso_state_t *dso, const uint8_t *message, size_t messa
     }
 
     // Get the primary TLV and count how many TLVs there are in total
-    offset = 12;
-    while (offset < message_length) {
-        // Get the TLV opcode
-        const uint16_t opcode = (uint16_t)(((uint16_t)message[offset]) << 8) + message[offset + 1];
-        // And the length
-        const uint16_t length = (uint16_t)(((uint16_t)message[offset + 2]) << 8) + message[offset + 3];
+    for (int k = 0; k < 2; k++) {
+        unsigned num_additls = 0;
+        offset = 12;
+        while (offset < message_length) {
+            // Get the TLV opcode
+            const uint16_t opcode = (uint16_t)(((uint16_t)message[offset]) << 8) + message[offset + 1];
+            // And the length
+            const uint16_t length = (uint16_t)(((uint16_t)message[offset + 2]) << 8) + message[offset + 3];
 
-        // Is there room for the contents of this TLV?
-        if (length + offset > message_length) {
-            LogMsg("dso_message_received: fatal: %s: TLV (%d %ld) extends past end (%ld)",
-                   dso->remote_name, opcode, (long)length, (long)message_length);
+            // Is there room for the contents of this TLV?
+            if (length + offset > message_length) {
+                LogMsg("dso_message_received: fatal: %s: TLV (%d %ld) extends past end (%ld)",
+                       dso->remote_name, opcode, (long)length, (long)message_length);
 
-            // Short messages are a fatal error. XXX check DSO document
-            dso_state_cancel(dso);
-            goto out;
-        }
+                // Short messages are a fatal error. XXX check DSO document
+                dso_state_cancel(dso);
+                goto out;
+            }
 
-        // Is this the primary TLV?
-        if (offset == 12) {
-            dso->primary.opcode = opcode;
-            dso->primary.length = length;
-            dso->primary.payload = &message[offset + 4];
-            dso->num_additls = 0;
-        } else {
-            if (dso->num_additls < MAX_ADDITLS) {
-                dso->additl[dso->num_additls].opcode = opcode;
-                dso->additl[dso->num_additls].length = length;
-                dso->additl[dso->num_additls].payload = &message[offset + 4];
-                dso->num_additls++;
+            if (k == 0) {
+                num_additls++;
             } else {
-                // XXX MAX_ADDITLS should be enough for all possible additional TLVs, so this
-                // XXX should never happen; if it does, maybe it's a fatal error.
-                LogMsg("dso_message_received: %s: ignoring additional TLV (%d %ld) in excess of %d",
-                       dso->remote_name, opcode, (long)length, MAX_ADDITLS);
+                // Is this the primary TLV?
+                if (offset == 12) {
+                    dso->primary.opcode = opcode;
+                    dso->primary.length = length;
+                    dso->primary.payload = &message[offset + 4];
+                    dso->num_additls = 0;
+                } else {
+                    if (dso->num_additls < dso->max_additls) {
+                        dso->additl[dso->num_additls].opcode = opcode;
+                        dso->additl[dso->num_additls].length = length;
+                        dso->additl[dso->num_additls].payload = &message[offset + 4];
+                        dso->num_additls++;
+                    } else {
+                        // XXX MAX_ADDITLS should be enough for all possible additional TLVs, so this
+                        // XXX should never happen; if it does, maybe it's a fatal error.
+                        LogMsg("dso_message_received: %s: ignoring additional TLV (%d %ld) in excess of %d",
+                               dso->remote_name, opcode, (long)length, dso->max_additls);
+                    }
+                }
+            }
+            offset += 4 + length;
+        }
+        if (k == 0) {
+            if (num_additls > dso->max_additls) {
+                if (dso->additl != dso->additl_buf) {
+                    mdns_free(dso->additl);
+                }
+                dso->additl = mdns_calloc(num_additls, sizeof(*dso->additl));
+                if (dso->additl == NULL) {
+                    dso->additl = dso->additl_buf;
+                    dso->max_additls = MAX_ADDITLS;
+                } else {
+                    dso->max_additls = num_additls;
+                }
             }
         }
-        offset += 4 + length;
     }
 
     // Call the callback with the message or response

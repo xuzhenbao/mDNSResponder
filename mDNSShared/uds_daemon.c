@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,10 +54,6 @@
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
 #include <mdns/signed_result.h>
 #include <mdns/system.h>
-#endif
-
-#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-#include <bsm/libbsm.h>
 #endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
@@ -156,6 +152,8 @@ mDNSexport DNameListElem *AutoBrowseDomains;        // List created from those l
 
 // ***************************************************************************
 // MARK: - General Utility Functions
+
+#define uds_log_error(FMT, ...) LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR, FMT, __VA_ARGS__)
 
 mDNSlocal mDNSu32 GetNewRequestID(void)
 {
@@ -408,6 +406,31 @@ mDNSexport int IsDebugSocketInUse(void)
 }
 #endif
 
+mDNSlocal void request_state_forget(request_state **const ptr)
+{
+    request_state *req = *ptr;
+    mdns_require_return(req);
+
+    freeL("request_enumeration/request_state_forget", req->enumeration);
+    freeL("request_servicereg/request_state_forget", req->servicereg);
+    freeL("request_resolve/request_state_forget", req->resolve);
+    freeL("QueryRecordClientRequest/request_state_forget", req->queryrecord);
+    freeL("request_browse/request_state_forget", req->browse);
+    freeL("request_port_mapping/request_state_forget", req->pm);
+    freeL("GetAddrInfoClientRequest/request_state_forget", req->addrinfo);
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+    mdns_forget(&req->peer_token);
+#endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
+    mdns_trust_forget(&req->trust);
+#endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
+    mdns_forget(&req->signed_obj);
+#endif
+    freeL("request_state/request_state_forget", req);
+    *ptr = mDNSNULL;
+}
+
 mDNSlocal void AbortUnlinkAndFree(request_state *req)
 {
     request_state **p = &all_requests;
@@ -416,13 +439,7 @@ mDNSlocal void AbortUnlinkAndFree(request_state *req)
     if (*p)
     {
         *p = req->next;
-#if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
-        mdns_trust_forget(&req->trust);
-#endif
-#if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
-        mdns_forget(&req->signed_obj);
-#endif
-        freeL("request_state/AbortUnlinkAndFree", req);
+        request_state_forget(&req);
     }
     else
     {
@@ -564,6 +581,26 @@ mDNSlocal void put_signed_result_tlvs(const uint8_t *data, uint16_t length, ipc_
     uint8_t ** const ptr, const uint8_t * const limit)
 {
     put_tlv(IPC_TLV_TYPE_SERVICE_ATTR_VALIDATION_DATA, length, data, ptr, limit);
+    hdr->ipc_flags |= IPC_FLAGS_TRAILING_TLVS;
+}
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+mDNSlocal void get_tracker_info_tlvs(request_state *const request)
+{
+    if (request->msgptr && (request->hdr.ipc_flags & IPC_FLAGS_TRAILING_TLVS))
+    {
+        const mDNSu8 *const start = (const mDNSu8 *)request->msgptr;
+        const mDNSu8 *const end   = (const mDNSu8 *)request->msgend;
+        uint32_t result = get_tlv_uint32(start, end, IPC_TLV_TYPE_GET_TRACKER_STR, mDNSNULL);
+        request->addTrackerInfo = (result != 0) ? mDNStrue : mDNSfalse;
+    }
+}
+
+mDNSlocal void put_tracker_hostname_tlvs(const char * hostname, ipc_msg_hdr * const hdr, uint8_t ** const ptr,
+    const uint8_t * const limit)
+{
+    put_tlv_string(IPC_TLV_TYPE_SERVICE_ATTR_TRACKER_STR, hostname, ptr, limit, NULL);
     hdr->ipc_flags |= IPC_FLAGS_TRAILING_TLVS;
 }
 #endif
@@ -879,28 +916,6 @@ mDNSlocal mDNSBool AuthorizedDomain(const request_state * const request, const d
 }
 #endif
 
-#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-mDNSlocal void SetupAuditTokenForRequest(request_state *request)
-{
-
-    pid_t audit_pid = audit_token_to_pid(request->audit_token);
-    if (audit_pid == 0)
-    {
-#if !defined(LOCAL_PEERTOKEN)
-#define LOCAL_PEERTOKEN         0x006           /* retrieve peer audit token */
-#endif
-        socklen_t len = sizeof(audit_token_t);
-        int ret = getsockopt(request->sd, SOL_LOCAL, LOCAL_PEERTOKEN, &request->audit_token, &len);
-        if (ret != 0)
-        {
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
-                      "SetupAuditTokenForRequest: No audit_token using LOCAL_PEERTOKEN (%s PID %d) for op %d ret(%d)",
-                      request->pid_name, request->process_id, request->hdr.op, ret);
-        }
-    }
-}
-#endif
-
 // ***************************************************************************
 // MARK: - external helpers
 
@@ -912,7 +927,8 @@ mDNSlocal void external_start_advertising_helper(service_instance *const instanc
     mDNSu32 i;
     const pid_t requestPID = instance->request->process_id;
 
-    if (mDNSIPPortIsZero(instance->request->u.servicereg.port))
+    const request_servicereg *const servicereg = instance->request->servicereg;
+    if (mDNSIPPortIsZero(servicereg->port))
     {
         LogInfo("external_start_advertising_helper: Not registering service with port number zero");
         return;
@@ -920,7 +936,7 @@ mDNSlocal void external_start_advertising_helper(service_instance *const instanc
 
     if (instance->external_advertise) LogMsg("external_start_advertising_helper: external_advertise already set!");
 
-    for (i = 0; i < instance->request->u.servicereg.num_subtypes; i++)
+    for (i = 0; i < servicereg->num_subtypes; i++)
         external_start_advertising_service(&st[i].resrec, instance->request->flags, requestPID);
 
     external_start_advertising_service(&instance->srs.RR_PTR.resrec, instance->request->flags, requestPID);
@@ -946,7 +962,7 @@ mDNSlocal void external_stop_advertising_helper(service_instance *const instance
     if (instance->request)
     {
         const pid_t requestPID = instance->request->process_id;
-        for (i = 0; i < instance->request->u.servicereg.num_subtypes; i++)
+        for (i = 0; i < instance->request->servicereg->num_subtypes; i++)
         {
             external_stop_advertising_service(&st[i].resrec, instance->request->flags, requestPID);
         }
@@ -1007,7 +1023,7 @@ mDNSlocal void unlink_and_free_service_instance(service_instance *srv)
     // clear pointers from parent struct
     if (srv->request)
     {
-        service_instance **p = &srv->request->u.servicereg.instances;
+        service_instance **p = &srv->request->servicereg->instances;
         while (*p)
         {
             if (*p == srv) { *p = (*p)->next; break; }
@@ -1078,26 +1094,25 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
 {
     mStatus err;
     mDNSBool SuppressError = mDNSfalse;
-    service_instance *instance;
     reply_state         *rep;
     (void)m; // Unused
 
     if (!srs)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "regservice_callback: srs is NULL %d", result);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "regservice_callback: srs is NULL %d", result);
         return;
     }
 
-    instance = srs->ServiceContext;
+    service_instance *const instance = srs->ServiceContext;
     if (!instance)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "regservice_callback: srs->ServiceContext is NULL %d", result);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "regservice_callback: srs->ServiceContext is NULL %d", result);
         return;
     }
 
     // don't send errors up to client for wide-area, empty-string registrations
     if (instance->request &&
-        instance->request->u.servicereg.default_domain &&
+        instance->request->servicereg->default_domain &&
         !instance->default_local)
         SuppressError = mDNStrue;
 
@@ -1121,8 +1136,14 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
                 result_description = description;
                 break;
         }
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] DNSServiceRegister(" PRI_DM_NAME ", %u) %s",
-                  request_id, DM_NAME_PARAM(srs->RR_SRV.resrec.name), mDNSVal16(srs->RR_SRV.resrec.rdata->u.srv.port), result_description);
+
+        const mDNSu32 srv_name_hash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, srs->RR_SRV.resrec.name->c,
+            DomainNameLength(srs->RR_SRV.resrec.name));
+
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+            "[R%u] DNSServiceRegister(" PRI_DM_NAME "(%x), %u) %s",
+            request_id, DM_NAME_PARAM(srs->RR_SRV.resrec.name), srv_name_hash,
+            mDNSVal16(srs->RR_SRV.resrec.rdata->u.srv.port), result_description);
     }
 
     if (!instance->request && result != mStatus_MemFree)
@@ -1130,10 +1151,10 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "regservice_callback: instance->request is NULL %d", result);
         return;
     }
-
     if (result == mStatus_NoError)
     {
-        if (instance->request->u.servicereg.allowremotequery)
+        const request_servicereg *const servicereg = instance->request->servicereg;
+        if (servicereg->allowremotequery)
         {
             ExtraResourceRecord *e;
             srs->RR_ADV.AllowRemoteQuery = mDNStrue;
@@ -1148,13 +1169,13 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
         else { append_reply(instance->request, rep); instance->clientnotified = mDNStrue; }
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
-        if (callExternalHelpers(instance->request->u.servicereg.InterfaceID, &instance->domain, instance->request->flags))
+        if (callExternalHelpers(servicereg->InterfaceID, &instance->domain, instance->request->flags))
         {
             LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] regservice_callback: calling external_start_advertising_helper()", instance->request->request_id);
             external_start_advertising_helper(instance);
         }
 #endif
-        if (instance->request->u.servicereg.autoname && CountPeerRegistrations(srs) == 0)
+        if (servicereg->autoname && CountPeerRegistrations(srs) == 0)
             RecordUpdatedNiceLabel(0);   // Successfully got new name, tell user immediately
     }
     else if (result == mStatus_MemFree)
@@ -1165,7 +1186,7 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
             external_stop_advertising_helper(instance);
 #endif
             instance->renameonmemfree = 0;
-            err = mDNS_RenameAndReregisterService(m, srs, &instance->request->u.servicereg.name);
+            err = mDNS_RenameAndReregisterService(m, srs, &instance->request->servicereg->name);
             if (err)
                 LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] ERROR: regservice_callback - RenameAndReregisterService returned %d", instance->request->request_id, err);
             // error should never happen - safest to log and continue
@@ -1175,12 +1196,13 @@ mDNSlocal void regservice_callback(mDNS *const m, ServiceRecordSet *const srs, m
     }
     else if (result == mStatus_NameConflict)
     {
-        if (instance->request->u.servicereg.autorename)
+        const request_servicereg *const servicereg = instance->request->servicereg;
+        if (servicereg->autorename)
         {
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
             external_stop_advertising_helper(instance);
 #endif
-            if (instance->request->u.servicereg.autoname && CountPeerRegistrations(srs) == 0)
+            if (servicereg->autoname && CountPeerRegistrations(srs) == 0)
             {
                 // On conflict for an autoname service, rename and reregister *all* autoname services
                 IncrementLabelSuffix(&m->nicelabel, mDNStrue);
@@ -1220,11 +1242,20 @@ mDNSlocal void regrecord_callback(mDNS *const m, AuthRecord *rr, mStatus result)
     if (!rr->RecordContext)     // parent struct already freed by termination callback
     {
         if (result == mStatus_NoError)
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Error: regrecord_callback: successful registration of orphaned record " PRI_S, ARDisplayString(m, rr));
+        {
+            if (rr->resrec.rrtype == kDNSType_TSR)    // TSR record does not have parent struct
+            {
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "regrecord_callback: successful registration of record " PRI_S, ARDisplayString(m, rr));
+            }
+            else
+            {
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Error: regrecord_callback: successful registration of orphaned record " PRI_S, ARDisplayString(m, rr));
+            }
+        }
         else
         {
             if (result != mStatus_MemFree)
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "regrecord_callback: error %d received after parent termination", result);
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "regrecord_callback: error %d received after parent termination", result);
 
             // We come here when the record is being deregistered either from DNSServiceRemoveRecord or connection_termination.
             // If the record has been updated, we need to free the rdata. Every time we call mDNS_Update, it calls update_callback
@@ -1259,7 +1290,7 @@ mDNSlocal void regrecord_callback(mDNS *const m, AuthRecord *rr, mStatus result)
                     break;
             }
 
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] DNSServiceRegisterRecord(%u " PRI_S ")" PUB_S,
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%u] DNSServiceRegisterRecord(%u " PRI_S ")" PUB_S,
                       request->request_id, re->key, RRDisplayString(m, &rr->resrec), result_description);
         }
 
@@ -1279,17 +1310,17 @@ mDNSlocal void regrecord_callback(mDNS *const m, AuthRecord *rr, mStatus result)
             // If this is a callback to a keepalive record, do not free it.
             if (result == mStatus_BadStateErr)
             {
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                           "[R%u] regrecord_callback: Callback with error code mStatus_BadStateErr - not freeing the record.", request->request_id);
             }
             else
             {
                 // unlink from list, free memory
-                registered_record_entry **ptr = &request->u.reg_recs;
+                registered_record_entry **ptr = &request->reg_recs;
                 while (*ptr && (*ptr) != re) ptr = &(*ptr)->next;
                 if (!*ptr)
                 {
-                    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+                    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                               "[R%u] regrecord_callback - record not in list!", request->request_id);
                     return;
                 }
@@ -1302,14 +1333,14 @@ mDNSlocal void regrecord_callback(mDNS *const m, AuthRecord *rr, mStatus result)
         {
             if (re->external_advertise)
             {
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                           "[R%u] regrecord_callback: external_advertise already set!", request->request_id);
             }
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
             if (callExternalHelpers(re->origInterfaceID, &rr->namestorage, request->flags))
             {
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                           "[R%u] regrecord_callback: calling external_start_advertising_service", request->request_id);
                 external_start_advertising_service(&rr->resrec, request->flags, request->process_id);
                 re->external_advertise = mDNStrue;
@@ -1362,26 +1393,20 @@ mDNSlocal void connection_termination(request_state *request)
             if (tmp->replies) LogMsg("connection_termination ERROR How can subordinate req %p %d have replies queued?", tmp, tmp->sd);
             abort_request(tmp);
             *req = tmp->next;
-#if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
-            mdns_trust_forget(&tmp->trust);
-#endif
-#if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
-            mdns_forget(&tmp->signed_obj);
-#endif
-            freeL("request_state/connection_termination", tmp);
+            request_state_forget(&tmp);
         }
         else
             req = &(*req)->next;
     }
 
-    while (request->u.reg_recs)
+    while (request->reg_recs)
     {
-        registered_record_entry *ptr = request->u.reg_recs;
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        registered_record_entry *ptr = request->reg_recs;
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceRegisterRecord(0x%X, %d, " PRI_S ") STOP PID[%d](" PUB_S ")",
                request->request_id, request->flags, request->interfaceIndex, RRDisplayString(&mDNSStorage, &ptr->rr->resrec), request->process_id,
                request->pid_name);
-        request->u.reg_recs = request->u.reg_recs->next;
+        request->reg_recs = request->reg_recs->next;
         ptr->rr->RecordContext = NULL;
         if (ptr->external_advertise)
         {
@@ -1411,13 +1436,7 @@ mDNSlocal void handle_cancel_request(request_state *request)
             request_state *tmp = *req;
             abort_request(tmp);
             *req = tmp->next;
-#if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
-            mdns_trust_forget(&tmp->trust);
-#endif
-#if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
-            mdns_forget(&tmp->signed_obj);
-#endif
-            freeL("request_state/handle_cancel_request", tmp);
+            request_state_forget(&tmp);
         }
         else
             req = &(*req)->next;
@@ -1458,7 +1477,7 @@ mDNSlocal mStatus _handle_regrecord_request_start(request_state *request, AuthRe
     if (rr->resrec.rroriginalttl == 0)
         rr->resrec.rroriginalttl = DefaultTTLforRRType(rr->resrec.rrtype);
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
            "[R%d] DNSServiceRegisterRecord(0x%X, %d, " PRI_S ") START PID[%d](" PUB_S ")",
            request->request_id, request->flags, request->interfaceIndex, RRDisplayString(&mDNSStorage, &rr->resrec), request->process_id,
            request->pid_name);
@@ -1466,7 +1485,7 @@ mDNSlocal mStatus _handle_regrecord_request_start(request_state *request, AuthRe
     err = mDNS_Register(&mDNSStorage, rr);
     if (err)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceRegisterRecord(0x%X, %d," PRI_S ") ERROR (%d)",
                request->request_id, request->flags, request->interfaceIndex, RRDisplayString(&mDNSStorage, &rr->resrec), err);
         freeL("registered_record_entry", re);
@@ -1475,8 +1494,8 @@ mDNSlocal mStatus _handle_regrecord_request_start(request_state *request, AuthRe
     else
     {
         LogMcastS(rr, request, reg_start);
-        re->next = request->u.reg_recs;
-        request->u.reg_recs = re;
+        re->next = request->reg_recs;
+        request->reg_recs = re;
     }
     return err;
 }
@@ -1488,7 +1507,7 @@ mDNSlocal void _return_regrecord_request_error(request_state *request, mStatus e
     reply_state *rep;
     if (GenerateNTDResponse(NULL, 0, request, &rep, reg_record_reply_op, 0, error) != mStatus_NoError)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] DNSServiceRegisterRecord _return_regrecord_request_error: error(%d)", request->request_id, error);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR, "[R%u] DNSServiceRegisterRecord _return_regrecord_request_error: error(%d)", request->request_id, error);
     }
     else
     {
@@ -1499,9 +1518,9 @@ mDNSlocal void _return_regrecord_request_error(request_state *request, mStatus e
 mDNSlocal mStatus _handle_regrecord_request_with_trust(request_state *request, AuthRecord * rr)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_regrecord_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_WARNING, "[R%u] _handle_regrecord_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_regrecord_request_start(request, rr);
     }
     else
@@ -1517,14 +1536,15 @@ mDNSlocal mStatus _handle_regrecord_request_with_trust(request_state *request, A
             service_ptr = type_str;
         }
 
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_bonjour(request->audit_token, service_ptr, &flags);
+        mdns_trust_status_t status = mdns_trust_check_bonjour(*token, service_ptr, &flags);
         switch (status)
         {
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, service_ptr, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, service_ptr, flags);
                 if (!trust)
                 {
                     freeL("AuthRecord/_handle_regrecord_request_with_trust", rr);
@@ -1592,24 +1612,25 @@ mDNSlocal mStatus regRecordAddTSRRecord(request_state *const request, AuthRecord
     {
         FatalError("ERROR: calloc");
     }
-    mDNS_SetupResourceRecord(ar, mDNSNULL, rr->resrec.InterfaceID, kDNSType_TSR, kHostNameTTL, rr->resrec.RecordType, rr->ARType, mDNSNULL, mDNSNULL);
+    mDNS_SetupResourceRecord(ar, mDNSNULL, rr->resrec.InterfaceID, kDNSType_TSR, kHostNameTTL, kDNSRecordTypeUnique, AuthRecordAny, mDNSNULL, mDNSNULL);
     AssignDomainName(&ar->namestorage, rr->resrec.name);
     ar->resrec.rdlength = (mDNSu16)sizeof(tsrTimestamp);
     ar->resrec.rdata->MaxRDLength = (mDNSu16)rdcapacity;
     // tsr timestamp in memory is time of receipt
     ar->resrec.rdata->u.tsr_value = tsrTimestamp;
     ar->resrec.namehash = DomainNameHashValue(ar->resrec.name);
+    ar->RecordCallback = regrecord_callback;
     SetNewRData(&ar->resrec, mDNSNULL, 0);  // Sets ar->rdatahash for us
 
-    ar->ForceMCast            = ((request->flags & kDNSServiceFlagsForceMulticast) != 0);
-    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] DNSServiceRegisterRecord(0x%X, %d, " PRI_S ") START PID[%d](" PUB_S ")",
+    ar->ForceMCast = ((request->flags & kDNSServiceFlagsForceMulticast) != 0);
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] regRecordAddTSRRecord(0x%X, %d, " PRI_S ") START PID[%d](" PUB_S ")",
               request->request_id, request->flags, request->interfaceIndex, RRDisplayString(&mDNSStorage, &ar->resrec),
               request->process_id, request->pid_name);
 
     err = mDNS_Register(&mDNSStorage, ar);
     if (err)
     {
-        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] DNSServiceRegisterRecord(0x%X, %d," PRI_S ") ERROR (%d)",
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] regRecordAddTSRRecord(0x%X, %d," PRI_S ") ERROR (%d)",
                   request->request_id, request->flags, request->interfaceIndex, RRDisplayString(&mDNSStorage, &ar->resrec), err);
         freeL("registered_record_entry/AuthRecord", ar);
     }
@@ -1628,7 +1649,7 @@ mDNSlocal mStatus updateTSRRecord(const request_state *const request, AuthRecord
     mDNSu32 unsignedTimestamp = (mDNSu32)tsrTimestamp;
     LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "TSR timestamp - name: " PRI_DM_NAME ", new: %d  old: %d",
               DM_NAME_PARAM(tsr->resrec.name), tsrTimestamp, rdb->tsr_value);
-    if (tsrTimestamp - rdb->tsr_value < 0)
+    if (tsrTimestamp - rdb->tsr_value > 0)
     {
         const mDNSu8 rdata[4] = { (unsignedTimestamp >> 24) & 0xFF, (unsignedTimestamp >> 16) & 0xFF,
             (unsignedTimestamp >> 8) & 0xFF, unsignedTimestamp & 0xFF};
@@ -1658,17 +1679,54 @@ mDNSlocal mDNSBool validateTSRTimestamp(mDNSs32 *timestampContinuous, mDNSu32 ts
     return mDNStrue;
 }
 
+mDNSlocal mDNSBool conflictWithAuthRecords(mDNS *const m, const AuthRecord *const rr)
+{
+    const AuthRecord *rp = m->ResourceRecords;
+    const uintptr_t s1 = rr->RRSet ? rr->RRSet : (uintptr_t)rr;
+
+    while (rp)
+    {
+        const uintptr_t s2 = rp->RRSet ? rp->RRSet : (uintptr_t)rp;
+        if (rp->resrec.rrtype != kDNSType_TSR && s1 != s2 &&
+            SameResourceRecordNameClassInterface(rp, rr) &&
+            !IdenticalSameNameRecord(&rp->resrec, &rr->resrec) &&
+            (rr->resrec.RecordType & kDNSRecordTypeUniqueMask || rp->resrec.RecordType & kDNSRecordTypeUniqueMask))
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Conflict with " PRI_S " (%p), InterfaceID %p",
+                      ARDisplayString(&mDNSStorage, rp), rp, rp->resrec.InterfaceID);
+            return mDNStrue;
+        }
+        else
+        {
+            rp = rp->next;
+        }
+    }
+    return mDNSfalse;
+}
+
+
 mDNSlocal mStatus handle_regrecord_request(request_state *request)
 {
     mStatus err = mStatus_BadParamErr;
     AuthRecord *rr;
+    mDNSBool foundTimestampTLV = mDNSfalse;
 
     if (request->terminate != connection_termination)
     { LogMsg("%3d: DNSServiceRegisterRecord(not a shared connection ref)", request->sd); return(err); }
 
     rr = read_rr_from_ipc_msg(request, 1, 1);
+    const mDNSu32 tsrTimestamp = get_service_attr_timestamp_value(request, &foundTimestampTLV);
+    AuthRecord *currentTSR = mDNSGetTSRRecord(&mDNSStorage, rr);
     if (rr)
     {
+        rr->RRSet = (uintptr_t)request->sd;
+        if ((currentTSR || foundTimestampTLV) && conflictWithAuthRecords(&mDNSStorage, rr))
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "handle_regrecord_request: Name conflict " PRI_S " (%p), InterfaceID %p",
+                      ARDisplayString(&mDNSStorage, rr), rr, rr->resrec.InterfaceID);
+            freeL("AuthRecord/handle_regrecord_request", rr);
+            return mStatus_NameConflict;
+        }
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
         if (os_feature_enabled(mDNSResponder, bonjour_privacy) &&
             IsLocalDomain(rr->resrec.name))
@@ -1683,19 +1741,15 @@ mDNSlocal mStatus handle_regrecord_request(request_state *request)
         err = _handle_regrecord_request_start(request, rr);
 #endif
     }
-    if (!err)
+    if (!err && foundTimestampTLV)
     {
-        mDNSBool foundTimestampTLV = mDNSfalse;
-        const mDNSu32 tsrTimestamp = get_service_attr_timestamp_value(request, &foundTimestampTLV);
-
-        if (foundTimestampTLV)
+        mDNSs32 timestampContinuous;
+        if (!validateTSRTimestamp(&timestampContinuous, tsrTimestamp, rr))
         {
-            AuthRecord *currentTSR = mDNSGetTSRRecord(&mDNSStorage, rr);
-            mDNSs32 timestampContinuous;
-            if (!validateTSRTimestamp(&timestampContinuous, tsrTimestamp, rr))
-            {
-                return err;
-            }
+            err = mStatus_BadParamErr;
+        }
+        else
+        {
             if (currentTSR)
             {
                 err = updateTSRRecord(request, currentTSR, timestampContinuous);
@@ -1704,20 +1758,36 @@ mDNSlocal mStatus handle_regrecord_request(request_state *request)
             {
                 err = regRecordAddTSRRecord(request, rr, timestampContinuous);
             }
-            if (!err)
+        }
+        if (!err)
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                      "handle_regrecord_request: TSR record added with tsrTimestamp %d",
+                      timestampContinuous);
+        }
+        else
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
+                      "handle_regrecord_request: Failed to add TSR record with error %d", err);
+            registered_record_entry *re = rr->RecordContext;
+            // unlink rr from list, free memory
+            registered_record_entry **ptr = &request->reg_recs;
+            while (*ptr && (*ptr) != re) ptr = &(*ptr)->next;
+            if (!*ptr)
             {
-                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
-                          "handle_regrecord_request: TSR record added with tsrTimestamp %d",
-                          timestampContinuous);
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
+                          "[R%u] handle_regrecord_request - record not in list!", request->request_id);
             }
             else
             {
-                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
-                          "handle_regrecord_request: Failed to add TSR record with tsrTimestamp %d error %d",
-                          timestampContinuous, err);
+                *ptr = (*ptr)->next;
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR, "[R%u] handle_regrecord_request: TSR fail, removing " PRI_S " (%p), InterfaceID %p",
+                          request->request_id, ARDisplayString(&mDNSStorage, rr), rr, rr->resrec.InterfaceID);
+                rr->RecordContext = NULL;
+                mDNS_Deregister(&mDNSStorage, rr);     // Will free rr for us; we're responsible for freeing re
+                freeL("registered_record_entry handle_regrecord_request", re);
             }
         }
-        rr->RRSet = (uintptr_t)request->sd;
     }
 
     return(err);
@@ -1725,20 +1795,22 @@ mDNSlocal mStatus handle_regrecord_request(request_state *request)
 
 mDNSlocal void UpdateDeviceInfoRecord(mDNS *const m);
 
-mDNSlocal void regservice_termination_callback(request_state *request)
+mDNSlocal void regservice_termination_callback(request_state *const request)
 {
     if (!request)
     {
         LogMsg("regservice_termination_callback context is NULL");
         return;
     }
-    while (request->u.servicereg.instances)
+    request_servicereg *const servicereg = request->servicereg;
+    while (servicereg->instances)
     {
-        service_instance *p = request->u.servicereg.instances;
-        request->u.servicereg.instances = request->u.servicereg.instances->next;
+        service_instance *p = servicereg->instances;
+        servicereg->instances = servicereg->instances->next;
         // only safe to free memory if registration is not valid, i.e. deregister fails (which invalidates p)
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%d] DNSServiceRegister(" PRI_DM_NAME ", %u) STOP PID[%d](" PUB_S ")",
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] DNSServiceRegister(" PRI_DM_NAME "(%x), %u) STOP PID[%d](" PUB_S ")",
                request->request_id, DM_NAME_PARAM(p->srs.RR_SRV.resrec.name),
+               mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, p->srs.RR_SRV.resrec.name->c, DomainNameLength(p->srs.RR_SRV.resrec.name)),
                mDNSVal16(p->srs.RR_SRV.resrec.rdata->u.srv.port), request->process_id, request->pid_name);
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
@@ -1747,7 +1819,7 @@ mDNSlocal void regservice_termination_callback(request_state *request)
 
         // Clear backpointer *before* calling mDNS_DeregisterService/unlink_and_free_service_instance
         // We don't need unlink_and_free_service_instance to cut its element from the list, because we're already advancing
-        // request->u.servicereg.instances as we work our way through the list, implicitly cutting one element at a time
+        // servicereg->instances as we work our way through the list, implicitly cutting one element at a time
         // We can't clear p->request *after* the calling mDNS_DeregisterService/unlink_and_free_service_instance
         // because by then we might have already freed p
         p->request = NULL;
@@ -1758,15 +1830,15 @@ mDNSlocal void regservice_termination_callback(request_state *request)
             // Don't touch service_instance *p after this -- it's likely to have been freed already
         }
     }
-    if (request->u.servicereg.txtdata)
+    if (servicereg->txtdata)
     {
-        freeL("service_info txtdata", request->u.servicereg.txtdata);
-        request->u.servicereg.txtdata = NULL;
+        freeL("service_info txtdata", servicereg->txtdata);
+        servicereg->txtdata = NULL;
     }
-    if (request->u.servicereg.autoname)
+    if (servicereg->autoname)
     {
         // Clear autoname before calling UpdateDeviceInfoRecord() so it doesn't mistakenly include this in its count of active autoname registrations
-        request->u.servicereg.autoname = mDNSfalse;
+        servicereg->autoname = mDNSfalse;
         UpdateDeviceInfoRecord(&mDNSStorage);
     }
 }
@@ -1781,8 +1853,8 @@ mDNSlocal request_state *LocateSubordinateRequest(request_state *request)
     return(request);
 }
 
-mDNSlocal mStatus add_record_to_service(request_state *request, service_instance *instance, mDNSu16 rrtype, mDNSu16 rdlen,
-    const mDNSu8 *const rdata, mDNSu32 ttl)
+mDNSlocal mStatus add_record_to_service(request_state *const request, service_instance *const instance, const mDNSu16 rrtype,
+    const mDNSu16 rdlen, const mDNSu8 *const rdata, const mDNSu32 ttl)
 {
     ServiceRecordSet *srs = &instance->srs;
     mStatus result;
@@ -1794,18 +1866,19 @@ mDNSlocal mStatus add_record_to_service(request_state *request, service_instance
     extra->r.resrec.rdata = &extra->r.rdatastorage;
     extra->r.resrec.rdata->MaxRDLength = (mDNSu16)rdcapacity;
     extra->r.resrec.rdlength = rdlen;
+    const request_servicereg *const servicereg = request->servicereg;
     if (!SetRData(mDNSNULL, rdata, rdata + rdlen, &extra->r.resrec, rdlen))
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
             "[R%u] read_rr_from_ipc_msg: SetRData failed for " PRI_DM_NAME " (" PUB_S ")",
-            request->request_id, DM_NAME_PARAM(request->u.servicereg.instances ?
-            request->u.servicereg.instances->srs.RR_SRV.resrec.name : mDNSNULL), DNSTypeName(rrtype));
+            request->request_id, DM_NAME_PARAM(servicereg->instances ?
+            servicereg->instances->srs.RR_SRV.resrec.name : mDNSNULL), DNSTypeName(rrtype));
         freeL("ExtraResourceRecord/add_record_to_service", extra);
         return mStatus_BadParamErr;
     }
     SetNewRData(&extra->r.resrec, mDNSNULL, 0);  // Sets rr->rdatahash for us
     // use InterfaceID value from DNSServiceRegister() call that created the original service
-    extra->r.resrec.InterfaceID = request->u.servicereg.InterfaceID;
+    extra->r.resrec.InterfaceID = servicereg->InterfaceID;
 
     result = mDNS_AddRecordToService(&mDNSStorage, srs, extra, &extra->r.rdatastorage, ttl, request->flags);
     if (result)
@@ -1818,7 +1891,7 @@ mDNSlocal mStatus add_record_to_service(request_state *request, service_instance
     extra->ClientID = request->hdr.reg_index;
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
     if (   instance->external_advertise
-           && callExternalHelpers(request->u.servicereg.InterfaceID, &instance->domain, request->flags))
+           && callExternalHelpers(servicereg->InterfaceID, &instance->domain, request->flags))
     {
         LogInfo("add_record_to_service: calling external_start_advertising_service");
         external_start_advertising_service(&extra->r.resrec, request->flags, request->process_id);
@@ -1841,7 +1914,7 @@ mDNSlocal mStatus handle_add_request(request_state *request)
 
     if (!request->msgptr)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceAddRecord(unreadable parameters)", request->request_id);
         return(mStatus_BadParamErr);
     }
@@ -1851,26 +1924,27 @@ mDNSlocal mStatus handle_add_request(request_state *request)
 
     if (request->terminate != regservice_termination_callback)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceAddRecord(not a registered service ref)", request->request_id);
         return(mStatus_BadParamErr);
     }
 
     // For a service registered with zero port, don't allow adding records. This mostly happens due to a bug
     // in the application. See radar://9165807.
-    if (mDNSIPPortIsZero(request->u.servicereg.port))
+    const request_servicereg *const servicereg = request->servicereg;
+    if (mDNSIPPortIsZero(servicereg->port))
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceAddRecord: adding record to a service registered with zero port", request->request_id);
         return(mStatus_BadParamErr);
     }
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
            "[R%d] DNSServiceAddRecord(%X, " PRI_DM_NAME ", " PUB_S ", %d) PID[%d](" PUB_S ")",
            request->request_id, flags,
-           DM_NAME_PARAM((request->u.servicereg.instances) ? (request->u.servicereg.instances->srs.RR_SRV.resrec.name) : mDNSNULL),
+           DM_NAME_PARAM((servicereg->instances) ? (servicereg->instances->srs.RR_SRV.resrec.name) : mDNSNULL),
            DNSTypeName(rrtype), rdlen, request->process_id, request->pid_name);
 
-    for (i = request->u.servicereg.instances; i; i = i->next)
+    for (i = servicereg->instances; i; i = i->next)
     {
         result = add_record_to_service(request, i, rrtype, rdlen, rdata, ttl);
         if (result && i->default_local) break;
@@ -1991,13 +2065,13 @@ mDNSlocal mStatus handle_update_request(request_state *request)
 
     if (!request->msgptr)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceUpdateRecord(unreadable parameters)", request->request_id);
         return(mStatus_BadParamErr);
     }
 
     const mDNSu32 tsrTimestamp = get_service_attr_timestamp_value(request, &foundTimestampTLV);
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
             "[R%d] DNSServiceUpdateRecord foundTimestampTLV[%s], tsrTimestamp[%u]", request->request_id,
             foundTimestampTLV ? "true" : "false", tsrTimestamp);
 
@@ -2007,8 +2081,7 @@ mDNSlocal mStatus handle_update_request(request_state *request)
     if (request->terminate == connection_termination)
     {
         // update an individually registered record
-        registered_record_entry *reptr;
-        for (reptr = request->u.reg_recs; reptr; reptr = reptr->next)
+        for (const registered_record_entry *reptr = request->reg_recs; reptr; reptr = reptr->next)
         {
             if (reptr->key == hdr->reg_index)
             {
@@ -2020,7 +2093,7 @@ mDNSlocal mStatus handle_update_request(request_state *request)
                 {
                     result = update_record(reptr->rr, rdlen, rdata, ttl, &reptr->external_advertise, request->request_id);
                 }
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                        "[R%d] DNSServiceUpdateRecord(" PRI_DM_NAME ", " PUB_S ") PID[%d](" PUB_S ")",
                        request->request_id, DM_NAME_PARAM(reptr->rr->resrec.name),
                        reptr->rr ? foundTimestampTLV ? "TSR" : DNSTypeName(reptr->rr->resrec.rrtype) : "<NONE>",
@@ -2034,15 +2107,16 @@ mDNSlocal mStatus handle_update_request(request_state *request)
 
     if (request->terminate != regservice_termination_callback)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceUpdateRecord(not a registered service ref)", request->request_id);
         return(mStatus_BadParamErr);
     }
 
     // For a service registered with zero port, only SRV record is initialized. Don't allow any updates.
-    if (mDNSIPPortIsZero(request->u.servicereg.port))
+    request_servicereg *servicereg = request->servicereg;
+    if (mDNSIPPortIsZero(servicereg->port))
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceUpdateRecord: updating the record of a service registered with zero port", request->request_id);
         return(mStatus_BadParamErr);
     }
@@ -2050,19 +2124,19 @@ mDNSlocal mStatus handle_update_request(request_state *request)
     // update the saved off TXT data for the service
     if (!foundTimestampTLV && hdr->reg_index == TXT_RECORD_INDEX)
     {
-        if (request->u.servicereg.txtdata)
-        { freeL("service_info txtdata", request->u.servicereg.txtdata); request->u.servicereg.txtdata = NULL; }
+        if (servicereg->txtdata)
+        { freeL("service_info txtdata", servicereg->txtdata); servicereg->txtdata = NULL; }
         if (rdlen > 0)
         {
-            request->u.servicereg.txtdata = mallocL("service_info txtdata", rdlen);
-            if (!request->u.servicereg.txtdata) FatalError("ERROR: handle_update_request - malloc");
-            mDNSPlatformMemCopy(request->u.servicereg.txtdata, rdata, rdlen);
+            servicereg->txtdata = mallocL("service_info txtdata", rdlen);
+            if (!servicereg->txtdata) FatalError("ERROR: handle_update_request - malloc");
+            mDNSPlatformMemCopy(servicereg->txtdata, rdata, rdlen);
         }
-        request->u.servicereg.txtlen = rdlen;
+        servicereg->txtlen = rdlen;
     }
 
     // update a record from a service record set
-    for (i = request->u.servicereg.instances; i; i = i->next)
+    for (i = servicereg->instances; i; i = i->next)
     {
         if (hdr->reg_index == TXT_RECORD_INDEX) rr = &i->srs.RR_TXT;
         else
@@ -2088,11 +2162,18 @@ mDNSlocal mStatus handle_update_request(request_state *request)
 
 end:
     if (request->terminate == regservice_termination_callback)
-        LogOperation("%3d: DNSServiceUpdateRecord(%##s, %s)  PID[%d](%s)", request->sd,
-                     (request->u.servicereg.instances) ? request->u.servicereg.instances->srs.RR_SRV.resrec.name->c : NULL,
-                     rr ? foundTimestampTLV ? "TSR" : DNSTypeName(rr->resrec.rrtype) : "<NONE>",
-                     request->process_id, request->pid_name);
-
+    {
+        servicereg = request->servicereg;
+        const domainname *const srvName =
+            (servicereg->instances ? servicereg->instances->srs.RR_SRV.resrec.name : mDNSNULL);
+        const mDNSu32 nameHash =
+            (srvName ? mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, srvName->c, DomainNameLength(srvName)) : 0);
+        const uint16_t rrType = (rr ? rr->resrec.rrtype : 0);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+            "[R%u] DNSServiceUpdateRecord(" PRI_DM_NAME "(%x), " PUB_DNS_TYPE ") UPDATE PID[%d](%s)",
+            request->request_id, DM_NAME_PARAM(srvName), nameHash, DNS_TYPE_PARAM(rrType),
+            request->process_id, request->pid_name);
+    }
     return(result);
 }
 
@@ -2100,7 +2181,7 @@ end:
 mDNSlocal mStatus remove_record(request_state *request)
 {
     mStatus err = mStatus_UnknownErr;
-    registered_record_entry *e, **ptr = &request->u.reg_recs;
+    registered_record_entry *e, **ptr = &request->reg_recs;
 
     while (*ptr && (*ptr)->key != request->hdr.reg_index) ptr = &(*ptr)->next;
     if (!*ptr) { LogMsg("%3d: DNSServiceRemoveRecord(%u) not found", request->sd, request->hdr.reg_index); return mStatus_BadReferenceErr; }
@@ -2158,7 +2239,7 @@ mDNSlocal mStatus handle_removerecord_request(request_state *request)
 
     if (!request->msgptr)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                "[R%d] DNSServiceRemoveRecord(unreadable parameters)", request->request_id);
         return(mStatus_BadParamErr);
     }
@@ -2178,7 +2259,7 @@ mDNSlocal mStatus handle_removerecord_request(request_state *request)
     // So if that's not the case, the request is invalid.
     else if (request->terminate != regservice_termination_callback)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                   "[R%d] DNSServiceRemoveRecord(not a registered service ref)", request->request_id);
         return(mStatus_BadParamErr);
     }
@@ -2189,18 +2270,17 @@ mDNSlocal mStatus handle_removerecord_request(request_state *request)
         // In this case request is a request created with DNSServiceRegister, and there may be more than one
         // instance if there is more than one default registration domain, so we have to iterate across the
         // instances and remove the record from each instance individually, if it is present.
-        for (i = request->u.servicereg.instances; i; i = i->next)
+        const request_servicereg *const servicereg = request->servicereg;
+        for (i = servicereg->instances; i; i = i->next)
         {
             err = remove_extra(request, i, &rrtype);
             if (err && i->default_local) break;
             else err = mStatus_NoError;  // suppress non-local default errors
         }
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
                   "[R%d] DNSServiceRemoveRecord(" PRI_DM_NAME ", " PUB_S ") PID[%d](" PUB_S "): %d",
                   request->request_id,
-                  DM_NAME_PARAM((request->u.servicereg.instances)
-                                ? (request->u.servicereg.instances->srs.RR_SRV.resrec.name)
-                                : mDNSNULL),
+                  DM_NAME_PARAM(servicereg->instances ? servicereg->instances->srs.RR_SRV.resrec.name : mDNSNULL),
                   rrtype ? DNSTypeName(rrtype) : "<NONE>", request->process_id, request->pid_name, err);
     }
 
@@ -2291,13 +2371,14 @@ mDNSlocal AuthRecord *AllocateSubTypes(mDNSu32 NumSubTypes, char *p)
     return(st);
 }
 
-mDNSlocal mStatus register_service_instance(request_state *request, const domainname *domain)
+mDNSlocal mStatus register_service_instance(request_state *const request, const domainname *const domain)
 {
     service_instance **ptr, *instance;
-    size_t extra_size = (request->u.servicereg.txtlen > sizeof(RDataBody)) ? (request->u.servicereg.txtlen - sizeof(RDataBody)) : 0;
+    request_servicereg *const servicereg = request->servicereg;
+    size_t extra_size = (servicereg->txtlen > sizeof(RDataBody)) ? (servicereg->txtlen - sizeof(RDataBody)) : 0;
     const mDNSBool DomainIsLocal = SameDomainName(domain, &localdomain);
     mStatus result;
-    mDNSInterfaceID interfaceID = request->u.servicereg.InterfaceID;
+    mDNSInterfaceID interfaceID = servicereg->InterfaceID;
     mDNSBool foundTimestampTLV = mDNSfalse;
     const mDNSu32 tsrTimestamp = get_service_attr_timestamp_value(request, &foundTimestampTLV);
     mDNSs32 timestampContinuous = 0;
@@ -2315,14 +2396,14 @@ mDNSlocal mStatus register_service_instance(request_state *request, const domain
     // registrations scoped to a specific interface, so for the automatic domains we add we must *not* specify an interface.
     // (Specifying an interface with an apparently wide-area domain (i.e. something other than "local")
     // currently forces the registration to use mDNS multicast despite the apparently wide-area domain.)
-    if (request->u.servicereg.default_domain && !DomainIsLocal) interfaceID = mDNSInterface_Any;
+    if (servicereg->default_domain && !DomainIsLocal) interfaceID = mDNSInterface_Any;
 
-    for (ptr = &request->u.servicereg.instances; *ptr; ptr = &(*ptr)->next)
+    for (ptr = &servicereg->instances; *ptr; ptr = &(*ptr)->next)
     {
         if (SameDomainName(&(*ptr)->domain, domain))
         {
             LogMsg("register_service_instance: domain %##s already registered for %#s.%##s",
-                   domain->c, &request->u.servicereg.name, &request->u.servicereg.type);
+                   domain->c, &servicereg->name, &servicereg->type);
             return mStatus_AlreadyRegistered;
         }
     }
@@ -2334,13 +2415,13 @@ mDNSlocal mStatus register_service_instance(request_state *request, const domain
     instance->request                       = request;
     instance->renameonmemfree               = 0;
     instance->clientnotified                = mDNSfalse;
-    instance->default_local                 = (request->u.servicereg.default_domain && DomainIsLocal);
+    instance->default_local                 = (servicereg->default_domain && DomainIsLocal);
     instance->external_advertise            = mDNSfalse;
     AssignDomainName(&instance->domain, domain);
 
-    instance->subtypes = AllocateSubTypes(request->u.servicereg.num_subtypes, request->u.servicereg.type_as_string);
+    instance->subtypes = AllocateSubTypes(servicereg->num_subtypes, servicereg->type_as_string);
 
-    if (request->u.servicereg.num_subtypes && !instance->subtypes)
+    if (servicereg->num_subtypes && !instance->subtypes)
     {
         unlink_and_free_service_instance(instance);
         instance = NULL;
@@ -2348,11 +2429,11 @@ mDNSlocal mStatus register_service_instance(request_state *request, const domain
     }
 
     result = mDNS_RegisterService(&mDNSStorage, &instance->srs,
-                                  &request->u.servicereg.name, &request->u.servicereg.type, domain,
-                                  request->u.servicereg.host.c[0] ? &request->u.servicereg.host : NULL,
-                                  request->u.servicereg.port,
-                                  mDNSNULL, request->u.servicereg.txtdata, request->u.servicereg.txtlen,
-                                  instance->subtypes, request->u.servicereg.num_subtypes,
+                                  &servicereg->name, &servicereg->type, domain,
+                                  servicereg->host.c[0] ? &servicereg->host : NULL,
+                                  servicereg->port,
+                                  mDNSNULL, servicereg->txtdata, servicereg->txtlen,
+                                  instance->subtypes, servicereg->num_subtypes,
                                   interfaceID, regservice_callback, instance, request->flags);
     if (!result && foundTimestampTLV)
     {
@@ -2383,15 +2464,23 @@ mDNSlocal mStatus register_service_instance(request_state *request, const domain
 
     if (!result)
     {
-        *ptr = instance;        // Append this to the end of our request->u.servicereg.instances list
-        LogOperation("%3d: DNSServiceRegister(%##s, %u) ADDED", instance->request->sd,
-                     instance->srs.RR_SRV.resrec.name->c, mDNSVal16(request->u.servicereg.port));
+        *ptr = instance;        // Append this to the end of our servicereg->instances list
+        const mDNSu32 srv_name_hash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, instance->srs.RR_SRV.resrec.name->c,
+            DomainNameLength(instance->srs.RR_SRV.resrec.name));
+        const mDNSu32 ptr_name_hash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, instance->srs.RR_PTR.resrec.name->c,
+            DomainNameLength(instance->srs.RR_PTR.resrec.name));
+
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+            "[R%u] DNSServiceRegister(" PRI_DM_NAME "(%x), %u) ADDED "
+            "-- PTR name hash: %x", request->request_id, DM_NAME_PARAM(instance->srs.RR_SRV.resrec.name),
+            srv_name_hash, mDNSVal16(servicereg->port), ptr_name_hash);
+
         LogMcastS(&instance->srs.RR_SRV, request, reg_start);
     }
     else
     {
         LogMsg("register_service_instance %#s.%##s%##s error %d",
-               &request->u.servicereg.name, &request->u.servicereg.type, domain->c, result);
+               &servicereg->name, &servicereg->type, domain->c, result);
         unlink_and_free_service_instance(instance);
     }
 
@@ -2405,11 +2494,12 @@ mDNSlocal void udsserver_default_reg_domain_changed(const DNameListElem *const d
     LogMsg("%s registration domain %##s", add ? "Adding" : "Removing", d->name.c);
     for (request = all_requests; request; request = request->next)
     {
+        request_servicereg *const servicereg = request->servicereg;
         if (request->terminate != regservice_termination_callback) continue;
-        if (!request->u.servicereg.default_domain) continue;
+        if (!servicereg->default_domain) continue;
         if (!d->uid || SystemUID(request->uid) || request->uid == d->uid)
         {
-            service_instance **ptr = &request->u.servicereg.instances;
+            service_instance **ptr = &servicereg->instances;
             while (*ptr && !SameDomainName(&(*ptr)->domain, &d->name)) ptr = &(*ptr)->next;
             if (add)
             {
@@ -2424,7 +2514,7 @@ mDNSlocal void udsserver_default_reg_domain_changed(const DNameListElem *const d
                 // and regservice_callback then calls unlink_and_free_service_instance and disposes of that instance.
                 if (!*ptr)
                     LogMsg("udsserver_default_reg_domain_changed domain %##s not found for service %#s type %s",
-                           &d->name, request->u.servicereg.name.c, request->u.servicereg.type_as_string);
+                           &d->name, servicereg->name.c, servicereg->type_as_string);
                 else
                 {
                     DNameListElem *p;
@@ -2474,7 +2564,7 @@ mDNSlocal mDNSBool PreDefinedInterfaceIndex(mDNSu32 interfaceIndex)
     }
 }
 
-mDNSlocal mStatus _handle_regservice_request_start(request_state *request, const domainname * const d)
+mDNSlocal mStatus _handle_regservice_request_start(request_state *const request, const domainname *const d)
 {
     mStatus err;
 
@@ -2486,9 +2576,10 @@ mDNSlocal mStatus _handle_regservice_request_start(request_state *request, const
 #endif
     if (!err)
     {
-        if (request->u.servicereg.autoname) UpdateDeviceInfoRecord(&mDNSStorage);
+        const request_servicereg *const servicereg = request->servicereg;
+        if (servicereg->autoname) UpdateDeviceInfoRecord(&mDNSStorage);
 
-        if (request->u.servicereg.default_domain)
+        if (servicereg->default_domain)
         {
             DNameListElem *ptr;
             // Note that we don't report errors for non-local, non-explicit domains
@@ -2502,12 +2593,13 @@ mDNSlocal mStatus _handle_regservice_request_start(request_state *request, const
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
 
-mDNSlocal void _return_regservice_request_error(request_state *request, mStatus error)
+mDNSlocal void _return_regservice_request_error(request_state *const request, const mStatus error)
 {
-    if (request->u.servicereg.txtdata)
+    request_servicereg *const servicereg = request->servicereg;
+    if (servicereg->txtdata)
     {
-        freeL("service_info txtdata", request->u.servicereg.txtdata);
-        request->u.servicereg.txtdata = NULL;
+        freeL("service_info txtdata", servicereg->txtdata);
+        servicereg->txtdata = NULL;
     }
 
     reply_state *rep;
@@ -2521,23 +2613,25 @@ mDNSlocal void _return_regservice_request_error(request_state *request, mStatus 
     }
 }
 
-mDNSlocal mStatus _handle_regservice_request_with_trust(request_state *request, const domainname * const d)
+mDNSlocal mStatus _handle_regservice_request_with_trust(request_state *const request, const domainname *const d)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_regservice_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_regservice_request_start(request, d);
     }
     else
     {
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_register_service(request->audit_token, request->u.servicereg.type_as_string, &flags);
+        const request_servicereg *const servicereg = request->servicereg;
+        mdns_trust_status_t status = mdns_trust_check_register_service(*token, servicereg->type_as_string, &flags);
         switch (status) {
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, request->u.servicereg.type_as_string, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, servicereg->type_as_string, flags);
                 if (!trust)
                 {
                     err = mStatus_NoMemoryErr;
@@ -2600,7 +2694,7 @@ exit:
 }
 #endif // TRUST_ENFORCEMENT
 
-mDNSlocal mStatus handle_regservice_request(request_state *request)
+mDNSlocal mStatus handle_regservice_request(request_state *const request)
 {
     char name[256]; // Lots of spare space for extra-long names that we'll auto-truncate down to 63 bytes
     char domain[MAX_ESCAPED_DOMAIN_NAME], host[MAX_ESCAPED_DOMAIN_NAME];
@@ -2614,6 +2708,12 @@ mDNSlocal mStatus handle_regservice_request(request_state *request)
     mDNSInterfaceID InterfaceID;
     mDNSs32 subtypeCount;
 
+    if (!request->servicereg)
+    {
+        request->servicereg = (request_servicereg *)callocL("request_servicereg", sizeof(*request->servicereg));
+        mdns_require_action_quiet(request->servicereg, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for service registration request", request->request_id));
+    }
     // Map kDNSServiceInterfaceIndexP2P to kDNSServiceInterfaceIndexAny with the
     // kDNSServiceFlagsIncludeP2P flag set.
     if (interfaceIndex == kDNSServiceInterfaceIndexP2P)
@@ -2650,48 +2750,49 @@ mDNSlocal mStatus handle_regservice_request(request_state *request)
 
     request->flags = flags;
     request->interfaceIndex = interfaceIndex;
-    request->u.servicereg.InterfaceID = InterfaceID;
-    request->u.servicereg.instances = NULL;
-    request->u.servicereg.txtlen  = 0;
-    request->u.servicereg.txtdata = NULL;
-    mDNSPlatformStrLCopy(request->u.servicereg.type_as_string, type_as_string, sizeof(request->u.servicereg.type_as_string));
+    request_servicereg *const servicereg = request->servicereg;
+    servicereg->InterfaceID = InterfaceID;
+    servicereg->instances = NULL;
+    servicereg->txtlen  = 0;
+    servicereg->txtdata = NULL;
+    mDNSPlatformStrLCopy(servicereg->type_as_string, type_as_string, sizeof(servicereg->type_as_string));
 
     if (request->msgptr + 2 > request->msgend) request->msgptr = NULL;
     else
     {
-        request->u.servicereg.port.b[0] = *request->msgptr++;
-        request->u.servicereg.port.b[1] = *request->msgptr++;
+        servicereg->port.b[0] = *request->msgptr++;
+        servicereg->port.b[1] = *request->msgptr++;
     }
 
-    request->u.servicereg.txtlen = get_uint16(&request->msgptr, request->msgend);
-    msgTXTData = get_rdata(&request->msgptr, request->msgend, request->u.servicereg.txtlen);
+    servicereg->txtlen = get_uint16(&request->msgptr, request->msgend);
+    msgTXTData = get_rdata(&request->msgptr, request->msgend, servicereg->txtlen);
 
     if (!request->msgptr) { LogMsg("%3d: DNSServiceRegister(unreadable parameters)", request->sd); return(mStatus_BadParamErr); }
 
-    if (request->u.servicereg.txtlen)
+    if (servicereg->txtlen)
     {
-        request->u.servicereg.txtdata = mallocL("service_info txtdata", request->u.servicereg.txtlen);
-        if (!request->u.servicereg.txtdata) FatalError("ERROR: handle_regservice_request - malloc");
-        mDNSPlatformMemCopy(request->u.servicereg.txtdata, msgTXTData, request->u.servicereg.txtlen);
+        servicereg->txtdata = mallocL("service_info txtdata", servicereg->txtlen);
+        if (!servicereg->txtdata) FatalError("ERROR: handle_regservice_request - malloc");
+        mDNSPlatformMemCopy(servicereg->txtdata, msgTXTData, servicereg->txtlen);
     }
 
     // Check for sub-types after the service type
-    subtypeCount = ChopSubTypes(request->u.servicereg.type_as_string);    // Note: Modifies regtype string to remove trailing subtypes
+    subtypeCount = ChopSubTypes(servicereg->type_as_string);    // Note: Modifies regtype string to remove trailing subtypes
     if (subtypeCount < 0)
     {
-        LogMsg("ERROR: handle_regservice_request - ChopSubTypes failed %s", request->u.servicereg.type_as_string);
+        LogMsg("ERROR: handle_regservice_request - ChopSubTypes failed %s", servicereg->type_as_string);
         goto bad_param;
     }
-    request->u.servicereg.num_subtypes = (mDNSu32)subtypeCount;
+    servicereg->num_subtypes = (mDNSu32)subtypeCount;
 
     // Don't try to construct "domainname t" until *after* ChopSubTypes has worked its magic
-    if (!*request->u.servicereg.type_as_string || !MakeDomainNameFromDNSNameString(&request->u.servicereg.type, request->u.servicereg.type_as_string))
-    { LogMsg("ERROR: handle_regservice_request - type_as_string bad %s", request->u.servicereg.type_as_string); goto bad_param; }
+    if (!*servicereg->type_as_string || !MakeDomainNameFromDNSNameString(&servicereg->type, servicereg->type_as_string))
+    { LogMsg("ERROR: handle_regservice_request - type_as_string bad %s", servicereg->type_as_string); goto bad_param; }
 
     if (!name[0])
     {
-        request->u.servicereg.name = mDNSStorage.nicelabel;
-        request->u.servicereg.autoname = mDNStrue;
+        servicereg->name = mDNSStorage.nicelabel;
+        servicereg->autoname = mDNStrue;
     }
     else
     {
@@ -2701,49 +2802,57 @@ mDNSlocal mStatus handle_regservice_request(request_state *request)
             const mDNSu32 newlen = TruncateUTF8ToLength((mDNSu8*)name, mDNSPlatformStrLen(name), MAX_DOMAIN_LABEL);
             name[newlen] = 0;
         }
-        if (!MakeDomainLabelFromLiteralString(&request->u.servicereg.name, name))
+        if (!MakeDomainLabelFromLiteralString(&servicereg->name, name))
         { LogMsg("ERROR: handle_regservice_request - name bad %s", name); goto bad_param; }
-        request->u.servicereg.autoname = mDNSfalse;
+        servicereg->autoname = mDNSfalse;
     }
 
     if (*domain)
     {
-        request->u.servicereg.default_domain = mDNSfalse;
+        servicereg->default_domain = mDNSfalse;
         if (!MakeDomainNameFromDNSNameString(&d, domain))
         { LogMsg("ERROR: handle_regservice_request - domain bad %s", domain); goto bad_param; }
     }
     else
     {
-        request->u.servicereg.default_domain = mDNStrue;
+        servicereg->default_domain = mDNStrue;
         MakeDomainNameFromDNSNameString(&d, "local.");
     }
 
-    if (!ConstructServiceName(&srv, &request->u.servicereg.name, &request->u.servicereg.type, &d))
+    if (!ConstructServiceName(&srv, &servicereg->name, &servicereg->type, &d))
     {
         LogMsg("ERROR: handle_regservice_request - Couldn't ConstructServiceName from, “%#s” “%##s” “%##s”",
-               request->u.servicereg.name.c, request->u.servicereg.type.c, d.c); goto bad_param;
+               servicereg->name.c, servicereg->type.c, d.c); goto bad_param;
     }
 
-    if (!MakeDomainNameFromDNSNameString(&request->u.servicereg.host, host))
+    if (!MakeDomainNameFromDNSNameString(&servicereg->host, host))
     { LogMsg("ERROR: handle_regservice_request - host bad %s", host); goto bad_param; }
-    request->u.servicereg.autorename       = (flags & kDNSServiceFlagsNoAutoRename    ) == 0;
-    request->u.servicereg.allowremotequery = (flags & kDNSServiceFlagsAllowRemoteQuery) != 0;
+    servicereg->autorename       = (flags & kDNSServiceFlagsNoAutoRename    ) == 0;
+    servicereg->allowremotequery = (flags & kDNSServiceFlagsAllowRemoteQuery) != 0;
 
     // Some clients use mDNS for lightweight copy protection, registering a pseudo-service with
     // a port number of zero. When two instances of the protected client are allowed to run on one
     // machine, we don't want to see misleading "Bogus client" messages in syslog and the console.
-    if (!mDNSIPPortIsZero(request->u.servicereg.port))
+    if (!mDNSIPPortIsZero(servicereg->port))
     {
-        int count = CountExistingRegistrations(&srv, request->u.servicereg.port);
+        int count = CountExistingRegistrations(&srv, servicereg->port);
         if (count)
             LogMsg("Client application[%d](%s) registered %d identical instances of service %##s port %u.", request->process_id,
-                   request->pid_name, count+1, srv.c, mDNSVal16(request->u.servicereg.port));
+                   request->pid_name, count+1, srv.c, mDNSVal16(servicereg->port));
     }
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d] DNSServiceRegister(%X, %d, \"" PRI_S "\", \"" PRI_S "\", \"" PRI_S "\", \"" PRI_S "\", %u) START PID[%d](" PUB_S ")",
-           request->request_id, request->flags, interfaceIndex, name, request->u.servicereg.type_as_string, domain, host,
-           mDNSVal16(request->u.servicereg.port), request->process_id, request->pid_name);
+    // Construct the full service name.
+    mDNSu32 nameHash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, servicereg->name.c,
+        DomainLabelLength(&servicereg->name) + 1);
+    nameHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, nameHash, servicereg->type.c,
+        DomainNameLength(&servicereg->type) - 1);
+    nameHash = mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash_FNV1a, nameHash, d.c,
+        DomainNameLength(&d));
+
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+           "[R%d] DNSServiceRegister(%X, %d, \"" PRI_S "\", \"" PRI_S "\", \"" PRI_S "\", %x, \"" PRI_S "\", %u) START PID[%d](" PUB_S ")",
+           request->request_id, request->flags, interfaceIndex, name, servicereg->type_as_string, domain, nameHash, host,
+           mDNSVal16(servicereg->port), request->process_id, request->pid_name);
 
     // We need to unconditionally set request->terminate, because even if we didn't successfully
     // start any registrations right now, subsequent configuration changes may cause successful
@@ -2755,13 +2864,13 @@ mDNSlocal mStatus handle_regservice_request(request_state *request)
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
     if (os_feature_enabled(mDNSResponder, bonjour_privacy) &&
-        (request->u.servicereg.default_domain || IsLocalDomain(&d)))
+        (servicereg->default_domain || IsLocalDomain(&d)))
     {
         err = _handle_regservice_request_with_trust(request, &d);
-        if (err == mStatus_NoAuth && request->u.servicereg.txtdata)
+        if (err == mStatus_NoAuth && servicereg->txtdata)
         {
-            freeL("service_info txtdata", request->u.servicereg.txtdata);
-            request->u.servicereg.txtdata = NULL;
+            freeL("service_info txtdata", servicereg->txtdata);
+            servicereg->txtdata = NULL;
         }
     }
     else
@@ -2772,11 +2881,12 @@ mDNSlocal mStatus handle_regservice_request(request_state *request)
     err = _handle_regservice_request_start(request, &d);
 #endif
 
+exit:
     return(err);
 
 bad_param:
-    freeL("handle_regservice_request (txtdata)", request->u.servicereg.txtdata);
-    request->u.servicereg.txtdata = NULL;
+    freeL("handle_regservice_request (txtdata)", servicereg->txtdata);
+    servicereg->txtdata = NULL;
     return mStatus_BadParamErr;
 }
 
@@ -2807,7 +2917,7 @@ mDNSlocal void FoundInstance(mDNS *const m, DNSQuestion *question, const Resourc
 
     if (GenerateNTDResponse(&answer->rdata->u.name, answer->InterfaceID, req, &rep, browse_reply_op, flags, mStatus_NoError) != mStatus_NoError)
     {
-        if (SameDomainName(&req->u.browser.regtype, (const domainname*)"\x09_services\x07_dns-sd\x04_udp"))
+        if (SameDomainName(&req->browse->regtype, (const domainname*)"\x09_services\x07_dns-sd\x04_udp"))
         {
             // Special support to enable the DNSServiceBrowse call made by Bonjour Browser
             // Remove after Bonjour Browser is updated to use DNSServiceQueryRecord instead of DNSServiceBrowse
@@ -2822,11 +2932,13 @@ mDNSlocal void FoundInstance(mDNS *const m, DNSQuestion *question, const Resourc
 
 validReply:
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d->Q%d] DNSServiceBrowse(" PRI_DM_NAME ", " PUB_S ") RESULT " PUB_S " interface %d: " PRI_S,
-           req->request_id, mDNSVal16(question->TargetQID), DM_NAME_PARAM(&question->qname), DNSTypeName(question->qtype),
-           AddRecord ? "ADD" : "RMV", mDNSPlatformInterfaceIndexfromInterfaceID(m, answer->InterfaceID, mDNSfalse),
-           RRDisplayString(m, answer));
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+        "[R%d->Q%d] DNSServiceBrowse(" PRI_DM_NAME "(%x), " PUB_S ") RESULT " PUB_ADD_RMV_U " interface %d: " PRI_S,
+        req->request_id, mDNSVal16(question->TargetQID), DM_NAME_PARAM(&question->qname),
+        mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, question->qname.c, DomainNameLength(&question->qname)),
+        DNSTypeName(question->qtype), ADD_RMV_U_PARAM(AddRecord),
+        mDNSPlatformInterfaceIndexfromInterfaceID(m, answer->InterfaceID, mDNSfalse),
+        RRDisplayString(m, answer));
 
     append_reply(req, rep);
 }
@@ -2861,10 +2973,15 @@ mDNSlocal void SetQuestionPolicy(DNSQuestion *q, request_state *req)
 mDNSlocal CFArrayRef _get_unicast_discovery_dns_services(request_state *info)
 {
     CFArrayRef result = NULL;
-    CFMutableArrayRef defArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &mdns_cfarray_callbacks);
+    CFMutableArrayRef defArray = NULL;
+    mdns_require_action_quiet(info->peer_token, exit, uds_log_error(
+        "[R%u] No peer audit token to get unicast discovery IP addresses", info->request_id));
+
+    defArray = CFArrayCreateMutable(kCFAllocatorDefault, 0, &mdns_cfarray_callbacks);
     require_quiet(defArray, exit);
 
-    util_device_media_access_unicast_addr_enumerate(&info->audit_token,
+    const audit_token_t *const token = mdns_audit_token_get_token(info->peer_token);
+    util_device_media_access_unicast_addr_enumerate(token,
     ^bool(uint8_t family, uint8_t *addr, uint32_t ifindex)
     {
         mdns_dns_service_definition_t definition = NULL;
@@ -2912,9 +3029,14 @@ exit:
 mDNSlocal mStatus add_domain_to_browser(request_state *info, const domainname *d)
 {
     browser_t *b, *p;
+#if MDNSRESPONDER_SUPPORTS(APPLE, UNICAST_DISCOVERY)
     __block mStatus err;
+#else
+    mStatus err;
+#endif
 
-    for (p = info->u.browser.browsers; p; p = p->next)
+    request_browse *const browse = info->browse;
+    for (p = browse->browsers; p; p = p->next)
     {
         if (SameDomainName(&p->domain, d))
         { debugf("add_domain_to_browser %##s already in list", d->c); return mStatus_AlreadyRegistered; }
@@ -2947,20 +3069,20 @@ mDNSlocal mStatus add_domain_to_browser(request_state *info, const domainname *d
                 ubrowse->q.request_id = info->request_id; // This browse request is started on behalf of the original browse request.
                 ubrowse->q.UnicastMDNSResolver = mDNSAddr_from_sockaddr(mdns_address_get_sockaddr(addr));
                 mDNSInterfaceID InterfaceID = mDNSPlatformInterfaceIDfromInterfaceIndex(&mDNSStorage, ifIndex);
-                err = mDNS_StartBrowse(&mDNSStorage, &ubrowse->q, &info->u.browser.regtype, d, InterfaceID, info->flags,
+                err = mDNS_StartBrowse(&mDNSStorage, &ubrowse->q, &browse->regtype, d, InterfaceID, info->flags,
                                         mDNSfalse, (info->flags & kDNSServiceFlagsBackgroundTrafficClass) != 0, mDNSNULL, info);
                 if (err)
                 {
-                    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+                    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
                         "[R%u] mDNS_StartBrowse returned error (UNICAST_DISCOVERY) -- "
                         "error: %d, type: " PRI_DM_NAME ", domain: " PRI_DM_NAME,
-                        info->request_id, err, DM_NAME_PARAM(&info->u.browser.regtype), DM_NAME_PARAM(d));
+                        info->request_id, err, DM_NAME_PARAM(&browse->regtype), DM_NAME_PARAM(d));
                     freeL("browser_t/add_domain_to_browser", ubrowse);
                 }
                 else
                 {
-                    ubrowse->next = info->u.browser.browsers;
-                    info->u.browser.browsers = ubrowse;
+                    ubrowse->next = browse->browsers;
+                    browse->browsers = ubrowse;
                     LogMcastQ(&ubrowse->q, info, q_start);
                 }
                 return true;
@@ -2970,32 +3092,32 @@ mDNSlocal mStatus add_domain_to_browser(request_state *info, const domainname *d
         }
     }
 #endif
-    
+
     b = (browser_t *) callocL("browser_t", sizeof(*b));
     if (!b) return mStatus_NoMemoryErr;
     AssignDomainName(&b->domain, d);
     SetQuestionPolicy(&b->q, info);
     b->q.request_id = info->request_id; // This browse request is started on behalf of the original browse request.
-    err = mDNS_StartBrowse(&mDNSStorage, &b->q, &info->u.browser.regtype, d, info->u.browser.interface_id, info->flags,
-                            info->u.browser.ForceMCast, (info->flags & kDNSServiceFlagsBackgroundTrafficClass) != 0, FoundInstance, info);
+    err = mDNS_StartBrowse(&mDNSStorage, &b->q, &browse->regtype, d, browse->interface_id, info->flags,
+        browse->ForceMCast, (info->flags & kDNSServiceFlagsBackgroundTrafficClass) != 0, FoundInstance, info);
     if (err)
     {
-        LogMsg("mDNS_StartBrowse returned %d for type %##s domain %##s", err, info->u.browser.regtype.c, d->c);
+        LogMsg("mDNS_StartBrowse returned %d for type %##s domain %##s", err, browse->regtype.c, d->c);
         freeL("browser_t/add_domain_to_browser", b);
     }
     else
     {
-        b->next = info->u.browser.browsers;
-        info->u.browser.browsers = b;
+        b->next = browse->browsers;
+        browse->browsers = b;
 
         LogMcastQ(&b->q, info, q_start);
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
-        if (callExternalHelpers(info->u.browser.interface_id, &b->domain, info->flags))
+        if (callExternalHelpers(browse->interface_id, &b->domain, info->flags))
         {
             domainname tmp;
-            ConstructServiceName(&tmp, NULL, &info->u.browser.regtype, &b->domain);
+            ConstructServiceName(&tmp, NULL, &browse->regtype, &b->domain);
             LogDebug("add_domain_to_browser: calling external_start_browsing_for_service()");
-            external_start_browsing_for_service(info->u.browser.interface_id, &tmp, kDNSType_PTR, info->flags, info->process_id);
+            external_start_browsing_for_service(browse->interface_id, &tmp, kDNSType_PTR, info->flags, info->process_id);
         }
 #endif
     }
@@ -3004,9 +3126,10 @@ mDNSlocal mStatus add_domain_to_browser(request_state *info, const domainname *d
 
 mDNSlocal void browse_termination_callback(request_state *info)
 {
-    if (info->u.browser.default_domain)
+    request_browse *const browse = info->browse;
+    if (browse->default_domain)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] DNSServiceBrowse Cancel domain enumeration for WAB and mDNS "
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%u] DNSServiceBrowse Cancel domain enumeration for WAB and mDNS "
             "PID[%d](" PUB_S ")" , info->request_id, info->process_id, info->pid_name);
         // Stop the domain enumeration queries to discover the WAB legacy browse domains
         uDNS_StopWABQueries(&mDNSStorage, UDNS_WAB_LBROWSE_QUERY);
@@ -3016,25 +3139,27 @@ mDNSlocal void browse_termination_callback(request_state *info)
         mDNS_StopDomainEnumeration(&mDNSStorage, &localdomain, mDNS_DomainTypeBrowseAutomatic);
     #endif
     }
-    while (info->u.browser.browsers)
+    while (browse->browsers)
     {
-        browser_t *ptr = info->u.browser.browsers;
+        browser_t *ptr = browse->browsers;
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
         if (callExternalHelpers(ptr->q.InterfaceID, &ptr->domain, ptr->q.flags))
         {
             domainname tmp;
-            ConstructServiceName(&tmp, NULL, &info->u.browser.regtype, &ptr->domain);
+            ConstructServiceName(&tmp, NULL, &browse->regtype, &ptr->domain);
             LogInfo("browse_termination_callback: calling external_stop_browsing_for_service()");
             external_stop_browsing_for_service(ptr->q.InterfaceID, &tmp, kDNSType_PTR, ptr->q.flags, info->process_id);
         }
 #endif
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-               "[R%d] DNSServiceBrowse(%X, %d, \"" PRI_DM_NAME "\") STOP PID[%d](" PUB_S ")",
+
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+               "[R%d] DNSServiceBrowse(%X, %d, \"" PRI_DM_NAME "\"(%x)) STOP PID[%d](" PUB_S ")",
                info->request_id, info->flags, info->interfaceIndex, DM_NAME_PARAM(&ptr->q.qname),
+               mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, ptr->q.qname.c, DomainNameLength(&ptr->q.qname)),
                info->process_id, info->pid_name);
 
-        info->u.browser.browsers = ptr->next;
+        browse->browsers = ptr->next;
         mDNS_StopBrowse(&mDNSStorage, &ptr->q);  // no need to error-check result
         LogMcastQ(&ptr->q, info, q_stop);
         freeL("browser_t/browse_termination_callback", ptr);
@@ -3049,10 +3174,10 @@ mDNSlocal void udsserver_automatic_browse_domain_changed(const DNameListElem *co
     for (request = all_requests; request; request = request->next)
     {
         if (request->terminate != browse_termination_callback) continue;    // Not a browse operation
-        if (!request->u.browser.default_domain) continue;                   // Not an auto-browse operation
+        if (!request->browse->default_domain) continue;                   // Not an auto-browse operation
         if (!d->uid || SystemUID(request->uid) || request->uid == d->uid)
         {
-            browser_t **ptr = &request->u.browser.browsers;
+            browser_t **ptr = &request->browse->browsers;
             while (*ptr && !SameDomainName(&(*ptr)->domain, &d->name)) ptr = &(*ptr)->next;
             if (add)
             {
@@ -3209,7 +3334,7 @@ mDNSlocal void AddAutoBrowseDomain(const mDNSu32 uid, const domainname *const na
     new->uid = uid;
     new->next = AutoBrowseDomains;
     AutoBrowseDomains = new;
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Automatic browsing domain is added - "
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Automatic browsing domain is added - "
         "domain name: " PRI_DM_NAME ", uid: %u", DM_NAME_PARAM(name), uid);
 
     udsserver_automatic_browse_domain_changed(new, mDNStrue);
@@ -3226,7 +3351,7 @@ mDNSlocal void RmvAutoBrowseDomain(const mDNSu32 uid, const domainname *const na
         *p = ptr->next;
         udsserver_automatic_browse_domain_changed(ptr, mDNSfalse);
         mDNSPlatformMemFree(ptr);
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Automatic browsing domain is removed - "
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Automatic browsing domain is removed - "
             "domain name: " PRI_DM_NAME ", uid: %u", DM_NAME_PARAM(name), uid);
     }
 }
@@ -3298,11 +3423,14 @@ mDNSexport void udsserver_handle_configchange(mDNS *const m)
 
     // For autoname services, see if the default service name has changed, necessitating an automatic update
     for (req = all_requests; req; req = req->next)
+    {
         if (req->terminate == regservice_termination_callback)
-            if (req->u.servicereg.autoname && !SameDomainLabelCS(req->u.servicereg.name.c, m->nicelabel.c))
+        {
+            request_servicereg *const servicereg = req->servicereg;
+            if (servicereg->autoname && !SameDomainLabelCS(servicereg->name.c, m->nicelabel.c))
             {
-                req->u.servicereg.name = m->nicelabel;
-                for (ptr = req->u.servicereg.instances; ptr; ptr = ptr->next)
+                servicereg->name = m->nicelabel;
+                for (ptr = servicereg->instances; ptr; ptr = ptr->next)
                 {
                     ptr->renameonmemfree = 1;
                     if (ptr->clientnotified) SendServiceRemovalNotification(&ptr->srs);
@@ -3311,7 +3439,8 @@ mDNSexport void udsserver_handle_configchange(mDNS *const m)
                         regservice_callback(m, &ptr->srs, mStatus_MemFree); // If service deregistered already, we can re-register immediately
                 }
             }
-
+        }
+    }
     // Let the platform layer get the current DNS information
     mDNS_Lock(m);
     mDNSPlatformSetDNSConfig(mDNSfalse, mDNSfalse, mDNSNULL, &RegDomains, &BrowseDomains, mDNSfalse);
@@ -3406,7 +3535,7 @@ mDNSexport void FoundNonLocalOnlyAutomaticBrowseDomain(mDNS *const m, DNSQuestio
     }
 
     const char *const if_name = InterfaceNameForID(m, answer->InterfaceID);
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Automatic browsing domain discovered via network - "
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Automatic browsing domain discovered via network - "
         "change: " PUB_S ", interface name: " PUB_S ", browsing domain: " PRI_DM_NAME,
         add_record == QC_add ? "added" : "removed", if_name, DM_NAME_PARAM(name));
 
@@ -3421,7 +3550,7 @@ mDNSlocal void AutomaticBrowseDomainChange(mDNS *const m, DNSQuestion *q, const 
     (void)q; // unused
 
     const mDNSBool ignored = (answer->InterfaceID == mDNSInterface_Any);
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Automatic browsing domain changes - "
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "Automatic browsing domain changes - "
         "name: " PRI_DM_NAME ", event: " PUB_S ", interface ID: %p" PUB_S, DM_NAME_PARAM(&answer->rdata->u.name),
         AddRecord == QC_add ? "adding" : "removing", answer->InterfaceID, ignored ? ", ignored." : ".");
 
@@ -3486,7 +3615,7 @@ mDNSlocal void _return_browse_request_error(request_state *request, mStatus erro
 
     GenerateBrowseReply(NULL, 0, request, &rep, browse_reply_op, 0, error);
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
            "[R%d] DNSServiceBrowse _return_browse_request_error: error (%d)", request->request_id, error);
 
     append_reply(request, rep);
@@ -3495,9 +3624,9 @@ mDNSlocal void _return_browse_request_error(request_state *request, mStatus erro
 mDNSlocal mStatus _handle_browse_request_with_trust(request_state *request, const char * domain)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_browse_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_WARNING, "[R%u] _handle_browse_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_browse_request_start(request, domain);
     }
     else
@@ -3506,17 +3635,19 @@ mDNSlocal mStatus _handle_browse_request_with_trust(request_state *request, cons
         typestr[0] = 0;
         domainlabel dName;
         domainname dType, dDomain;
-        if (DeconstructServiceName(&request->u.browser.regtype, &dName, &dType, &dDomain))
+        const request_browse *const browse = request->browse;
+        if (DeconstructServiceName(&browse->regtype, &dName, &dType, &dDomain))
         {
             ConvertDomainNameToCString(&dType, typestr);
         }
         else
         {
-            ConvertDomainNameToCString(&request->u.browser.regtype, typestr);
+            ConvertDomainNameToCString(&browse->regtype, typestr);
         }
 
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_bonjour(request->audit_token, typestr, &flags);
+        mdns_trust_status_t status = mdns_trust_check_bonjour(*token, typestr, &flags);
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
         if ((flags & mdns_trust_flags_system_privileged) != mdns_trust_flags_system_privileged)
         {
@@ -3524,7 +3655,7 @@ mDNSlocal mStatus _handle_browse_request_with_trust(request_state *request, cons
         }
         if ((flags & mdns_trust_flags_media_discovery_entitlement) == mdns_trust_flags_media_discovery_entitlement)
         {
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG,
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEBUG,
                 "[R%u] _handle_browse_request_with_trust: has media discovery entitlement", request->request_id);
             request->sign_result = mDNStrue; // Always sign results for media discovery entitlement
         }
@@ -3534,7 +3665,7 @@ mDNSlocal mStatus _handle_browse_request_with_trust(request_state *request, cons
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, typestr, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, typestr, flags);
                 if (!trust )
                 {
                     err = mStatus_NoMemoryErr;
@@ -3607,6 +3738,12 @@ mDNSlocal mStatus handle_browse_request(request_state *request)
     mDNSs32 NumSubTypes;
     mStatus err = mStatus_NoError;
 
+    if (!request->browse)
+    {
+        request->browse = (request_browse *)callocL("request_browse", sizeof(*request->browse));
+        mdns_require_action_quiet(request->browse, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for browse request", request->request_id));
+    }
     DNSServiceFlags flags = get_flags(&request->msgptr, request->msgend);
     mDNSu32 interfaceIndex = get_uint32(&request->msgptr, request->msgend);
     mDNSInterfaceID InterfaceID = mDNSPlatformInterfaceIDfromInterfaceIndex(&mDNSStorage, interfaceIndex);
@@ -3656,20 +3793,21 @@ mDNSlocal mStatus handle_browse_request(request_state *request)
     // For over-long service types, we only allow domain "local"
     if (temp.c[0] > 15 && domain[0] == 0) mDNSPlatformStrLCopy(domain, "local.", sizeof(domain));
 
-    // Set up browser info
-    request->u.browser.ForceMCast = (flags & kDNSServiceFlagsForceMulticast) != 0;
-    request->u.browser.interface_id = InterfaceID;
-    AssignDomainName(&request->u.browser.regtype, &typedn);
-    request->u.browser.default_domain = !domain[0];
-    request->u.browser.browsers = NULL;
+    // Set up browse info
+    request_browse *const browse = request->browse;
+    browse->ForceMCast = (flags & kDNSServiceFlagsForceMulticast) != 0;
+    browse->interface_id = InterfaceID;
+    AssignDomainName(&browse->regtype, &typedn);
+    browse->default_domain = !domain[0];
+    browse->browsers = NULL;
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%d] DNSServiceBrowse(%X, %d, \"" PRI_DM_NAME "\", \"" PRI_S "\") START PID[%d](" PUB_S ")",
-           request->request_id, request->flags, interfaceIndex, DM_NAME_PARAM(&request->u.browser.regtype), domain,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%d] DNSServiceBrowse(%X, %d, \"" PRI_DM_NAME "\", \"" PRI_S "\") START PID[%d](" PUB_S ")",
+           request->request_id, request->flags, interfaceIndex, DM_NAME_PARAM(&browse->regtype), domain,
            request->process_id, request->pid_name);
 
-    if (request->u.browser.default_domain)
+    if (browse->default_domain)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%u] DNSServiceBrowse Start domain enumeration for WAB and mDNS "
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT, "[R%u] DNSServiceBrowse Start domain enumeration for WAB and mDNS "
             "PID[%d](" PUB_S ")", request->request_id, request->process_id, request->pid_name);
         // Start the domain enumeration queries to discover the WAB browse domains
         uDNS_StartWABQueries(&mDNSStorage, UDNS_WAB_LBROWSE_QUERY);
@@ -3689,7 +3827,7 @@ mDNSlocal mStatus handle_browse_request(request_state *request)
     if (!MakeDomainNameFromDNSNameString(&d, domain)) return(mStatus_BadParamErr);
 
     if (os_feature_enabled(mDNSResponder, bonjour_privacy) &&
-        (request->u.browser.default_domain || IsLocalDomain(&d) || request->u.browser.ForceMCast))
+        (browse->default_domain || IsLocalDomain(&d) || browse->ForceMCast))
     {
         err = _handle_browse_request_with_trust(request, domain);
     }
@@ -3701,6 +3839,7 @@ mDNSlocal mStatus handle_browse_request(request_state *request)
     err = _handle_browse_request_start(request, domain);
 #endif
 
+exit:
     return(err);
 }
 
@@ -3709,17 +3848,19 @@ mDNSlocal mStatus handle_browse_request(request_state *request)
 
 mDNSlocal void resolve_termination_callback(request_state *request)
 {
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d] DNSServiceResolve(%X, %d, \"" PRI_DM_NAME "\") STOP PID[%d](" PUB_S ")",
-           request->request_id, request->flags, request->interfaceIndex, DM_NAME_PARAM(&request->u.resolve.qtxt.qname),
-           request->process_id, request->pid_name);
-    mDNS_StopQuery(&mDNSStorage, &request->u.resolve.qtxt);
-    mDNS_StopQuery(&mDNSStorage, &request->u.resolve.qsrv);
-    LogMcastQ(&request->u.resolve.qsrv, request, q_stop);
+    request_resolve *const resolve = request->resolve;
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+       "[R%d] DNSServiceResolve(%X, %d, \"" PRI_DM_NAME "\"(%x)) STOP PID[%d](" PUB_S ")",
+       request->request_id, request->flags, request->interfaceIndex, DM_NAME_PARAM(&resolve->qtxt.qname),
+       mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, resolve->qtxt.qname.c, DomainNameLength(&resolve->qtxt.qname)),
+       request->process_id, request->pid_name);
+    mDNS_StopQuery(&mDNSStorage, &resolve->qtxt);
+    mDNS_StopQuery(&mDNSStorage, &resolve->qsrv);
+    LogMcastQ(&resolve->qsrv, request, q_stop);
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
-    if (request->u.resolve.external_advertise)
+    if (resolve->external_advertise)
     {
-        external_stop_resolving_service(request->u.resolve.qsrv.InterfaceID, &request->u.resolve.qsrv.qname, request->flags, request->process_id);
+        external_stop_resolving_service(resolve->qsrv.InterfaceID, &resolve->qsrv.qname, request->flags, request->process_id);
     }
 #endif
 }
@@ -3730,27 +3871,28 @@ typedef struct {
     mDNSInterfaceID InterfaceID;
 } _resolve_start_params_t;
 
-mDNSlocal mStatus _handle_resolve_request_start(request_state *request, const _resolve_start_params_t * const params)
+mDNSlocal mStatus _handle_resolve_request_start(request_state *const request, const _resolve_start_params_t *const params)
 {
     mStatus err;
 
-    err = mDNS_StartQuery(&mDNSStorage, &request->u.resolve.qsrv);
+    request_resolve *const resolve = request->resolve;
+    err = mDNS_StartQuery(&mDNSStorage, &resolve->qsrv);
 
     if (!err)
     {
-        err = mDNS_StartQuery(&mDNSStorage, &request->u.resolve.qtxt);
+        err = mDNS_StartQuery(&mDNSStorage, &resolve->qtxt);
         if (err)
         {
-            mDNS_StopQuery(&mDNSStorage, &request->u.resolve.qsrv);
+            mDNS_StopQuery(&mDNSStorage, &resolve->qsrv);
         }
         else
         {
             request->terminate = resolve_termination_callback;
-            LogMcastQ(&request->u.resolve.qsrv, request, q_start);
+            LogMcastQ(&resolve->qsrv, request, q_start);
 #if MDNSRESPONDER_SUPPORTS(APPLE, D2D)
             if (callExternalHelpers(params->InterfaceID, &params->fqdn, request->flags))
             {
-                request->u.resolve.external_advertise    = mDNStrue;
+                resolve->external_advertise    = mDNStrue;
                 LogInfo("handle_resolve_request: calling external_start_resolving_service()");
                 external_start_resolving_service(params->InterfaceID, &params->fqdn, request->flags, request->process_id);
             }
@@ -3768,31 +3910,41 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
     char fullname[MAX_ESCAPED_DOMAIN_NAME], target[MAX_ESCAPED_DOMAIN_NAME] = "0";
     uint8_t *data;
     reply_state *rep;
-    request_state *req = question->QuestionContext;
     const DNSServiceErrorType error =
         (answer->RecordType == kDNSRecordTypePacketNegative) ? kDNSServiceErr_NoSuchRecord : kDNSServiceErr_NoError;
     (void)m; // Unused
 
-    LogOperation("%3d: DNSServiceResolve(%##s) %s interface %d: %s",
-        req->sd, question->qname.c, AddRecord ? "ADD" : "RMV",
+    request_state *const req = question->QuestionContext;
+    const mDNSu32 name_hash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, question->qname.c,
+        DomainNameLength(&question->qname));
+
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+        "[R%u] DNSServiceResolve(" PRI_DM_NAME "(%x)) " PUB_ADD_RMV_U " interface %u: " PRI_S,
+        req->request_id, DM_NAME_PARAM(&question->qname), name_hash, ADD_RMV_U_PARAM(AddRecord),
         mDNSPlatformInterfaceIndexfromInterfaceID(m, answer->InterfaceID, mDNSfalse), RRDisplayString(m, answer));
 
+    request_resolve *const resolve = req->resolve;
     if (!AddRecord)
     {
-        if (req->u.resolve.srv == answer) req->u.resolve.srv = mDNSNULL;
-        if (req->u.resolve.txt == answer) req->u.resolve.txt = mDNSNULL;
+        if (resolve->srv == answer) resolve->srv = mDNSNULL;
+        if (resolve->txt == answer) resolve->txt = mDNSNULL;
         return;
     }
 
-    if (answer->rrtype == kDNSType_SRV) req->u.resolve.srv = answer;
-    if (answer->rrtype == kDNSType_TXT) req->u.resolve.txt = answer;
+    if (answer->rrtype == kDNSType_SRV) resolve->srv = answer;
+    if (answer->rrtype == kDNSType_TXT) resolve->txt = answer;
 
-    if (!req->u.resolve.txt || !req->u.resolve.srv) return;     // only deliver result to client if we have both answers
+    if (!resolve->txt || !resolve->srv) return;     // only deliver result to client if we have both answers
 
     ConvertDomainNameToCString(answer->name, fullname);
 
+    mDNSu32 target_name_hash = 0;
     if (answer->RecordType != kDNSRecordTypePacketNegative)
-        ConvertDomainNameToCString(&req->u.resolve.srv->rdata->u.srv.target, target);
+    {
+        ConvertDomainNameToCString(&resolve->srv->rdata->u.srv.target, target);
+        target_name_hash = mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, resolve->srv->rdata->u.srv.target.c,
+            DomainNameLength(&resolve->srv->rdata->u.srv.target));
+    }
 
     mDNSu32 interface_index = mDNSPlatformInterfaceIndexfromInterfaceID(m, answer->InterfaceID, mDNSfalse);
     // calculate reply length
@@ -3802,7 +3954,7 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
     len += strlen(fullname) + 1;
     len += strlen(target) + 1;
     len += 2 * sizeof(mDNSu16);  // port, txtLen
-    len += req->u.resolve.txt->rdlength;
+    len += resolve->txt->rdlength;
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
     mdns_signed_resolve_result_t signed_result = NULL;
     const uint8_t *signed_data = NULL;
@@ -3814,19 +3966,19 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
         if (!browseResult)
         {
             err = mStatus_Invalid;
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
                 "[R%u->Q%u] resolve_result_callback mdns_signed_resolve_result_downcast failed",
                 req->request_id, mDNSVal16(question->TargetQID));
         }
         else
         {
-            signed_result = mdns_signed_resolve_result_create(browseResult, req->u.resolve.srv->rdata->u.srv.target.c,
-                req->u.resolve.srv->rdata->u.srv.port.NotAnInteger, interface_index, req->u.resolve.txt->rdata->u.data,
-                req->u.resolve.txt->rdlength, &err);
+            signed_result = mdns_signed_resolve_result_create(browseResult, resolve->srv->rdata->u.srv.target.c,
+                resolve->srv->rdata->u.srv.port.NotAnInteger, interface_index, resolve->txt->rdata->u.data,
+                resolve->txt->rdlength, &err);
         }
         if (!signed_result || err != 0)
         {
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
                 "[R%u->Q%u] resolve_result_callback signed_resolve failed %ld", req->request_id,
                 mDNSVal16(question->TargetQID), (long)err);
         }
@@ -3855,10 +4007,10 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
     // write reply data to message
     put_string(fullname, &data);
     put_string(target, &data);
-    *data++ =  req->u.resolve.srv->rdata->u.srv.port.b[0];
-    *data++ =  req->u.resolve.srv->rdata->u.srv.port.b[1];
-    put_uint16(req->u.resolve.txt->rdlength, &data);
-    put_rdata(req->u.resolve.txt->rdlength, req->u.resolve.txt->rdata->u.data, &data);
+    *data++ =  resolve->srv->rdata->u.srv.port.b[0];
+    *data++ =  resolve->srv->rdata->u.srv.port.b[1];
+    put_uint16(resolve->txt->rdlength, &data);
+    put_rdata(resolve->txt->rdlength, resolve->txt->rdata->u.data, &data);
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
     if (signed_data)
     {
@@ -3867,9 +4019,10 @@ mDNSlocal void resolve_result_callback(mDNS *const m, DNSQuestion *question, con
     mdns_forget(&signed_result);
 #endif
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%d->Q%d] DNSServiceResolve(" PRI_S ") RESULT   " PRI_S ":%d",
-           req->request_id, mDNSVal16(question->TargetQID), fullname, target,
-           mDNSVal16(req->u.resolve.srv->rdata->u.srv.port));
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+        "[R%d->Q%d] DNSServiceResolve(" PRI_S "(%x)) RESULT   " PRI_S "(%x):%d",
+        req->request_id, mDNSVal16(question->TargetQID), fullname, name_hash, target, target_name_hash,
+        mDNSVal16(resolve->srv->rdata->u.srv.port));
     append_reply(req, rep);
 }
 
@@ -3882,7 +4035,7 @@ mDNSlocal void _return_resolve_request_error(request_state * request, mStatus er
     uint8_t *data;
     reply_state *rep;
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
        "[R%u] DNSServiceResolve _return_resolve_request_error: error(%d)", request->request_id, error);
 
     // calculate reply length
@@ -3913,21 +4066,22 @@ mDNSlocal void _return_resolve_request_error(request_state * request, mStatus er
 mDNSlocal mStatus _handle_resolve_request_with_trust(request_state *request, const _resolve_start_params_t * const params)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
-        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_resolve_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
+        LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_WARNING, "[R%u] _handle_resolve_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_resolve_request_start(request, params);
     }
     else
     {
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_bonjour(request->audit_token, params->regtype, &flags);
+        mdns_trust_status_t status = mdns_trust_check_bonjour(*token, params->regtype, &flags);
         switch (status)
         {
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, params->regtype, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, params->regtype, flags);
                 if (!trust )
                 {
                     err = mStatus_NoMemoryErr;
@@ -3997,6 +4151,12 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
     _resolve_start_params_t params;
     mStatus err;
 
+    if (!request->resolve)
+    {
+        request->resolve = (request_resolve *)callocL("request_resolve", sizeof(*request->resolve));
+        mdns_require_action_quiet(request->resolve, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for resolve request", request->request_id));
+    }
     // extract the data from the message
     DNSServiceFlags flags = get_flags(&request->msgptr, request->msgend);
     mDNSu32 interfaceIndex = get_uint32(&request->msgptr, request->msgend);
@@ -4044,65 +4204,65 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
     if (build_domainname_from_strings(&params.fqdn, name, params.regtype, domain) < 0)
     { LogMsg("ERROR: handle_resolve_request bad “%s” “%s” “%s”", name, params.regtype, domain); return(mStatus_BadParamErr); }
 
-    mDNSPlatformMemZero(&request->u.resolve, sizeof(request->u.resolve));
-
     request->flags = flags;
     request->interfaceIndex = interfaceIndex;
 
     // format questions
-    request->u.resolve.qsrv.InterfaceID      = params.InterfaceID;
-    request->u.resolve.qsrv.flags            = flags;
-    AssignDomainName(&request->u.resolve.qsrv.qname, &params.fqdn);
-    request->u.resolve.qsrv.qtype            = kDNSType_SRV;
-    request->u.resolve.qsrv.qclass           = kDNSClass_IN;
-    request->u.resolve.qsrv.LongLived        = (flags & kDNSServiceFlagsLongLivedQuery     ) != 0;
-    request->u.resolve.qsrv.ExpectUnique     = mDNStrue;
-    request->u.resolve.qsrv.ForceMCast       = (flags & kDNSServiceFlagsForceMulticast     ) != 0;
-    request->u.resolve.qsrv.ReturnIntermed   = (flags & kDNSServiceFlagsReturnIntermediates) != 0;
-    request->u.resolve.qsrv.SuppressUnusable = mDNSfalse;
-    request->u.resolve.qsrv.AppendSearchDomains = 0;
-    request->u.resolve.qsrv.TimeoutQuestion  = 0;
-    request->u.resolve.qsrv.WakeOnResolve    = (flags & kDNSServiceFlagsWakeOnResolve) != 0;
-    request->u.resolve.qsrv.UseBackgroundTraffic = (flags & kDNSServiceFlagsBackgroundTrafficClass) != 0;
-    request->u.resolve.qsrv.ProxyQuestion    = 0;
-    request->u.resolve.qsrv.pid              = request->process_id;
-    request->u.resolve.qsrv.euid             = request->uid;
-    request->u.resolve.qsrv.QuestionCallback = resolve_result_callback;
-    request->u.resolve.qsrv.QuestionContext  = request;
+    request_resolve *const resolve = request->resolve;
+    resolve->qsrv.InterfaceID      = params.InterfaceID;
+    resolve->qsrv.flags            = flags;
+    AssignDomainName(&resolve->qsrv.qname, &params.fqdn);
+    resolve->qsrv.qtype            = kDNSType_SRV;
+    resolve->qsrv.qclass           = kDNSClass_IN;
+    resolve->qsrv.LongLived        = (flags & kDNSServiceFlagsLongLivedQuery     ) != 0;
+    resolve->qsrv.ExpectUnique     = mDNStrue;
+    resolve->qsrv.ForceMCast       = (flags & kDNSServiceFlagsForceMulticast     ) != 0;
+    resolve->qsrv.ReturnIntermed   = (flags & kDNSServiceFlagsReturnIntermediates) != 0;
+    resolve->qsrv.SuppressUnusable = mDNSfalse;
+    resolve->qsrv.AppendSearchDomains = 0;
+    resolve->qsrv.TimeoutQuestion  = 0;
+    resolve->qsrv.WakeOnResolve    = (flags & kDNSServiceFlagsWakeOnResolve) != 0;
+    resolve->qsrv.UseBackgroundTraffic = (flags & kDNSServiceFlagsBackgroundTrafficClass) != 0;
+    resolve->qsrv.ProxyQuestion    = 0;
+    resolve->qsrv.pid              = request->process_id;
+    resolve->qsrv.euid             = request->uid;
+    resolve->qsrv.QuestionCallback = resolve_result_callback;
+    resolve->qsrv.QuestionContext  = request;
 
-    request->u.resolve.qtxt.InterfaceID      = params.InterfaceID;
-    request->u.resolve.qtxt.flags            = flags;
-    AssignDomainName(&request->u.resolve.qtxt.qname, &params.fqdn);
-    request->u.resolve.qtxt.qtype            = kDNSType_TXT;
-    request->u.resolve.qtxt.qclass           = kDNSClass_IN;
-    request->u.resolve.qtxt.LongLived        = (flags & kDNSServiceFlagsLongLivedQuery     ) != 0;
-    request->u.resolve.qtxt.ExpectUnique     = mDNStrue;
-    request->u.resolve.qtxt.ForceMCast       = (flags & kDNSServiceFlagsForceMulticast     ) != 0;
-    request->u.resolve.qtxt.ReturnIntermed   = (flags & kDNSServiceFlagsReturnIntermediates) != 0;
-    request->u.resolve.qtxt.SuppressUnusable = mDNSfalse;
-    request->u.resolve.qtxt.AppendSearchDomains = 0;
-    request->u.resolve.qtxt.TimeoutQuestion  = 0;
-    request->u.resolve.qtxt.WakeOnResolve    = 0;
-    request->u.resolve.qtxt.UseBackgroundTraffic = (flags & kDNSServiceFlagsBackgroundTrafficClass) != 0;
-    request->u.resolve.qtxt.ProxyQuestion    = 0;
-    request->u.resolve.qtxt.pid              = request->process_id;
-    request->u.resolve.qtxt.euid             = request->uid;
-    request->u.resolve.qtxt.QuestionCallback = resolve_result_callback;
-    request->u.resolve.qtxt.QuestionContext  = request;
+    resolve->qtxt.InterfaceID      = params.InterfaceID;
+    resolve->qtxt.flags            = flags;
+    AssignDomainName(&resolve->qtxt.qname, &params.fqdn);
+    resolve->qtxt.qtype            = kDNSType_TXT;
+    resolve->qtxt.qclass           = kDNSClass_IN;
+    resolve->qtxt.LongLived        = (flags & kDNSServiceFlagsLongLivedQuery     ) != 0;
+    resolve->qtxt.ExpectUnique     = mDNStrue;
+    resolve->qtxt.ForceMCast       = (flags & kDNSServiceFlagsForceMulticast     ) != 0;
+    resolve->qtxt.ReturnIntermed   = (flags & kDNSServiceFlagsReturnIntermediates) != 0;
+    resolve->qtxt.SuppressUnusable = mDNSfalse;
+    resolve->qtxt.AppendSearchDomains = 0;
+    resolve->qtxt.TimeoutQuestion  = 0;
+    resolve->qtxt.WakeOnResolve    = 0;
+    resolve->qtxt.UseBackgroundTraffic = (flags & kDNSServiceFlagsBackgroundTrafficClass) != 0;
+    resolve->qtxt.ProxyQuestion    = 0;
+    resolve->qtxt.pid              = request->process_id;
+    resolve->qtxt.euid             = request->uid;
+    resolve->qtxt.QuestionCallback = resolve_result_callback;
+    resolve->qtxt.QuestionContext  = request;
 
-    request->u.resolve.ReportTime            = NonZeroTime(mDNS_TimeNow(&mDNSStorage) + 130 * mDNSPlatformOneSecond);
+    resolve->ReportTime            = NonZeroTime(mDNS_TimeNow(&mDNSStorage) + 130 * mDNSPlatformOneSecond);
 
-    request->u.resolve.external_advertise    = mDNSfalse;
+    resolve->external_advertise    = mDNSfalse;
 
 #if 0
     if (!AuthorizedDomain(request, &fqdn, AutoBrowseDomains)) return(mStatus_NoError);
 #endif
 
     // ask the questions
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d] DNSServiceResolve(%X, %d, \"" PRI_DM_NAME "\") START PID[%d](" PUB_S ")",
-           request->request_id, flags, interfaceIndex, DM_NAME_PARAM(&request->u.resolve.qsrv.qname),
-           request->process_id, request->pid_name);
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+        "[R%d] DNSServiceResolve(%X, %d, \"" PRI_DM_NAME "\"(%x)) START PID[%d](" PUB_S ")",
+        request->request_id, flags, interfaceIndex, DM_NAME_PARAM(&resolve->qsrv.qname),
+        mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, resolve->qsrv.qname.c, DomainNameLength(&resolve->qsrv.qname)),
+        request->process_id, request->pid_name);
 
     request->terminate = NULL;
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
@@ -4117,7 +4277,7 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
         {
             if (mdns_system_is_signed_result_uuid_valid(mdns_signed_result_get_uuid(browseResult)))
             {
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEBUG,
                        "[R%d] DNSServiceResolve: Allowing signed result",
                           request->request_id);
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
@@ -4126,7 +4286,7 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
             }
             else
             {
-                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+                LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
                        "[R%d] DNSServiceResolve: Signed result UUID revoked.",
                           request->request_id);
                 return mStatus_PolicyDenied;
@@ -4134,9 +4294,9 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
         }
         else
         {
-            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
-                   "[R%d] DNSServiceResolve: Signed result does not cover service: " PRI_DM_NAME ", ifindex: %u.",
-                      request->request_id, DM_NAME_PARAM(&request->u.resolve.qsrv.qname), interfaceIndex);
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_ERROR,
+                "[R%d] DNSServiceResolve: Signed result does not cover service: " PRI_DM_NAME ", ifindex: %u.",
+                request->request_id, DM_NAME_PARAM(&resolve->qsrv.qname), interfaceIndex);
             request->sign_result = mDNSfalse;
             mdns_forget(&request->signed_obj);
         }
@@ -4148,7 +4308,7 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
 
     if (!trust_check_done                                   &&
         os_feature_enabled(mDNSResponder, bonjour_privacy)  &&
-        (IsLocalDomain(&d) || request->u.resolve.qsrv.ForceMCast))
+        (IsLocalDomain(&d) || resolve->qsrv.ForceMCast))
     {
         err = _handle_resolve_request_with_trust(request, &params);
     }
@@ -4160,13 +4320,15 @@ mDNSlocal mStatus handle_resolve_request(request_state *request)
     err = _handle_resolve_request_start(request, &params);
 #endif
 
+exit:
     return(err);
 }
 
 // ***************************************************************************
 // MARK: - DNSServiceQueryRecord
 
-mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, const ResourceRecord *const answer, QC_result AddRecord, DNSServiceErrorType error, void *context)
+mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *const question, const ResourceRecord *const answer,
+    const mDNSBool expired, const QC_result AddRecord, const DNSServiceErrorType error, void *const context)
 {
     char name[MAX_ESCAPED_DOMAIN_NAME];
     size_t len;
@@ -4174,7 +4336,23 @@ mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, co
     reply_state *rep;
     uint8_t *data;
     request_state *req = (request_state *)context;
-
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_STATE)
+    bool addTrackerState = (resolved_cache_is_enabled() && AddRecord &&
+                            ((answer->rrtype == kDNSType_A) || (answer->rrtype == kDNSType_AAAA)));
+#endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    const char *tracker_hostname = NULL;
+    if (addTrackerState && req->addTrackerInfo)
+    {
+        if (resolved_cache_get_tracker_state(question, &tracker_hostname, NULL, NULL, NULL) == tracker_state_known_tracker &&
+            !tracker_hostname)
+        {
+            LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+                "[R%u->Q%u] queryrecord_result_reply NULL tracker hostname",
+                req->request_id, mDNSVal16(question->TargetQID));
+        }
+    }
+#endif
     ConvertDomainNameToCString(answer->name, name);
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
@@ -4186,10 +4364,14 @@ mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, co
     }
 #endif
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-       "[R%u->Q%u] DNSService" PUB_S "(" PRI_DM_NAME ", " PUB_DNS_TYPE ") RESULT " PUB_ADD_RMV " interface %d: (" PUB_MORTALITY ", " PUB_DNSSEC_RESULT ")" PRI_S,
+    const mDNSBool localDomain = IsLocalDomain(&question->qname);
+
+    LogRedact(localDomain ? MDNS_LOG_CATEGORY_MDNS : MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+       "[R%u->Q%u] DNSService" PUB_S "(" PRI_DM_NAME "(%x), " PUB_DNS_TYPE ") RESULT " PUB_ADD_RMV_U " interface %d: (" PUB_MORTALITY ", " PUB_DNSSEC_RESULT ")" PRI_S,
        req->request_id, mDNSVal16(question->TargetQID), req->hdr.op == query_request ? "QueryRecord" : "GetAddrInfo",
-       DM_NAME_PARAM(&question->qname), DNS_TYPE_PARAM(question->qtype), ADD_RMV_PARAM(AddRecord),
+       DM_NAME_PARAM(&question->qname),
+       mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, question->qname.c, DomainNameLength(&question->qname)),
+       DNS_TYPE_PARAM(question->qtype), ADD_RMV_U_PARAM(AddRecord),
        mDNSPlatformInterfaceIndexfromInterfaceID(m, answer->InterfaceID, mDNSfalse),
        MORTALITY_PARAM(answer->mortality), DNSSEC_RESULT_PARAM(dnssec_result), RRDisplayString(m, answer));
 
@@ -4282,12 +4464,18 @@ mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, co
         }
     }
 #endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    if (tracker_hostname)
+    {
+        len += get_required_tlv_string_length(tracker_hostname);
+    }
+#endif
 
     rep = create_reply(req->hdr.op == query_request ? query_reply_op : addrinfo_reply_op, len, req);
 
     if (AddRecord)
         flags |= kDNSServiceFlagsAdd;
-    if (answer->mortality == Mortality_Ghost)
+    if (expired)
         flags |= kDNSServiceFlagsExpiredAnswer;
     if (!question->InitialCacheMiss)
         flags |= kDNSServiceFlagAnsweredFromCache;
@@ -4316,9 +4504,16 @@ mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, co
     }
     mdns_forget(&signed_result);
 #endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    if (tracker_hostname)
+    {
+        put_tracker_hostname_tlvs(tracker_hostname, rep->mhdr, &data, data + len);
+        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "[R%u->Q%u] queryrecord_result_reply add tracker " PRI_S,
+            req->request_id, mDNSVal16(question->TargetQID), tracker_hostname);
+    }
+#endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_STATE)
-    if (resolved_cache_is_enabled() && AddRecord &&
-        ((answer->rrtype == kDNSType_A) || (answer->rrtype == kDNSType_AAAA)))
+    if (addTrackerState)
     {
         resolved_cache_update_tracking(question);
     }
@@ -4328,13 +4523,16 @@ mDNSlocal void queryrecord_result_reply(mDNS *const m, DNSQuestion *question, co
 
 mDNSlocal void queryrecord_termination_callback(request_state *request)
 {
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%u] DNSServiceQueryRecord(%X, %d, " PRI_DM_NAME ", " PUB_S ") STOP PID[%d](" PUB_S ")",
-           request->request_id, request->flags, request->interfaceIndex,
-           DM_NAME_PARAM(QueryRecordClientRequestGetQName(&request->u.queryrecord)),
-           DNSTypeName(QueryRecordClientRequestGetType(&request->u.queryrecord)), request->process_id, request->pid_name);
+    const domainname *const qname = QueryRecordClientRequestGetQName(request->queryrecord);
+    const mDNSBool localDomain = IsLocalDomain(qname);
 
-    QueryRecordClientRequestStop(&request->u.queryrecord);
+    LogRedact(localDomain ? MDNS_LOG_CATEGORY_MDNS : MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        "[R%u] DNSServiceQueryRecord(%X, %d, " PRI_DM_NAME "(%x), " PUB_S ") STOP PID[%d](" PUB_S ")",
+        request->request_id, request->flags, request->interfaceIndex,
+        DM_NAME_PARAM(qname), mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, qname->c, DomainNameLength(qname)),
+        DNSTypeName(QueryRecordClientRequestGetType(request->queryrecord)), request->process_id, request->pid_name);
+
+    QueryRecordClientRequestStop(request->queryrecord);
 }
 
 typedef struct
@@ -4361,7 +4559,7 @@ static void _uds_queryrecord_params_copy(uds_queryrecord_params_t *const dst, co
 mDNSlocal mStatus _handle_queryrecord_request_start(request_state *request, const uds_queryrecord_params_t *const params)
 {
     request->terminate = queryrecord_termination_callback;
-    return QueryRecordClientRequestStart(&request->u.queryrecord, &params->cr, queryrecord_result_reply, request);
+    return QueryRecordClientRequestStart(request->queryrecord, &params->cr, queryrecord_result_reply, request);
 }
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
@@ -4407,7 +4605,7 @@ mDNSlocal mStatus _handle_queryrecord_request_with_trust(request_state *request,
     const uds_queryrecord_params_t *const params)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_queryrecord_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_queryrecord_request_start(request, params);
@@ -4429,15 +4627,16 @@ mDNSlocal mStatus _handle_queryrecord_request_with_trust(request_state *request,
             }
         }
 
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_query(request->audit_token, params->qname, service_ptr,
+        mdns_trust_status_t status = mdns_trust_check_query(*token, params->qname, service_ptr,
             params->cr.qtype, (params->cr.flags & kDNSServiceFlagsForceMulticast) != 0, &flags);
         switch (status)
         {
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, service_ptr, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, service_ptr, flags);
                 if (!trust )
                 {
                     err = mStatus_NoMemoryErr;
@@ -4530,6 +4729,12 @@ mDNSlocal void get_queryrecord_tlvs(request_state *const request, uds_queryrecor
 mDNSlocal mStatus handle_queryrecord_request(request_state *request)
 {
     mStatus err;
+    if (!request->queryrecord)
+    {
+        request->queryrecord = (QueryRecordClientRequest *)callocL("QueryRecordClientRequest", sizeof(*request->queryrecord));
+        mdns_require_action_quiet(request->queryrecord, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for query record request", request->request_id));
+    }
     uds_queryrecord_params_t params;
     _uds_queryrecord_params_init(&params);
     params.cr.flags          = get_flags(&request->msgptr, request->msgend);
@@ -4546,7 +4751,7 @@ mDNSlocal mStatus handle_queryrecord_request(request_state *request)
     params.cr.effectiveUUID  = request->validUUID ? request->uuid : mDNSNULL;
     params.cr.peerUID        = request->uid;
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    params.cr.peerAuditToken = &request->audit_token;
+    params.cr.peerToken      = request->peer_token;
 #endif
     if (!request->msgptr)
     {
@@ -4564,18 +4769,30 @@ mDNSlocal mStatus handle_queryrecord_request(request_state *request)
     err = get_signed_browse_tlvs(request);
     if (err) { LogMsg("%3d: handle_queryrecord_request err reading Validation TLVS", request->sd); return(err); }
 #endif
-
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    get_tracker_info_tlvs(request);
+#endif
     mDNSBool enablesDNSSEC = mDNSfalse;
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
     enablesDNSSEC = dns_service_flags_enables_dnssec(request->flags);
 #endif
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-        "[R%d] DNSServiceQueryRecord(%X, %d, " PRI_S ", " PUB_S PUB_S ") START PID[%d](" PUB_S ")",
-        request->request_id, request->flags, request->interfaceIndex, params.qname, DNSTypeName(params.cr.qtype),
-        enablesDNSSEC ? ", DNSSEC" : "", request->process_id, request->pid_name);
+    domainname query_name;
+    const mDNSu8 *const nextUnusedBytes = MakeDomainNameFromDNSNameString(&query_name, params.qname);
+    if (!nextUnusedBytes)
+    {
+        err = mStatus_BadParamErr;
+        goto exit;
+    }
 
-    mDNSPlatformMemZero(&request->u.queryrecord, (mDNSu32)sizeof(request->u.queryrecord));
+    const mDNSBool localDomain = IsLocalDomain(&query_name);
+
+    LogRedact(localDomain ? MDNS_LOG_CATEGORY_MDNS : MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
+        "[R%d] DNSServiceQueryRecord(%X, %d, " PRI_S "(%x), " PUB_DNS_TYPE PUB_S ") START PID[%d](" PUB_S ")",
+        request->request_id, request->flags, request->interfaceIndex, params.qname,
+        mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, query_name.c, DomainNameLength(&query_name)),
+        DNS_TYPE_PARAM(params.cr.qtype), enablesDNSSEC ? ", DNSSEC" : "", request->process_id, request->pid_name);
+
     request->terminate = NULL;
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
@@ -4584,11 +4801,8 @@ mDNSlocal mStatus handle_queryrecord_request(request_state *request)
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
     if (request->signed_obj)
     {
-        domainname query_name;
         mdns_signed_browse_result_t browseResult = mdns_signed_browse_result_downcast(request->signed_obj);
-        if (browseResult &&
-            MakeDomainNameFromDNSNameString(&query_name, params.qname) &&
-            mdns_signed_browse_result_contains(browseResult, query_name.c, request->interfaceIndex))
+        if (browseResult && mdns_signed_browse_result_contains(browseResult, query_name.c, request->interfaceIndex))
         {
             LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG,
                    "[R%d] DNSServiceQueryRecord: Allowing signed result",
@@ -4645,8 +4859,9 @@ mDNSlocal reply_state *format_enumeration_reply(request_state *request,
 
 mDNSlocal void enum_termination_callback(request_state *request)
 {
+    request_enumeration *const enumeration = request->enumeration;
     // Stop the domain enumeration queries to discover the WAB Browse/Registration domains
-    if (request->u.enumeration.flags & kDNSServiceFlagsRegistrationDomains)
+    if (enumeration->flags & kDNSServiceFlagsRegistrationDomains)
     {
         LogInfo("%3d: DNSServiceEnumeration Cancel WAB Registration PID[%d](%s)", request->sd, request->process_id, request->pid_name);
         uDNS_StopWABQueries(&mDNSStorage, UDNS_WAB_REG_QUERY);
@@ -4655,10 +4870,10 @@ mDNSlocal void enum_termination_callback(request_state *request)
     {
         LogInfo("%3d: DNSServiceEnumeration Cancel WAB Browse PID[%d](%s)", request->sd, request->process_id, request->pid_name);
         uDNS_StopWABQueries(&mDNSStorage, UDNS_WAB_BROWSE_QUERY | UDNS_WAB_LBROWSE_QUERY);
-        mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_autoall);
+        mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_autoall);
     }
-    mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_all);
-    mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_default);
+    mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_all);
+    mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_default);
 }
 
 mDNSlocal void enum_result_callback(mDNS *const m,
@@ -4672,18 +4887,15 @@ mDNSlocal void enum_result_callback(mDNS *const m,
 
     if (answer->rrtype != kDNSType_PTR) return;
 
-#if 0
-    if (!AuthorizedDomain(request, &answer->rdata->u.name, request->u.enumeration.flags ? AutoRegistrationDomains : AutoBrowseDomains)) return;
-#endif
-
     // We only return add/remove events for the browse and registration lists
     // For the default browse and registration answers, we only give an "ADD" event
-    if (question == &request->u.enumeration.q_default && !AddRecord) return;
+    const request_enumeration *const enumeration = request->enumeration;
+    if (question == &enumeration->q_default && !AddRecord) return;
 
     if (AddRecord)
     {
         flags |= kDNSServiceFlagsAdd;
-        if (question == &request->u.enumeration.q_default) flags |= kDNSServiceFlagsDefault;
+        if (question == &enumeration->q_default) flags |= kDNSServiceFlagsDefault;
     }
 
     ConvertDomainNameToCString(&answer->rdata->u.name, domain);
@@ -4693,10 +4905,10 @@ mDNSlocal void enum_result_callback(mDNS *const m,
     reply = format_enumeration_reply(request, domain, flags, kDNSServiceInterfaceIndexAny, kDNSServiceErr_NoError);
     if (!reply) { LogMsg("ERROR: enum_result_callback, format_enumeration_reply"); return; }
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d->Q%d] DNSServiceEnumerateDomains(%2.*s) RESULT " PUB_S ": " PRI_S,
-           request->request_id, mDNSVal16(question->TargetQID), question->qname.c[0], &question->qname.c[1],
-           AddRecord ? "ADD" : "RMV", domain);
+    LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+           "[R%d->Q%d] DNSServiceEnumerateDomains(" PRI_DM_LABEL ") RESULT " PUB_ADD_RMV_U ": " PRI_S,
+           request->request_id, mDNSVal16(question->TargetQID), DM_LABEL_PARAM(&question->qname),
+           ADD_RMV_U_PARAM(AddRecord), domain);
 
     append_reply(request, reply);
 }
@@ -4710,22 +4922,28 @@ mDNSlocal mStatus handle_enum_request(request_state *request)
     mDNS_DomainType t_default = reg ? mDNS_DomainTypeRegistrationDefault : mDNS_DomainTypeBrowseDefault;
     mDNSu32 interfaceIndex = get_uint32(&request->msgptr, request->msgend);
     mDNSInterfaceID InterfaceID = mDNSPlatformInterfaceIDfromInterfaceIndex(&mDNSStorage, interfaceIndex);
-    if (interfaceIndex && !InterfaceID) return(mStatus_BadParamErr);
+    mdns_require_action_quiet((interfaceIndex == 0) || InterfaceID, exit, err = mStatus_BadParamErr);
+    mdns_require_action_quiet(request->msgptr, exit, err = mStatus_BadParamErr; uds_log_error(
+        "[R%u] DNSServiceEnumerateDomains(unreadable parameters)", request->request_id));
 
-    if (!request->msgptr)
-    { LogMsg("%3d: DNSServiceEnumerateDomains(unreadable parameters)", request->sd); return(mStatus_BadParamErr); }
-
+    if (!request->enumeration)
+    {
+        request->enumeration = (request_enumeration *)callocL("request_enumeration", sizeof(*request->enumeration));
+        mdns_require_action_quiet(request->enumeration, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for enumeration request", request->request_id));
+    }
     request->flags = flags;
     request->interfaceIndex = interfaceIndex;
 
     // mark which kind of enumeration we're doing so that we know what domain enumeration queries to stop
-    request->u.enumeration.flags = reg;
+    request_enumeration *const enumeration = request->enumeration;
+    enumeration->flags = reg;
 
     // enumeration requires multiple questions, so we must link all the context pointers so that
     // necessary context can be reached from the callbacks
-    request->u.enumeration.q_all.QuestionContext = request;
-    request->u.enumeration.q_default.QuestionContext = request;
-    if (!reg) request->u.enumeration.q_autoall.QuestionContext = request;
+    enumeration->q_all.QuestionContext = request;
+    enumeration->q_default.QuestionContext = request;
+    if (!reg) enumeration->q_autoall.QuestionContext = request;
 
     // if the caller hasn't specified an explicit interface, we use local-only to get the system-wide list.
     if (!InterfaceID) InterfaceID = mDNSInterface_LocalOnly;
@@ -4734,18 +4952,18 @@ mDNSlocal mStatus handle_enum_request(request_state *request)
     LogOperation("%3d: DNSServiceEnumerateDomains(%X=%s)", request->sd, flags,
                  (flags & kDNSServiceFlagsBrowseDomains      ) ? "kDNSServiceFlagsBrowseDomains" :
                  (flags & kDNSServiceFlagsRegistrationDomains) ? "kDNSServiceFlagsRegistrationDomains" : "<<Unknown>>");
-    err = mDNS_GetDomains(&mDNSStorage, &request->u.enumeration.q_all, t_all, NULL, InterfaceID, enum_result_callback, request);
+    err = mDNS_GetDomains(&mDNSStorage, &enumeration->q_all, t_all, NULL, InterfaceID, enum_result_callback, request);
     if (!err)
     {
-        err = mDNS_GetDomains(&mDNSStorage, &request->u.enumeration.q_default, t_default, NULL, InterfaceID, enum_result_callback, request);
-        if (err) mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_all);
+        err = mDNS_GetDomains(&mDNSStorage, &enumeration->q_default, t_default, NULL, InterfaceID, enum_result_callback, request);
+        if (err) mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_all);
         else if (!reg)
         {
-            err = mDNS_GetDomains(&mDNSStorage, &request->u.enumeration.q_autoall, mDNS_DomainTypeBrowseAutomatic, NULL, InterfaceID, enum_result_callback, request);
+            err = mDNS_GetDomains(&mDNSStorage, &enumeration->q_autoall, mDNS_DomainTypeBrowseAutomatic, NULL, InterfaceID, enum_result_callback, request);
             if (err)
             {
-                mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_all);
-                mDNS_StopGetDomains(&mDNSStorage, &request->u.enumeration.q_default);
+                mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_all);
+                mDNS_StopGetDomains(&mDNSStorage, &enumeration->q_default);
             }
         }
         if (!err) request->terminate = enum_termination_callback;
@@ -4765,6 +4983,7 @@ mDNSlocal mStatus handle_enum_request(request_state *request)
         }
     }
 
+exit:
     return(err);
 }
 
@@ -4778,13 +4997,25 @@ mDNSlocal mStatus handle_reconfirm_request(request_state *request)
     if (rr)
     {
         status = mDNS_ReconfirmByValue(&mDNSStorage, &rr->resrec);
-        LogOperation(
-            (status == mStatus_NoError) ?
-            "%3d: DNSServiceReconfirmRecord(%s) interface %d initiated PID[%d](%s)" :
-            "%3d: DNSServiceReconfirmRecord(%s) interface %d failed PID[%d](%s) status %d",
-            request->sd, RRDisplayString(&mDNSStorage, &rr->resrec),
-            mDNSPlatformInterfaceIndexfromInterfaceID(&mDNSStorage, rr->resrec.InterfaceID, mDNSfalse),
-            request->process_id, request->pid_name, status);
+
+        if (status == mStatus_NoError)
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                "[R%d] DNSServiceReconfirmRecord(%X, %d, " PRI_DM_NAME "(%x), " PUB_DNS_TYPE ") START PID[%d](" PUB_S ")",
+                request->request_id, request->flags, request->interfaceIndex, DM_NAME_PARAM(rr->resrec.name),
+                mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, rr->resrec.name->c, DomainNameLength(rr->resrec.name)),
+                DNS_TYPE_PARAM(rr->resrec.rrtype), request->process_id, request->pid_name);
+        }
+        else
+        {
+            LogRedact(MDNS_LOG_CATEGORY_MDNS, MDNS_LOG_DEFAULT,
+                "[R%d] DNSServiceReconfirmRecord(%X, %d, " PRI_DM_NAME "(%x), " PUB_DNS_TYPE ") FAILED PID[%d](" PUB_S ") -- "
+                "status: %d", request->request_id, request->flags, request->interfaceIndex,
+                DM_NAME_PARAM(rr->resrec.name),
+                mDNS_NonCryptoHash(mDNSNonCryptoHash_FNV1a, rr->resrec.name->c, DomainNameLength(rr->resrec.name)),
+                DNS_TYPE_PARAM(rr->resrec.rrtype), request->process_id, request->pid_name, status);
+        }
+
         freeL("AuthRecord/handle_reconfirm_request", rr);
     }
     return(status);
@@ -4857,12 +5088,13 @@ typedef packedstruct
 
 mDNSlocal void port_mapping_termination_callback(request_state *request)
 {
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) STOP PID[%d](" PUB_S ")",
-           request->request_id, DNSServiceProtocol(request->u.pm.NATinfo.Protocol),
-           mDNSVal16(request->u.pm.NATinfo.IntPort), mDNSVal16(request->u.pm.ReqExt), request->u.pm.NATinfo.NATLease,
-           request->process_id, request->pid_name);
+    request_port_mapping *const pm = request->pm;
+    LogRedact(MDNS_LOG_CATEGORY_NAT, MDNS_LOG_DEFAULT, "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) STOP PID[%d](" PUB_S ")",
+        request->request_id, DNSServiceProtocol(pm->NATinfo.Protocol),
+        mDNSVal16(pm->NATinfo.IntPort), mDNSVal16(pm->ReqExt), pm->NATinfo.NATLease,
+        request->process_id, request->pid_name);
 
-    mDNS_StopNATOperation(&mDNSStorage, &request->u.pm.NATinfo);
+    mDNS_StopNATOperation(&mDNSStorage, &pm->NATinfo);
 }
 
 // Called via function pointer when we get a NAT Traversal (address request or port mapping) response
@@ -4890,23 +5122,24 @@ mDNSlocal void port_mapping_create_request_callback(mDNS *m, NATTraversalInfo *n
 
     data = (uint8_t *)&rep->rhdr[1];
 
-    *data++ = request->u.pm.NATinfo.ExternalAddress.b[0];
-    *data++ = request->u.pm.NATinfo.ExternalAddress.b[1];
-    *data++ = request->u.pm.NATinfo.ExternalAddress.b[2];
-    *data++ = request->u.pm.NATinfo.ExternalAddress.b[3];
-    *data++ = DNSServiceProtocol(request->u.pm.NATinfo.Protocol);
-    *data++ = request->u.pm.NATinfo.IntPort.b[0];
-    *data++ = request->u.pm.NATinfo.IntPort.b[1];
-    *data++ = request->u.pm.NATinfo.ExternalPort.b[0];
-    *data++ = request->u.pm.NATinfo.ExternalPort.b[1];
-    put_uint32(request->u.pm.NATinfo.Lifetime, &data);
+    const request_port_mapping *const pm = request->pm;
+    *data++ = pm->NATinfo.ExternalAddress.b[0];
+    *data++ = pm->NATinfo.ExternalAddress.b[1];
+    *data++ = pm->NATinfo.ExternalAddress.b[2];
+    *data++ = pm->NATinfo.ExternalAddress.b[3];
+    *data++ = DNSServiceProtocol(pm->NATinfo.Protocol);
+    *data++ = pm->NATinfo.IntPort.b[0];
+    *data++ = pm->NATinfo.IntPort.b[1];
+    *data++ = pm->NATinfo.ExternalPort.b[0];
+    *data++ = pm->NATinfo.ExternalPort.b[1];
+    put_uint32(pm->NATinfo.Lifetime, &data);
 
-    LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) RESULT " PRI_IPv4_ADDR ":%u TTL %u",
-           request->request_id, DNSServiceProtocol(request->u.pm.NATinfo.Protocol),
-           mDNSVal16(request->u.pm.NATinfo.IntPort), mDNSVal16(request->u.pm.ReqExt), request->u.pm.NATinfo.NATLease,
-           &request->u.pm.NATinfo.ExternalAddress, mDNSVal16(request->u.pm.NATinfo.ExternalPort),
-           request->u.pm.NATinfo.Lifetime);
+    LogRedact(MDNS_LOG_CATEGORY_NAT, MDNS_LOG_DEFAULT,
+        "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) RESULT " PRI_IPv4_ADDR ":%u TTL %u",
+        request->request_id, DNSServiceProtocol(pm->NATinfo.Protocol),
+        mDNSVal16(pm->NATinfo.IntPort), mDNSVal16(pm->ReqExt), pm->NATinfo.NATLease,
+        &pm->NATinfo.ExternalAddress, mDNSVal16(pm->NATinfo.ExternalPort),
+        pm->NATinfo.Lifetime);
 
     append_reply(request, rep);
 }
@@ -4922,13 +5155,20 @@ mDNSlocal mStatus handle_port_mapping_request(request_state *request)
     mDNSu8 protocol       = (mDNSu8)get_uint32(&request->msgptr, request->msgend);
     (void)flags; // Unused
     if (interfaceIndex && !InterfaceID) return(mStatus_BadParamErr);
+    if (!request->pm)
+    {
+        request->pm = (request_port_mapping *)callocL("request_port_mapping", sizeof(*request->pm));
+        mdns_require_action_quiet(request->pm, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for port mapping request", request->request_id));
+    }
+    request_port_mapping *const pm = request->pm;
     if (request->msgptr + 8 > request->msgend) request->msgptr = NULL;
     else
     {
-        request->u.pm.NATinfo.IntPort.b[0] = *request->msgptr++;
-        request->u.pm.NATinfo.IntPort.b[1] = *request->msgptr++;
-        request->u.pm.ReqExt.b[0]          = *request->msgptr++;
-        request->u.pm.ReqExt.b[1]          = *request->msgptr++;
+        pm->NATinfo.IntPort.b[0] = *request->msgptr++;
+        pm->NATinfo.IntPort.b[1] = *request->msgptr++;
+        pm->ReqExt.b[0]          = *request->msgptr++;
+        pm->ReqExt.b[1]          = *request->msgptr++;
         ttl = get_uint32(&request->msgptr, request->msgend);
     }
 
@@ -4941,31 +5181,32 @@ mDNSlocal mStatus handle_port_mapping_request(request_state *request)
 
     if (protocol == 0)  // If protocol == 0 (i.e. just request public address) then IntPort, ExtPort, ttl must be zero too
     {
-        if (!mDNSIPPortIsZero(request->u.pm.NATinfo.IntPort) || !mDNSIPPortIsZero(request->u.pm.ReqExt) || ttl) return(mStatus_BadParamErr);
+        if (!mDNSIPPortIsZero(pm->NATinfo.IntPort) || !mDNSIPPortIsZero(pm->ReqExt) || ttl) return(mStatus_BadParamErr);
     }
     else
     {
-        if (mDNSIPPortIsZero(request->u.pm.NATinfo.IntPort)) return(mStatus_BadParamErr);
+        if (mDNSIPPortIsZero(pm->NATinfo.IntPort)) return(mStatus_BadParamErr);
         if (!(protocol & (kDNSServiceProtocol_UDP | kDNSServiceProtocol_TCP))) return(mStatus_BadParamErr);
     }
 
-    request->flags                       = flags;
-    request->interfaceIndex              = interfaceIndex;
-    request->u.pm.NATinfo.Protocol       = !protocol ? NATOp_AddrRequest : (protocol == kDNSServiceProtocol_UDP) ? NATOp_MapUDP : NATOp_MapTCP;
-    //       u.pm.NATinfo.IntPort        = already set above
-    request->u.pm.NATinfo.RequestedPort  = request->u.pm.ReqExt;
-    request->u.pm.NATinfo.NATLease       = ttl;
-    request->u.pm.NATinfo.clientCallback = port_mapping_create_request_callback;
-    request->u.pm.NATinfo.clientContext  = request;
+    request->flags             = flags;
+    request->interfaceIndex    = interfaceIndex;
+    pm->NATinfo.Protocol       = !protocol ? NATOp_AddrRequest : (protocol == kDNSServiceProtocol_UDP) ? NATOp_MapUDP : NATOp_MapTCP;
+    // pm->NATinfo.IntPort already set above.
+    pm->NATinfo.RequestedPort  = pm->ReqExt;
+    pm->NATinfo.NATLease       = ttl;
+    pm->NATinfo.clientCallback = port_mapping_create_request_callback;
+    pm->NATinfo.clientContext  = request;
 
     LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-           "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) START PID[%d](" PUB_S ")",
-           request->request_id, protocol, mDNSVal16(request->u.pm.NATinfo.IntPort), mDNSVal16(request->u.pm.ReqExt),
-           request->u.pm.NATinfo.NATLease, request->process_id, request->pid_name);
-    err = mDNS_StartNATOperation(&mDNSStorage, &request->u.pm.NATinfo);
+        "[R%d] DNSServiceNATPortMappingCreate(%X, %u, %u, %d) START PID[%d](" PUB_S ")",
+        request->request_id, protocol, mDNSVal16(pm->NATinfo.IntPort), mDNSVal16(pm->ReqExt),
+        pm->NATinfo.NATLease, request->process_id, request->pid_name);
+    err = mDNS_StartNATOperation(&mDNSStorage, &pm->NATinfo);
     if (err) LogMsg("ERROR: mDNS_StartNATOperation: %d", (int)err);
     else request->terminate = port_mapping_termination_callback;
 
+exit:
     return(err);
 }
 
@@ -4974,12 +5215,13 @@ mDNSlocal mStatus handle_port_mapping_request(request_state *request)
 
 mDNSlocal void addrinfo_termination_callback(request_state *request)
 {
+    GetAddrInfoClientRequest *const addrinfo = request->addrinfo;
     LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
            "[R%u] DNSServiceGetAddrInfo(" PRI_DM_NAME ") STOP PID[%d](" PUB_S ")",
-           request->request_id, DM_NAME_PARAM(GetAddrInfoClientRequestGetQName(&request->u.addrinfo)),
+           request->request_id, DM_NAME_PARAM(GetAddrInfoClientRequestGetQName(addrinfo)),
            request->process_id, request->pid_name);
 
-    GetAddrInfoClientRequestStop(&request->u.addrinfo);
+    GetAddrInfoClientRequestStop(addrinfo);
 }
 
 typedef struct {
@@ -5011,9 +5253,12 @@ mDNSlocal mStatus _handle_addrinfo_request_start(request_state *request, const _
     gaiParams.customID       = request->custom_service_id;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    gaiParams.peerAuditToken = &request->audit_token;
+    gaiParams.peerToken      = request->peer_token;
 #endif
-    err = GetAddrInfoClientRequestStart(&request->u.addrinfo, &gaiParams, queryrecord_result_reply, request);
+#if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_DEBUGGING)
+    get_tracker_info_tlvs(request);
+#endif
+    err = GetAddrInfoClientRequestStart(request->addrinfo, &gaiParams, queryrecord_result_reply, request);
 
     return err;
 }
@@ -5028,21 +5273,22 @@ mDNSlocal void _return_addrinfo_request_error(request_state * request, mStatus e
 mDNSlocal mStatus _handle_addrinfo_request_with_trust(request_state *request, const _addrinfo_start_params_t * const params)
 {
     mStatus err;
-    if (audit_token_to_pid(request->audit_token) == 0)
+    if (!request->peer_token)
     {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_WARNING, "[R%u] _handle_addrinfo_request_with_trust: no audit token for pid(%s %d)", request->request_id, request->pid_name, request->process_id);
         err = _handle_addrinfo_request_start(request, params);
     }
     else
     {
+        const audit_token_t *const token = mdns_audit_token_get_token(request->peer_token);
         mdns_trust_flags_t flags = mdns_trust_flags_none;
-        mdns_trust_status_t status = mdns_trust_check_getaddrinfo(request->audit_token, params->hostname, &flags);
+        mdns_trust_status_t status = mdns_trust_check_getaddrinfo(*token, params->hostname, &flags);
         switch (status)
         {
             case mdns_trust_status_denied:
             case mdns_trust_status_pending:
             {
-                mdns_trust_t trust = mdns_trust_create(request->audit_token, NULL, flags);
+                mdns_trust_t trust = mdns_trust_create(*token, NULL, flags);
                 if (!trust )
                 {
                     err = mStatus_NoMemoryErr;
@@ -5108,11 +5354,16 @@ exit:
 
 mDNSlocal mStatus handle_addrinfo_request(request_state *request)
 {
-    mStatus             err;
+    mStatus err;
+    if (!request->addrinfo)
+    {
+        request->addrinfo = (GetAddrInfoClientRequest *)callocL("GetAddrInfoClientRequest", sizeof(*request->addrinfo));
+        mdns_require_action_quiet(request->addrinfo, exit, err = mStatus_NoMemoryErr; uds_log_error(
+            "[R%u] Failed to allocate memory for addrinfo request", request->request_id));
+    }
     DNSServiceFlags     flags;
     mDNSu32             interfaceIndex;
     _addrinfo_start_params_t params;
-
     flags               = get_flags(&request->msgptr, request->msgend);
     interfaceIndex      = get_uint32(&request->msgptr, request->msgend);
     params.protocols    = get_uint32(&request->msgptr, request->msgend);
@@ -5162,7 +5413,6 @@ mDNSlocal mStatus handle_addrinfo_request(request_state *request)
         request->request_id, request->flags, request->interfaceIndex, params.protocols, params.hostname,
         enablesDNSSEC ? ", DNSSEC" : "", request->process_id, request->pid_name);
 
-    mDNSPlatformMemZero(&request->u.addrinfo, (mDNSu32)sizeof(request->u.addrinfo));
     request->terminate = NULL;
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
@@ -5513,11 +5763,39 @@ mDNSlocal void returnAsyncErrorCode(request_state *const request, const mStatus 
     append_reply(request, rep);
 }
 
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+mDNSlocal mStatus request_state_prepare_audit_token(request_state *const req)
+{
+    mStatus err;
+    mdns_require_action_quiet(!req->peer_token, exit, err = mStatus_NoError);
+
+    audit_token_t token;
+    memset(&token, 0, sizeof(token));
+    const OSStatus token_err = mdns_system_get_peer_audit_token_from_uds_connection(req->sd, &token);
+    mdns_require_noerr_action_quiet(token_err, exit, err = mStatus_NoError;
+        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_ERROR,
+        "[R%u] Failed to get peer audit token -- error: %ld, client pid: %lld (" PUB_S ")",
+        req->request_id, (long)token_err, (long long)req->process_id, req->pid_name));
+
+    req->peer_token = mdns_audit_token_create(&token);
+    mdns_require_action_quiet(req->peer_token, exit, err = mStatus_NoMemoryErr;
+        LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT,
+        "[R%u] Failed to create peer audit token -- client pid: %lld (" PUB_S ")",
+        req->request_id, (long long)req->process_id, req->pid_name));
+
+    err = mStatus_NoError;
+
+exit:
+    return err;
+}
+#endif
+
 mDNSlocal mStatus handle_client_request(request_state *req)
 {
     mStatus err = mStatus_NoError;
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    SetupAuditTokenForRequest(req);
+    err = request_state_prepare_audit_token(req);
+    mdns_require_noerr_quiet(err, exit);
 #endif
     switch(req->hdr.op)
     {
@@ -5530,7 +5808,7 @@ mDNSlocal mStatus handle_client_request(request_state *req)
             break;
         case connection_delegate_request:
             LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT,
-                   "[R%d] DNSServiceCreateDelegateConnection START PID[%d](" PRI_S ")",
+                   "[R%d] DNSServiceCreateDelegateConnection START PID[%d](" PUB_S ")",
                    req->request_id, req->process_id, req->pid_name);
             req->terminate = connection_termination;
             handle_connection_delegate_request(req);
@@ -5545,7 +5823,6 @@ mDNSlocal mStatus handle_client_request(request_state *req)
         case getproperty_request:                handle_getproperty_request (req);  break;
         case port_mapping_request:         err = handle_port_mapping_request(req);  break;
         case addrinfo_request:             err = handle_addrinfo_request    (req);  break;
-        case send_bpf:                     /* Do nothing for send_bpf */            break;
 
             // These are all operations that work with an existing request_state object
         case reg_record_request:           err = handle_regrecord_request   (req);  break;
@@ -5554,12 +5831,15 @@ mDNSlocal mStatus handle_client_request(request_state *req)
         case remove_record_request:        err = handle_removerecord_request(req);  break;
         case cancel_request:                     handle_cancel_request      (req);  break;
         case release_request:              err = handle_release_request     (req);  break;
+        case send_bpf_OBSOLETE:            // No longer supported.
         default: LogMsg("request_callback: %3d:ERROR: Unsupported UDS req:%d PID[%d][%s]",
                         req->sd, req->hdr.op, req->process_id, req->pid_name);
             err = mStatus_BadParamErr;
             break;
     }
-
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+exit:
+#endif
     return err;
 }
 
@@ -5612,9 +5892,9 @@ mDNSlocal void request_callback(int fd, void *info)
             case getproperty_request:      min_size = 2;                                                                           break;
             case port_mapping_request:     min_size += sizeof(mDNSu32) + 4 /* udp/tcp */ + 4 /* int/ext port */    + 4 /* ttl */;  break;
             case addrinfo_request:         min_size += sizeof(mDNSu32) + 4 /* v4/v6 */   + 1 /* hostname */;                       break;
-            case send_bpf:                 // Same as cancel_request below
             case cancel_request:           min_size = 0;                                                                           break;
             case release_request:          min_size += sizeof(mDNSu32) + 3 /* type, type, domain */;                               break;
+            case send_bpf_OBSOLETE:        // No longer supported.
             default: LogMsg("request_callback: ERROR: validate_message - unsupported req type: %d PID[%d][%s]",
                             req->hdr.op, req->process_id, req->pid_name);
                      min_size = -1;                                                                                                break;
@@ -5649,7 +5929,7 @@ mDNSlocal void request_callback(int fd, void *info)
             newreq->msgend  = req->msgend;
             newreq->request_id = GetNewRequestID();
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-            newreq->audit_token = req->audit_token;
+            mdns_replace(&newreq->peer_token, req->peer_token);
 #endif
             // if the parent request is a delegate connection, copy the
             // relevant bits
@@ -5674,7 +5954,7 @@ mDNSlocal void request_callback(int fd, void *info)
         }
 
         // Check if the request wants no asynchronous replies.
-        if (req->hdr.ipc_flags & IPC_FLAGS_NOREPLY) req->no_reply = 1;
+        if (req->hdr.ipc_flags & IPC_FLAGS_NOREPLY) req->no_reply = mDNStrue;
 
         // If we're shutting down, don't allow new client requests
         // We do allow "cancel" and "getproperty" during shutdown
@@ -5688,7 +5968,7 @@ mDNSlocal void request_callback(int fd, void *info)
 
         // There's no return data for a cancel request (DNSServiceRefDeallocate returns no result)
         // For a DNSServiceGetProperty call, the handler already generated the response, so no need to do it again here
-        if (req->hdr.op != cancel_request && req->hdr.op != getproperty_request && req->hdr.op != send_bpf && req->hdr.op != getpid_request)
+        if (req->hdr.op != cancel_request && req->hdr.op != getproperty_request && req->hdr.op != getpid_request)
         {
             const mStatus err_netorder = (mStatus)dnssd_htonl((mDNSu32)err);
             if ((req->hdr.ipc_flags & IPC_FLAGS_NOERRSD))
@@ -6018,92 +6298,108 @@ mDNSlocal void LogClientInfoToFD(int fd, request_state *req)
         int num_records = 0, num_ops = 0;
         const registered_record_entry *p;
         request_state *r;
-        for (p = req->u.reg_recs; p; p=p->next) num_records++;
+        for (p = req->reg_recs; p; p=p->next)
+        {
+            num_records++;
+        }
         for (r = req->next; r; r=r->next) if (r->primary == req) num_ops++;
         LogToFD(fd, "%s DNSServiceCreateConnection: %d registered record%s, %d kDNSServiceFlagsShareConnection operation%s PID[%d](%s)",
                   prefix, num_records, num_records != 1 ? "s" : "", num_ops,     num_ops     != 1 ? "s" : "",
                   req->process_id, req->pid_name);
-        for (p = req->u.reg_recs; p; p=p->next)
+        for (p = req->reg_recs; p; p=p->next)
+        {
             LogToFD(fd, " ->  DNSServiceRegisterRecord   0x%08X %2d %3d %s PID[%d](%s)",
-                      req->flags, req->interfaceIndex, p->key, ARDisplayString(&mDNSStorage, p->rr), req->process_id, req->pid_name);
+                req->flags, req->interfaceIndex, p->key, ARDisplayString(&mDNSStorage, p->rr), req->process_id, req->pid_name);
+        }
         for (r = req->next; r; r=r->next) if (r->primary == req) LogClientInfoToFD(fd, r);
     }
     else if (req->terminate == regservice_termination_callback)
     {
         service_instance *ptr;
-        for (ptr = req->u.servicereg.instances; ptr; ptr = ptr->next)
+        const request_servicereg *const servicereg = req->servicereg;
+        for (ptr = servicereg->instances; ptr; ptr = ptr->next)
+        {
             LogToFD(fd, "%-9s DNSServiceRegister         0x%08X %2d %##s %u/%u PID[%d](%s)",
-                      (ptr == req->u.servicereg.instances) ? prefix : "", req->flags, req->interfaceIndex, ptr->srs.RR_SRV.resrec.name->c,
-                      mDNSVal16(req->u.servicereg.port),
-                      SRS_PORT(&ptr->srs), req->process_id, req->pid_name);
+                (ptr == servicereg->instances) ? prefix : "", req->flags, req->interfaceIndex, ptr->srs.RR_SRV.resrec.name->c,
+                mDNSVal16(servicereg->port),
+                SRS_PORT(&ptr->srs), req->process_id, req->pid_name);
+        }
     }
     else if (req->terminate == browse_termination_callback)
     {
-        browser_t *blist;
-        for (blist = req->u.browser.browsers; blist; blist = blist->next)
+        const request_browse *const browse = req->browse;
+        for (const browser_t *blist = browse->browsers; blist; blist = blist->next)
+        {
             LogToFD(fd, "%-9s DNSServiceBrowse           0x%08X %2d %##s PID[%d](%s)",
-                      (blist == req->u.browser.browsers) ? prefix : "", req->flags, req->interfaceIndex, blist->q.qname.c,
-                      req->process_id, req->pid_name);
+                (blist == browse->browsers) ? prefix : "", req->flags, req->interfaceIndex, blist->q.qname.c,
+                req->process_id, req->pid_name);
+        }
     }
     else if (req->terminate == resolve_termination_callback)
+    {
         LogToFD(fd, "%s DNSServiceResolve          0x%08X %2d %##s PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex, req->u.resolve.qsrv.qname.c, req->process_id, req->pid_name);
+            prefix, req->flags, req->interfaceIndex, req->resolve->qsrv.qname.c, req->process_id, req->pid_name);
+    }
     else if (req->terminate == queryrecord_termination_callback)
     {
+        const QueryRecordClientRequest *const queryrecord = req->queryrecord;
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-        const bool redacted = (req->u.queryrecord.op.q.logPrivacyLevel == dnssd_log_privacy_level_private);
+        const bool redacted = (queryrecord->op.q.logPrivacyLevel == dnssd_log_privacy_level_private);
 #endif
 
         LogToFD(fd, "%s DNSServiceQueryRecord      0x%08X %2d %##s (%s) PID[%d](%s)", prefix, req->flags,
             req->interfaceIndex,
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-            redacted ? PRIVATE_DOMAIN_NAME : QueryRecordClientRequestGetQName(&req->u.queryrecord),
+            redacted ? PRIVATE_DOMAIN_NAME : QueryRecordClientRequestGetQName(queryrecord),
 #else
-            QueryRecordClientRequestGetQName(&req->u.queryrecord),
+            QueryRecordClientRequestGetQName(queryrecord),
 #endif
-            DNSTypeName(QueryRecordClientRequestGetType(&req->u.queryrecord)),
+            DNSTypeName(QueryRecordClientRequestGetType(queryrecord)),
             req->process_id, req->pid_name);
     }
     else if (req->terminate == enum_termination_callback)
         LogToFD(fd, "%s DNSServiceEnumerateDomains 0x%08X %2d %##s PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex, req->u.enumeration.q_all.qname.c, req->process_id, req->pid_name);
+                  prefix, req->flags, req->interfaceIndex, req->enumeration->q_all.qname.c, req->process_id, req->pid_name);
     else if (req->terminate == port_mapping_termination_callback)
+    {
+        const request_port_mapping *const pm = req->pm;
         LogToFD(fd, "%s DNSServiceNATPortMapping   0x%08X %2d %s%s Int %5d Req %5d Ext %.4a:%5d Req TTL %5d Granted TTL %5d PID[%d](%s)",
-                  prefix,
-                  req->flags,
-                  req->interfaceIndex,
-                  req->u.pm.NATinfo.Protocol & NATOp_MapTCP ? "TCP" : "   ",
-                  req->u.pm.NATinfo.Protocol & NATOp_MapUDP ? "UDP" : "   ",
-                  mDNSVal16(req->u.pm.NATinfo.IntPort),
-                  mDNSVal16(req->u.pm.ReqExt),
-                  &req->u.pm.NATinfo.ExternalAddress,
-                  mDNSVal16(req->u.pm.NATinfo.ExternalPort),
-                  req->u.pm.NATinfo.NATLease,
-                  req->u.pm.NATinfo.Lifetime,
-                  req->process_id, req->pid_name);
+            prefix,
+            req->flags,
+            req->interfaceIndex,
+            pm->NATinfo.Protocol & NATOp_MapTCP ? "TCP" : "   ",
+            pm->NATinfo.Protocol & NATOp_MapUDP ? "UDP" : "   ",
+            mDNSVal16(pm->NATinfo.IntPort),
+            mDNSVal16(pm->ReqExt),
+            &pm->NATinfo.ExternalAddress,
+            mDNSVal16(pm->NATinfo.ExternalPort),
+            pm->NATinfo.NATLease,
+            pm->NATinfo.Lifetime,
+            req->process_id, req->pid_name);
+    }
     else if (req->terminate == addrinfo_termination_callback)
     {
+        const GetAddrInfoClientRequest *const addrinfo = req->addrinfo;
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-        const GetAddrInfoClientRequest *const request = &req->u.addrinfo;
         bool redacted = false;
-        if (request->op4)
+        if (addrinfo->op4)
         {
-            redacted = (request->op4->q.logPrivacyLevel == dnssd_log_privacy_level_private);
+            redacted = (addrinfo->op4->q.logPrivacyLevel == dnssd_log_privacy_level_private);
         }
-        else if (request->op6)
+        else if (addrinfo->op6)
         {
-            redacted = (request->op6->q.logPrivacyLevel == dnssd_log_privacy_level_private);
+            redacted = (addrinfo->op6->q.logPrivacyLevel == dnssd_log_privacy_level_private);
         }
 #endif
 
         LogToFD(fd, "%s DNSServiceGetAddrInfo      0x%08X %2d %s%s %##s PID[%d](%s)", prefix, req->flags,
             req->interfaceIndex,
-            req->u.addrinfo.protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
-            req->u.addrinfo.protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
+            addrinfo->protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
+            addrinfo->protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-            redacted ? PRIVATE_DOMAIN_NAME : GetAddrInfoClientRequestGetQName(&req->u.addrinfo),
+            redacted ? PRIVATE_DOMAIN_NAME : GetAddrInfoClientRequestGetQName(req->addrinfo),
 #else
-            GetAddrInfoClientRequestGetQName(&req->u.addrinfo),
+            GetAddrInfoClientRequestGetQName(req->addrinfo),
 #endif
             req->process_id, req->pid_name);
     }
@@ -6127,62 +6423,81 @@ mDNSlocal void LogClientInfo(request_state *req)
         int num_records = 0, num_ops = 0;
         const registered_record_entry *p;
         request_state *r;
-        for (p = req->u.reg_recs; p; p=p->next) num_records++;
+        for (p = req->reg_recs; p; p=p->next)
+        {
+            num_records++;
+        }
         for (r = req->next; r; r=r->next) if (r->primary == req) num_ops++;
         LogMsgNoIdent("%s DNSServiceCreateConnection: %d registered record%s, %d kDNSServiceFlagsShareConnection operation%s PID[%d](%s)",
                       prefix, num_records, num_records != 1 ? "s" : "", num_ops,     num_ops     != 1 ? "s" : "",
                       req->process_id, req->pid_name);
-        for (p = req->u.reg_recs; p; p=p->next)
-        LogMsgNoIdent(" ->  DNSServiceRegisterRecord   0x%08X %2d %3d %s PID[%d](%s)",
-                      req->flags, req->interfaceIndex, p->key, ARDisplayString(&mDNSStorage, p->rr), req->process_id, req->pid_name);
+        for (p = req->reg_recs; p; p=p->next)
+        {
+            LogMsgNoIdent(" ->  DNSServiceRegisterRecord   0x%08X %2d %3d %s PID[%d](%s)",
+                req->flags, req->interfaceIndex, p->key, ARDisplayString(&mDNSStorage, p->rr), req->process_id, req->pid_name);
+        }
         for (r = req->next; r; r=r->next) if (r->primary == req) LogClientInfo(r);
     }
     else if (req->terminate == regservice_termination_callback)
     {
         service_instance *ptr;
-        for (ptr = req->u.servicereg.instances; ptr; ptr = ptr->next)
-        LogMsgNoIdent("%-9s DNSServiceRegister         0x%08X %2d %##s %u/%u PID[%d](%s)",
-                      (ptr == req->u.servicereg.instances) ? prefix : "", req->flags, req->interfaceIndex, ptr->srs.RR_SRV.resrec.name->c,
-                      mDNSVal16(req->u.servicereg.port),
-                      SRS_PORT(&ptr->srs), req->process_id, req->pid_name);
+        const request_servicereg *const servicereg = req->servicereg;
+        for (ptr = servicereg->instances; ptr; ptr = ptr->next)
+        {
+            LogMsgNoIdent("%-9s DNSServiceRegister         0x%08X %2d %##s %u/%u PID[%d](%s)",
+                (ptr == servicereg->instances) ? prefix : "", req->flags, req->interfaceIndex, ptr->srs.RR_SRV.resrec.name->c,
+                mDNSVal16(servicereg->port),
+                SRS_PORT(&ptr->srs), req->process_id, req->pid_name);
+        }
     }
     else if (req->terminate == browse_termination_callback)
     {
-        browser_t *blist;
-        for (blist = req->u.browser.browsers; blist; blist = blist->next)
-        LogMsgNoIdent("%-9s DNSServiceBrowse           0x%08X %2d %##s PID[%d](%s)",
-                      (blist == req->u.browser.browsers) ? prefix : "", req->flags, req->interfaceIndex, blist->q.qname.c,
-                      req->process_id, req->pid_name);
+        const request_browse *const browse = req->browse;
+        for (const browser_t *blist = browse->browsers; blist; blist = blist->next)
+        {
+            LogMsgNoIdent("%-9s DNSServiceBrowse           0x%08X %2d %##s PID[%d](%s)",
+                (blist == browse->browsers) ? prefix : "", req->flags, req->interfaceIndex, blist->q.qname.c,
+                req->process_id, req->pid_name);
+        }
     }
     else if (req->terminate == resolve_termination_callback)
     LogMsgNoIdent("%s DNSServiceResolve          0x%08X %2d %##s PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex, req->u.resolve.qsrv.qname.c, req->process_id, req->pid_name);
+                  prefix, req->flags, req->interfaceIndex, req->resolve->qsrv.qname.c, req->process_id, req->pid_name);
     else if (req->terminate == queryrecord_termination_callback)
-    LogMsgNoIdent("%s DNSServiceQueryRecord      0x%08X %2d %##s (%s) PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex, QueryRecordClientRequestGetQName(&req->u.queryrecord), DNSTypeName(QueryRecordClientRequestGetType(&req->u.queryrecord)), req->process_id, req->pid_name);
+    {
+        LogMsgNoIdent("%s DNSServiceQueryRecord      0x%08X %2d %##s (%s) PID[%d](%s)",
+            prefix, req->flags, req->interfaceIndex, QueryRecordClientRequestGetQName(req->queryrecord),
+            DNSTypeName(QueryRecordClientRequestGetType(req->queryrecord)), req->process_id, req->pid_name);
+    }
     else if (req->terminate == enum_termination_callback)
     LogMsgNoIdent("%s DNSServiceEnumerateDomains 0x%08X %2d %##s PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex, req->u.enumeration.q_all.qname.c, req->process_id, req->pid_name);
+                  prefix, req->flags, req->interfaceIndex, req->enumeration->q_all.qname.c, req->process_id, req->pid_name);
     else if (req->terminate == port_mapping_termination_callback)
-    LogMsgNoIdent("%s DNSServiceNATPortMapping   0x%08X %2d %s%s Int %5d Req %5d Ext %.4a:%5d Req TTL %5d Granted TTL %5d PID[%d](%s)",
-                  prefix,
-                  req->flags,
-                  req->interfaceIndex,
-                  req->u.pm.NATinfo.Protocol & NATOp_MapTCP ? "TCP" : "   ",
-                  req->u.pm.NATinfo.Protocol & NATOp_MapUDP ? "UDP" : "   ",
-                  mDNSVal16(req->u.pm.NATinfo.IntPort),
-                  mDNSVal16(req->u.pm.ReqExt),
-                  &req->u.pm.NATinfo.ExternalAddress,
-                  mDNSVal16(req->u.pm.NATinfo.ExternalPort),
-                  req->u.pm.NATinfo.NATLease,
-                  req->u.pm.NATinfo.Lifetime,
-                  req->process_id, req->pid_name);
+    {
+        const request_port_mapping *const pm = req->pm;
+        LogMsgNoIdent("%s DNSServiceNATPortMapping   0x%08X %2d %s%s Int %5d Req %5d Ext %.4a:%5d Req TTL %5d Granted TTL %5d PID[%d](%s)",
+            prefix,
+            req->flags,
+            req->interfaceIndex,
+            pm->NATinfo.Protocol & NATOp_MapTCP ? "TCP" : "   ",
+            pm->NATinfo.Protocol & NATOp_MapUDP ? "UDP" : "   ",
+            mDNSVal16(pm->NATinfo.IntPort),
+            mDNSVal16(pm->ReqExt),
+            &pm->NATinfo.ExternalAddress,
+            mDNSVal16(pm->NATinfo.ExternalPort),
+            pm->NATinfo.NATLease,
+            pm->NATinfo.Lifetime,
+            req->process_id, req->pid_name);
+    }
     else if (req->terminate == addrinfo_termination_callback)
-    LogMsgNoIdent("%s DNSServiceGetAddrInfo      0x%08X %2d %s%s %##s PID[%d](%s)",
-                  prefix, req->flags, req->interfaceIndex,
-                  req->u.addrinfo.protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
-                  req->u.addrinfo.protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
-                  GetAddrInfoClientRequestGetQName(&req->u.addrinfo), req->process_id, req->pid_name);
+    {
+        const GetAddrInfoClientRequest *const addrinfo = req->addrinfo;
+        LogMsgNoIdent("%s DNSServiceGetAddrInfo      0x%08X %2d %s%s %##s PID[%d](%s)",
+            prefix, req->flags, req->interfaceIndex,
+            addrinfo->protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
+            addrinfo->protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
+            GetAddrInfoClientRequestGetQName(addrinfo), req->process_id, req->pid_name);
+    }
     else
     LogMsgNoIdent("%s Unrecognized operation %p", prefix, req->terminate);
 }
@@ -6194,12 +6509,14 @@ mDNSlocal void GetMcastClients(request_state *req)
         int num_records = 0, num_ops = 0;
         const registered_record_entry *p;
         request_state *r;
-        for (p = req->u.reg_recs; p; p=p->next)
+        for (p = req->reg_recs; p; p=p->next)
+        {
             num_records++;
+        }
         for (r = req->next; r; r=r->next)
             if (r->primary == req)
                 num_ops++;
-        for (p = req->u.reg_recs; p; p=p->next)
+        for (p = req->reg_recs; p; p=p->next)
         {
             if (!AuthRecord_uDNS(p->rr))
                 n_mrecords++;
@@ -6211,7 +6528,7 @@ mDNSlocal void GetMcastClients(request_state *req)
     else if (req->terminate == regservice_termination_callback)
     {
         service_instance *ptr;
-        for (ptr = req->u.servicereg.instances; ptr; ptr = ptr->next)
+        for (ptr = req->servicereg->instances; ptr; ptr = ptr->next)
         {
             if (!AuthRecord_uDNS(&ptr->srs.RR_SRV))
                 n_mrecords++;
@@ -6219,8 +6536,7 @@ mDNSlocal void GetMcastClients(request_state *req)
     }
     else if (req->terminate == browse_termination_callback)
     {
-        browser_t *blist;
-        for (blist = req->u.browser.browsers; blist; blist = blist->next)
+        for (const browser_t *blist = req->browse->browsers; blist; blist = blist->next)
         {
             if (mDNSOpaque16IsZero(blist->q.TargetQID))
                 n_mquests++;
@@ -6228,18 +6544,25 @@ mDNSlocal void GetMcastClients(request_state *req)
     }
     else if (req->terminate == resolve_termination_callback)
     {
-        if ((mDNSOpaque16IsZero(req->u.resolve.qsrv.TargetQID)) && (req->u.resolve.qsrv.ThisQInterval > 0))
+        const request_resolve *const resolve = req->resolve;
+        if ((mDNSOpaque16IsZero(resolve->qsrv.TargetQID)) && (resolve->qsrv.ThisQInterval > 0))
+        {
             n_mquests++;
+        }
     }
     else if (req->terminate == queryrecord_termination_callback)
     {
-        if (QueryRecordClientRequestIsMulticast(&req->u.queryrecord))
+        if (QueryRecordClientRequestIsMulticast(req->queryrecord))
+        {
             n_mquests++;
+        }
     }
     else if (req->terminate == addrinfo_termination_callback)
     {
-        if (GetAddrInfoClientRequestIsMulticast(&req->u.addrinfo))
+        if (GetAddrInfoClientRequestIsMulticast(req->addrinfo))
+        {
             n_mquests++;
+        }
     }
     else
     {
@@ -6257,12 +6580,14 @@ mDNSlocal void LogMcastClientInfo(request_state *req)
         int num_records = 0, num_ops = 0;
         const registered_record_entry *p;
         request_state *r;
-        for (p = req->u.reg_recs; p; p=p->next)
+        for (p = req->reg_recs; p; p=p->next)
+        {
             num_records++;
+        }
         for (r = req->next; r; r=r->next)
             if (r->primary == req)
                 num_ops++;
-        for (p = req->u.reg_recs; p; p=p->next)
+        for (p = req->reg_recs; p; p=p->next)
         {
             if (!AuthRecord_uDNS(p->rr))
                 LogMcastNoIdent("R: ->  DNSServiceRegisterRecord:  %##s %s PID[%d](%s)", p->rr->resrec.name->c,
@@ -6275,17 +6600,19 @@ mDNSlocal void LogMcastClientInfo(request_state *req)
     else if (req->terminate == regservice_termination_callback)
     {
         service_instance *ptr;
-        for (ptr = req->u.servicereg.instances; ptr; ptr = ptr->next)
+        const request_servicereg *const servicereg = req->servicereg;
+        for (ptr = servicereg->instances; ptr; ptr = ptr->next)
         {
             if (!AuthRecord_uDNS(&ptr->srs.RR_SRV))
-                LogMcastNoIdent("R: DNSServiceRegister:  %##s %u/%u PID[%d](%s)", ptr->srs.RR_SRV.resrec.name->c, mDNSVal16(req->u.servicereg.port),
+            {
+                LogMcastNoIdent("R: DNSServiceRegister:  %##s %u/%u PID[%d](%s)", ptr->srs.RR_SRV.resrec.name->c, mDNSVal16(servicereg->port),
                                 SRS_PORT(&ptr->srs), req->process_id, req->pid_name, i_mcount++);
+            }
         }
     }
     else if (req->terminate == browse_termination_callback)
     {
-        browser_t *blist;
-        for (blist = req->u.browser.browsers; blist; blist = blist->next)
+        for (const browser_t *blist = req->browse->browsers; blist; blist = blist->next)
         {
             if (mDNSOpaque16IsZero(blist->q.TargetQID))
                 LogMcastNoIdent("Q: DNSServiceBrowse  %##s %s PID[%d](%s)", blist->q.qname.c, DNSTypeName(blist->q.qtype),
@@ -6294,28 +6621,32 @@ mDNSlocal void LogMcastClientInfo(request_state *req)
     }
     else if (req->terminate == resolve_termination_callback)
     {
-        if ((mDNSOpaque16IsZero(req->u.resolve.qsrv.TargetQID)) && (req->u.resolve.qsrv.ThisQInterval > 0))
-            LogMcastNoIdent("Q: DNSServiceResolve  %##s %s PID[%d](%s)", req->u.resolve.qsrv.qname.c, DNSTypeName(req->u.resolve.qsrv.qtype),
+        const request_resolve *const resolve = req->resolve;
+        if ((mDNSOpaque16IsZero(resolve->qsrv.TargetQID)) && (resolve->qsrv.ThisQInterval > 0))
+        {
+            LogMcastNoIdent("Q: DNSServiceResolve  %##s %s PID[%d](%s)", resolve->qsrv.qname.c, DNSTypeName(resolve->qsrv.qtype),
                             req->process_id, req->pid_name, i_mcount++);
+        }
     }
     else if (req->terminate == queryrecord_termination_callback)
     {
-        if (QueryRecordClientRequestIsMulticast(&req->u.queryrecord))
+        if (QueryRecordClientRequestIsMulticast(req->queryrecord))
         {
             LogMcastNoIdent("Q: DNSServiceQueryRecord  %##s %s PID[%d](%s)",
-                          QueryRecordClientRequestGetQName(&req->u.queryrecord),
-                          DNSTypeName(QueryRecordClientRequestGetType(&req->u.queryrecord)),
-                          req->process_id, req->pid_name, i_mcount++);
+                QueryRecordClientRequestGetQName(req->queryrecord),
+                DNSTypeName(QueryRecordClientRequestGetType(req->queryrecord)),
+                req->process_id, req->pid_name, i_mcount++);
         }
     }
     else if (req->terminate == addrinfo_termination_callback)
     {
-        if (GetAddrInfoClientRequestIsMulticast(&req->u.addrinfo))
+        const GetAddrInfoClientRequest *const addrinfo = req->addrinfo;
+        if (GetAddrInfoClientRequestIsMulticast(addrinfo))
         {
             LogMcastNoIdent("Q: DNSServiceGetAddrInfo  %s%s %##s PID[%d](%s)",
-                          req->u.addrinfo.protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
-                          req->u.addrinfo.protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
-                          GetAddrInfoClientRequestGetQName(&req->u.addrinfo), req->process_id, req->pid_name, i_mcount++);
+                addrinfo->protocols & kDNSServiceProtocol_IPv4 ? "v4" : "  ",
+                addrinfo->protocols & kDNSServiceProtocol_IPv6 ? "v6" : "  ",
+                GetAddrInfoClientRequestGetQName(addrinfo), req->process_id, req->pid_name, i_mcount++);
         }
     }
 }
@@ -6405,29 +6736,35 @@ mDNSlocal void LogLocalOnlyAuthRecordsToFD(int fd, mDNS *const m)
     if (showheader) LogToFD(fd, "<None>");
 }
 
-mDNSlocal void LogOneAuthRecordToFD(int fd, const AuthRecord *ar, mDNSs32 now, const char *ifname)
+mDNSlocal void LogOneAuthRecordToFD(const int fd, const AuthRecord *const ar, const mDNSs32 now,
+    const char *const ifname)
 {
+    char timeRegistered[MIN_TIMESTAMP_STRING_LENGTH];
+    getLocalTimestampFromPlatformTime(now, ar->TimeRegistered, timeRegistered, sizeof(timeRegistered));
+
     if (AuthRecord_uDNS(ar))
     {
-        LogToFD(fd, "%7d %7d %7d %-7s %4d %s %s",
-                  ar->ThisAPInterval / mDNSPlatformOneSecond,
-                  (ar->LastAPTime + ar->ThisAPInterval - now) / mDNSPlatformOneSecond,
-                  ar->expire ? (ar->expire - now) / mDNSPlatformOneSecond : 0,
-                  "-U-",
-                  ar->state,
-                  ar->AllowRemoteQuery ? "☠" : " ",
-                  ARDisplayString(&mDNSStorage, ar));
+        LogToFD(fd, "%s %7d %7d %7d %-7s %4d %s %s",
+            timeRegistered,
+            ar->ThisAPInterval / mDNSPlatformOneSecond,
+            (ar->LastAPTime + ar->ThisAPInterval - now) / mDNSPlatformOneSecond,
+            ar->expire ? (ar->expire - now) / mDNSPlatformOneSecond : 0,
+            "-U-",
+            ar->state,
+            ar->AllowRemoteQuery ? "☠" : " ",
+            ARDisplayString(&mDNSStorage, ar));
     }
     else
     {
-        LogToFD(fd, "%7d %7d %7d %-7s 0x%02X %s %s",
-                  ar->ThisAPInterval / mDNSPlatformOneSecond,
-                  ar->AnnounceCount ? (ar->LastAPTime + ar->ThisAPInterval - now) / mDNSPlatformOneSecond : 0,
-                  ar->TimeExpire    ? (ar->TimeExpire                      - now) / mDNSPlatformOneSecond : 0,
-                  ifname ? ifname : "ALL",
-                  ar->resrec.RecordType,
-                  ar->AllowRemoteQuery ? "☠" : " ",
-                  ARDisplayString(&mDNSStorage, ar));
+        LogToFD(fd, "%s %7d %7d %7d %-7s 0x%02X %s %s",
+            timeRegistered,
+            ar->ThisAPInterval / mDNSPlatformOneSecond,
+            ar->AnnounceCount ? (ar->LastAPTime + ar->ThisAPInterval - now) / mDNSPlatformOneSecond : 0,
+            ar->TimeExpire    ? (ar->TimeExpire                      - now) / mDNSPlatformOneSecond : 0,
+            ifname ? ifname : "ALL",
+            ar->resrec.RecordType,
+            ar->AllowRemoteQuery ? "☠" : " ",
+            ARDisplayString(&mDNSStorage, ar));
     }
 }
 
@@ -6442,7 +6779,11 @@ mDNSlocal void LogAuthRecordsToFD(int fd,
         const char *const ifname = InterfaceNameForID(&mDNSStorage, ar->resrec.InterfaceID);
         if ((ar->WakeUp.HMAC.l[0] != 0) == (proxy != mDNSNULL))
         {
-            if (showheader) { showheader = mDNSfalse; LogToFD(fd, "    Int    Next  Expire if     State"); }
+            if (showheader)
+            {
+                showheader = mDNSfalse;
+                LogToFD(fd, "Time Registered                  Int    Next  Expire if     State");
+            }
             if (proxy) (*proxy)++;
             if (!mDNSPlatformMemSame(&owner, &ar->WakeUp, sizeof(owner)))
             {
@@ -6486,7 +6827,7 @@ mDNSlocal void PrintOneCacheRecordToFD(int fd, const CacheRecord *cr, mDNSu32 sl
 #endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-    const mDNSBool redacted = (cr->PrivacyLevel == CRLogPrivacyLevel_Private);
+    const mDNSBool redacted = (cr->PrivacyLevel == mDNSCRLogPrivacyLevel_Private);
 #endif
 
     LogToFD(fd, "%3d %s%8d %-7s%s %-6s"
@@ -6591,10 +6932,11 @@ mDNSexport void udsserver_info_dump_to_fd(int fd)
                 mDNSInterfaceID InterfaceID = cr->resrec.InterfaceID;
                 mDNSu32 *const countPtr = InterfaceID ? &mcastRecordCount : &ucastRecordCount;
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-                if (!InterfaceID && cr->resrec.dnsservice &&
-                    (mdns_dns_service_get_scope(cr->resrec.dnsservice) == mdns_dns_service_scope_interface))
+                const mdns_dns_service_t dnsservice = mdns_cache_metadata_get_dns_service(cr->resrec.metadata);
+                if (!InterfaceID && dnsservice &&
+                    (mdns_dns_service_get_scope(dnsservice) == mdns_dns_service_scope_interface))
                 {
-                    InterfaceID = (mDNSInterfaceID)(uintptr_t)mdns_dns_service_get_interface_index(cr->resrec.dnsservice);
+                    InterfaceID = (mDNSInterfaceID)(uintptr_t)mdns_dns_service_get_interface_index(dnsservice);
                 }
 #else
                 if (!InterfaceID && cr->resrec.rDNSServer && cr->resrec.rDNSServer->scopeType)
@@ -6900,16 +7242,24 @@ mDNSlocal void udsserver_validatelists(void *context)
         if (req->terminate == connection_termination)
         {
             registered_record_entry *r;
-            for (r = req->u.reg_recs; r; r=r->next)
+            for (r = req->reg_recs; r; r=r->next)
+            {
                 if (r->next == (registered_record_entry *)~0)
-                    LogMemCorruption("UDS req->u.reg_recs: %p is garbage", r);
+                {
+                    LogMemCorruption("UDS req->reg_recs: %p is garbage", r);
+                }
+            }
         }
         else if (req->terminate == regservice_termination_callback)
         {
             service_instance *s;
-            for (s = req->u.servicereg.instances; s; s=s->next)
+            for (s = req->servicereg->instances; s; s=s->next)
+            {
                 if (s->next == (service_instance *)~0)
-                    LogMemCorruption("UDS req->u.servicereg.instances: %p is garbage", s);
+                {
+                    LogMemCorruption("UDS req->servicereg->instances: %p is garbage", s);
+                }
+            }
         }
         else if (req->terminate == browse_termination_callback)
         {
@@ -6981,14 +7331,18 @@ mDNSexport mDNSs32 udsserver_idle(mDNSs32 nextevent)
         request_state *r = *req;
 
         if (r->terminate == resolve_termination_callback)
-            if (r->u.resolve.ReportTime && now - r->u.resolve.ReportTime >= 0)
+        {
+            request_resolve *const resolve = r->resolve;
+            if (resolve->ReportTime && ((now - resolve->ReportTime) >= 0))
             {
-                r->u.resolve.ReportTime = 0;
+                resolve->ReportTime = 0;
                 // if client received results and resolve still active
-                if (r->u.resolve.txt && r->u.resolve.srv)
-                    LogMsgNoIdent("Client application PID[%d](%s) has received results for DNSServiceResolve(%##s) yet remains active over two minutes.", r->process_id, r->pid_name, r->u.resolve.qsrv.qname.c);
+                if (resolve->txt && resolve->srv)
+                {
+                    LogMsgNoIdent("Client application PID[%d](%s) has received results for DNSServiceResolve(%##s) yet remains active over two minutes.", r->process_id, r->pid_name, resolve->qsrv.qname.c);
+                }
             }
-
+        }
         // Note: Only primary req's have reply lists, not subordinate req's.
         while (r->replies)      // Send queued replies
         {
@@ -7054,7 +7408,7 @@ mDNSexport mDNSs32 udsserver_idle(mDNSs32 nextevent)
         {
             // Since we're already doing a list traversal, we unlink the request directly instead of using AbortUnlinkAndFree()
             *req = r->next;
-            freeL("request_state/udsserver_idle", r);
+            request_state_forget(&r);
         }
         else
             req = &r->next;
@@ -7067,10 +7421,10 @@ struct CompileTimeAssertionChecks_uds_daemon
     // Check our structures are reasonable sizes. Including overly-large buffers, or embedding
     // other overly-large structures instead of having a pointer to them, can inadvertently
     // cause structure sizes (and therefore memory usage) to balloon unreasonably.
-    char sizecheck_request_state          [(sizeof(request_state)           <= 3888) ? 1 : -1];
+    char sizecheck_request_state          [(sizeof(request_state)           <= 1072) ? 1 : -1];
     char sizecheck_registered_record_entry[(sizeof(registered_record_entry) <=   60) ? 1 : -1];
     char sizecheck_service_instance       [(sizeof(service_instance)        <= 6552) ? 1 : -1];
-    char sizecheck_browser_t              [(sizeof(browser_t)               <= 1480) ? 1 : -1];
+    char sizecheck_browser_t              [(sizeof(browser_t)               <=  984) ? 1 : -1];
     char sizecheck_reply_hdr              [(sizeof(reply_hdr)               <=   12) ? 1 : -1];
     char sizecheck_reply_state            [(sizeof(reply_state)             <=   64) ? 1 : -1];
 };

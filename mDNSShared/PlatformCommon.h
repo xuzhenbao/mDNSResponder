@@ -24,6 +24,9 @@
 #ifndef USEC_PER_SEC
     #define USEC_PER_SEC 1000000ull
 #endif
+#ifndef MSEC_PER_SEC
+    #define MSEC_PER_SEC 1000ull
+#endif
 #ifndef NSEC_PER_USEC
     #define NSEC_PER_USEC 1000ull
 #endif

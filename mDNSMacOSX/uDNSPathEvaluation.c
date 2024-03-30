@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2013-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,11 +19,12 @@
 #include <nw/private.h>
 
 #include "dns_sd_internal.h"
-#include "mdns_strict.h"
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
 #include "QuerierSupport.h"
 #endif
+
+#include "mdns_strict.h"
 
 #define _nw_forget(PTR)         \
     do                          \

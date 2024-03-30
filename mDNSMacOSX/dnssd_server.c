@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,17 +25,16 @@
 #include "mDNSMacOSX.h"
 #include "termination_reason.h"
 
-#include <bsm/libbsm.h>
 #include <CoreUtils/CommonServices.h>
 #include <CoreUtils/DebugServices.h>
 #include <mach/mach_time.h>
 #include <mdns/alloc.h>
+#include <mdns/audit_token.h>
 #include <mdns/mortality.h>
 #include <mdns/resource_record.h>
 #include <mdns/system.h>
 #include <mdns/ticks.h>
 #include <mdns/xpc.h>
-#include <net/necp.h>
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <xpc/private.h>
@@ -152,6 +151,16 @@ _dx_retain(dx_any_t object);
 static void
 _dx_release(dx_any_t object);
 #define _dx_forget(X)	ForgetCustom(X, _dx_release)
+#define _dx_replace(PTR, OBJ)		\
+	do {							\
+		if (OBJ) {					\
+			_dx_retain(OBJ);		\
+		}							\
+		if (*(PTR)) {				\
+			_dx_release(*(PTR));	\
+		}							\
+		*(PTR) = (OBJ);				\
+	} while(0)
 
 static void
 _dx_invalidate(dx_any_t object);
@@ -174,7 +183,9 @@ struct dx_session_s {
 	dispatch_source_t	idle_timer;					// Timer for detecting idleness.
 	dispatch_source_t	keepalive_reply_timer;		// Timer for enforcing a time limit on keepalive replies.
 	uint64_t			pending_send_start_ticks;	// Start time in mach ticks of the current pending send condition.
-	audit_token_t		audit_token;				// Client's audit_token.
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+	mdns_audit_token_t	peer_token;					// Client's audit token.
+#endif
 	uid_t				client_euid;				// Client's EUID.
 	pid_t				client_pid;					// Client's PID.
 	uint32_t			pending_send_count;			// Count of sent messages that still haven't been processed.
@@ -182,14 +193,17 @@ struct dx_session_s {
 	bool				terminated;					// True if the session was prematurely ended due to a fatal error.
 	bool				log_pending_send_counts;	// True if pending send counts should be logged.
 };
-
-check_compile_time(sizeof(struct dx_session_s) <= 128);
+mdns_compile_time_max_size_check(struct dx_session_s, 104);
 
 static void
 _dx_session_invalidate(dx_session_t session);
 
+static void
+_dx_session_finalize(dx_session_t session);
+
 DX_OBJECT_SUBKIND_DEFINE(session,
-	.invalidate	= _dx_session_invalidate
+	.invalidate	= _dx_session_invalidate,
+	.finalize	= _dx_session_finalize
 );
 
 typedef union {
@@ -228,27 +242,21 @@ DX_OBJECT_SUBKIND_DEFINE_ABSTRACT(request,
 
 OS_CLOSED_OPTIONS(dx_gai_state, uint8_t,
 	dx_gai_state_null						= 0,         // Default null state.
-	dx_gai_state_gai_is_active				= (1U << 0), // Underlying GAI client request is active.
-	dx_gai_state_query_is_active			= (1U << 1), // Underlying SVCB/HTTPS query client request is active.
-	dx_gai_state_waiting_for_a				= (1U << 2), // Currently waiting for an A result. [1]
-	dx_gai_state_waiting_for_aaaa			= (1U << 3), // Currently waiting for a AAAA result. [1]
-	dx_gai_state_service_allowed_failover	= (1U << 4), // Got a result from a DNS service that allows failover.
-	dx_gai_state_failover_mode				= (1U << 5)  // Currently avoiding DNS services that allow failover.
+	dx_gai_state_waiting_for_a				= (1U << 0), // Currently waiting for an A result. [1]
+	dx_gai_state_waiting_for_aaaa			= (1U << 1), // Currently waiting for a AAAA result. [1]
+	dx_gai_state_service_allowed_failover	= (1U << 2), // Got a result from a DNS service that allows failover.
+	dx_gai_state_failover_mode				= (1U << 3), // Currently avoiding DNS services that allow failover.
+	dx_gai_state_avoid_suppressed_a_result	= (1U << 4), // Avoiding negative results for suppressed A queries. [2]
 );
 
 #define DX_GAI_STATE_WAITING_FOR_RESULTS (dx_gai_state_waiting_for_a | dx_gai_state_waiting_for_aaaa)
 
-// Notes:
-// 1. If a client request specifies that DNS services that allow failover be avoided if they're unable to provide
-//    at least one positive response to either the A, AAAA, or HTTPS query, then we have to wait until at least one
-//    positive result is received or until all of the underlying DNSQuestions get negative results before deciding
-//    whether to start providing results to the client (former case), or discarding the current list of pending
-//    results and restarting the underlying DNSQuestions in failover mode (latter case).
-
+MDNS_CLANG_TREAT_WARNING_AS_ERROR_BEGIN(-Wpadded)
 struct dx_gai_request_s {
 	struct dx_request_s				base;					// Request object base.
-	GetAddrInfoClientRequest		gai;					// Underlying GAI request.
-	QueryRecordClientRequest		query;					// Underlying SVCB/HTTPS query request.
+	mdns_dns_service_id_t			custom_service_id;		// ID for this request's custom DNS service.
+	GetAddrInfoClientRequest *		gai;					// Underlying GAI request.
+	QueryRecordClientRequest *		query;					// Underlying SVCB/HTTPS query request.
 	dx_gai_result_t					results;				// List of pending results.
 	char *							hostname;				// Hostname C string to be resolved for getaddrinfo request.
 	mdns_domain_name_t				last_domain_name;		// Domain name of the most recent result.
@@ -256,12 +264,9 @@ struct dx_gai_request_s {
 	mdns_xpc_string_t				last_tracker_owner;		// Tracker owner of the most recent result (XPC string).
 	const char *					svcb_name;				// If non-NULL, name of the SVCB/HTTPS record to query for.
 	uuid_t *						resolver_uuid;			// The resolver UUID to use for UUID-scoped requests.
-	mdns_dns_service_id_t			custom_service_id;		// ID for this request's custom DNS service.
 	xpc_object_t					cnames_a;				// Hostname's canonical names for A records (XPC array).
-	ssize_t							cnames_a_expire_idx;	// Index of the first expired canonical name in cnames_a.
 	xpc_object_t					cnames_aaaa;			// Hostname's canonical names for AAAA records (XPC array).
-	ssize_t							cnames_aaaa_expire_idx;	// Index of the first expired canonical name in cnames_aaaa.
-	audit_token_t *					delegator_audit_token;	// The delegator's audit token.
+	mdns_audit_token_t				delegator_token;		// The delegator's audit token.
 	xpc_object_t					fallback_dns_config;	// Fallback DNS configuration.
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRUST_ENFORCEMENT)
 	mdns_trust_t					trust;					// Trust instance if status is mdns_trust_status_pending
@@ -270,22 +275,67 @@ struct dx_gai_request_s {
 	mdns_signed_resolve_result_t	signed_resolve;			// Signed resolve result with which to sign results.
 #endif
 	char *							svcb_name_memory;		// Memory that was allocated for svcb_name.
+	dx_gai_result_t					pending_suppresed_a;	// Pending negative result for a suppressed A query. [2]
 	DNSServiceFlags					flags;					// The request's flags parameter.
 	uint32_t						ifindex;				// The interface index to use for interface-scoped requests.
 	DNSServiceProtocol				protocols;				// Used to specify IPv4, IPv6, or any IP address types.
+	pid_t							effective_pid;			// Effective client PID.
+	uint16_t						svcb_type;				// If svcb_name is non-NULL, the type for SVCB/HTTPS query.
+	uuid_t							effective_uuid;			// Effective client UUID.
+	dx_gai_state_t					state;					// Collection of state bits.
+	mdns_gai_options_t				options;				// Additional request options.
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
 	dnssd_log_privacy_level_t		log_privacy_level;		// The log privacy level of this request.
 #endif
-	pid_t							effective_pid;			// Effective client PID.
-	uuid_t							effective_uuid;			// Effective client UUID.
-	uint16_t						svcb_type;				// If svcb_name is non-NULL, the type for SVCB/HTTPS query.
-	dx_gai_state_t					state;					// Collection of state bits.
-	mdns_gai_options_t				options;				// Additional request options.
 	bool							cnames_a_changed;		// True if cnames_a has changed.
 	bool							cnames_aaaa_changed;	// True if cnames_aaaa has changed.
+	MDNS_STRUCT_PAD_64_32(1, 1);
 };
+MDNS_CLANG_TREAT_WARNING_AS_ERROR_END()
+mdns_compile_time_max_size_check(struct dx_gai_request_s, 248);
 
-check_compile_time(sizeof(struct dx_gai_request_s) <= 1560);
+// Notes:
+// 1. If a client request specifies that DNS services that allow failover be avoided if they're unable to provide
+//    at least one positive response to either the A, AAAA, or HTTPS query, then we have to wait until at least one
+//    positive result is received or until all of the underlying DNSQuestions get negative results before deciding
+//    whether to start providing results to the client (former case), or discarding the current list of pending
+//    results and restarting the underlying DNSQuestions in failover mode (latter case).
+//
+// 2. There are cases where an IPv6-only network is the primary network and will inadvertently prevent the
+//    resolution of IPv4-only hostnames that are in fact resolvable via a VPN's DNS service.
+//
+//    On IPv6-only networks it usually makes no sense to bother sending A record queries to the network's DNS
+//    service because IPv4 addresses are typically unusable on such networks, or it's at least preferable to
+//    connect directly to an IPv6 address instead of to an IPv4 address through an IPv4 translation mechanism, such
+//    as 464XLAT. So sending A queries is wasteful. Therefore, as a matter of policy, DNS services associated with
+//    IPv6-only networks are typically configured to advise against sending A queries.
+//
+//    As a DNSQuestion traverses the original QNAME's CNAME chain, it may end up switching over to a different DNS
+//    service depending on its current QNAME and the most appropriate DNS service for that QNAME according to the
+//    current DNS configuration. For example, consider a DNSQuestion that is originally for www.example.com. If
+//    there's a split-tunnel corporate VPN DNS service that's responsible for resolving everything in the
+//    example.com domain. If the VPN DNS service responds to a query for www.example.com with a CNAME mapping
+//    www.example.com to cdn.example.net, then when the DNSQuestion is restarted for cdn.example.net, it may be
+//    assigned a different DNS service, specifically if the VPN is not responsible for cdn.example.net.
+//
+//    Suppose that the next DNS service is for an IPv6-only network not associated with the VPN. Suppose that in
+//    the public DNS there's a cdn.example.net CNAME record that points to server.example.com. Also suppose that
+//    the VPN supports IPv4 and that server.example.com is an IPv4-only host. Because the IPv6-only network's DNS
+//    service advises against A queries, the DNSQuestion is stuck at cdn.example.net if the DNSQuestion is
+//    configured to suppress queries for unusable addresses, as is usually the case.
+//
+//    When a GAI request involves parallel A and AAAA DNSQuestions, the CNAME records placed in the cache as a
+//    result of the unsuppressed AAAA query can help the A DNSQuestion advance to the next name in the CNAME chain
+//    so that it can advance to the VPN DNS service for server.example.com for its unsuppressed A query. This is
+//    only possible if the persistWhenARecordsUnusable option is set.
+//
+//    A caveat with the persistWhenARecordsUnusable option is that negative results that indicate that an A query
+//    was suppressed will still be generated when the A DNSQuestion is parked on a DNS service that advises against
+//    A queries. We want to avoid a client seeing a negative AAAA result along with a negative suppressed A result
+//    as the first pair of A+AAAA results because this could lead the client to give up upon getting such a
+//    negative pair when it could be the case that a more definitive A result is on the way, e.g., a positive
+//    result with an IPv4 address or some other negative result, as a consequence of the A DNSQuestion advancing to
+//    a DNS service for which A queries are not suppressed.
 
 typedef xpc_object_t
 (*dx_request_take_results_f)(dx_any_request_t request);
@@ -297,9 +347,6 @@ struct dx_request_kind_s {
 };
 
 #define DX_REQUEST_SUBKIND_DEFINE(NAME, ...)														\
-	static void																						\
-	_dx_ ## NAME ## _request_init(dx_ ## NAME ## _request_t request);								\
-																									\
 	static void																						\
 	_dx_ ## NAME ## _request_invalidate(dx_ ## NAME ## _request_t request);							\
 																									\
@@ -326,43 +373,42 @@ struct dx_request_kind_s {
 	}																								\
 	DX_BASE_CHECK(NAME ## _request, request)
 
-static void
-_dx_gai_request_init(dx_gai_request_t request);
-
 static xpc_object_t
 _dx_gai_request_take_results(dx_gai_request_t request);
 
 DX_REQUEST_SUBKIND_DEFINE(gai,
-	.base.init		= _dx_gai_request_init,
 	.take_results	= _dx_gai_request_take_results
 );
 
 //======================================================================================================================
 // MARK: - Result Kind Definition
 
-#define DNSSD_AUTHENTICATION_TAG_SIZE	32 // Defined here until an NECP header defines this length.
-typedef uint8_t dx_auth_tag_t[DNSSD_AUTHENTICATION_TAG_SIZE];
-
 struct dx_gai_result_s {
-	struct dx_object_s				base;				// Object base.
-	dx_gai_result_t					next;				// Next result in list.
-	mdns_resource_record_t			record;				// Result's resource record.
-	mdns_xpc_string_t				provider_name;		// The DNS service's provider name, if any.
-	xpc_object_t					cname_update;		// If non-NULL, XPC array to use for a CNAME chain update.
-	mdns_xpc_string_t				tracker_hostname;	// If non-NULL, tracker hostname as an XPC string.
-	mdns_xpc_string_t				tracker_owner;		// If non-NULL, owner of the tracker hostname as an XPC string.
-	dx_auth_tag_t *					auth_tag;			// Optional authentication tag for hostname+IP addresses.
+	struct dx_object_s				base;					// Object base.
+	dx_gai_result_t					next;					// Next result in list.
+	mdns_resource_record_t			record;					// Result's resource record.
+	mdns_xpc_string_t				provider_name;			// The DNS service's provider name, if any.
+	xpc_object_t					cname_update;			// If non-NULL, XPC array to use for a CNAME chain update.
+	mdns_xpc_string_t				tracker_hostname;		// If non-NULL, tracker hostname as an XPC string.
+	mdns_xpc_string_t				tracker_owner;			// If non-NULL, owner of the tracker hostname as an XPC string.
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
-	mdns_signed_hostname_result_t	signed_hostname;	// Signed hostname result.
+	mdns_signed_hostname_result_t	signed_hostname;		// Signed hostname result.
 #endif
-	DNSServiceFlags					flags;				// The result's flags.
-	dnssd_negative_reason_t			negative_reason;	// Reason code for negative results.
-	DNSServiceErrorType				error;				// Error returned by mDNS core.
-	uint32_t						ifindex;			// The interface index associated with the result.
-	mdns_resolver_type_t			protocol;			// The transport protocol used to obtain the record.
-	uint16_t						question_id;		// ID of DNSQuestion used to get result. Used for logging.
-	bool							tracker_is_approved;// True if the assoicated tracker is approved for the client.
+	mdns_extended_dns_error_t		extended_dns_error;		// Extended DNS Error, if any.
+	DNSServiceFlags					flags;					// The result's flags.
+	dnssd_negative_reason_t			negative_reason;		// Reason code for negative results.
+	DNSServiceErrorType				error;					// Error returned by mDNS core.
+	uint32_t						ifindex;				// The interface index associated with the result.
+	mdns_resolver_type_t			protocol;				// The transport protocol used to obtain the record.
+	uint16_t						question_id;			// ID of DNSQuestion used to get result. Used for logging.
+	unsigned						tracker_is_approved : 1;// True if the associated tracker is approved for the client.
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+	unsigned						sensitive_logging : 1;	// True if hostnames and rdata should be logged sensitively.
+#endif
+	unsigned						tracker_can_block : 1;	// True if a request to this known tracker can be blocked.
+	unsigned						__pad_bits : 5;
 };
+mdns_compile_time_max_size_check(struct dx_gai_result_s, 104);
 
 static void
 _dx_gai_result_finalize(dx_gai_result_t result);
@@ -470,24 +516,19 @@ _dx_gai_request_stop_client_requests(dx_gai_request_t request, bool need_lock);
 static void
 _dx_gai_request_restart_client_requests_in_failover_mode(dx_gai_request_t request);
 
-static xpc_object_t *
-_dx_gai_request_get_cnames_ptr(dx_gai_request_t request, int qtype, bool **out_changed_ptr,
-	ssize_t **out_expire_idx_ptr);
-
 static void
-_dx_gai_request_append_cname(dx_gai_request_t request, int qtype, const domainname *cname, bool expired, bool unwind);
-#define _dx_gai_request_unwind_cnames_if_necessary(R, T)	_dx_gai_request_append_cname(R, T, NULL, false, true)
+_dx_gai_request_append_cname(dx_gai_request_t request, int qtype, const domainname *cname, bool expired);
 
 static xpc_object_t
 _dx_gai_request_copy_cname_update(dx_gai_request_t request, int qtype);
 
 static void
-_dx_gai_request_gai_result_handler(mDNS *m, DNSQuestion *q, const ResourceRecord *answer, QC_result qc_result,
-	DNSServiceErrorType error, void *context);
+_dx_gai_request_gai_result_handler(mDNS *m, DNSQuestion *q, const ResourceRecord *answer, mDNSBool expired,
+	QC_result qc_result, DNSServiceErrorType error, void *context);
 
 static void
-_dx_gai_request_query_result_handler(mDNS *m, DNSQuestion *q, const ResourceRecord *answer, QC_result qc_result,
-	DNSServiceErrorType error, void *context);
+_dx_gai_request_query_result_handler(mDNS *m, DNSQuestion *q, const ResourceRecord *answer, mDNSBool expired,
+	QC_result qc_result, DNSServiceErrorType error, void *context);
 
 static void
 _dx_gai_request_enqueue_result(dx_gai_request_t request, QC_result qc_result, const ResourceRecord *answer,
@@ -526,10 +567,6 @@ _dx_gai_result_to_dictionary(dx_gai_result_t result);
 static void
 _dx_gai_result_log(dx_gai_result_t result, uint32_t request_id);
 
-static bool
-_dx_authenticate_address_rdata(uuid_t effective_uuid, const char *hostname, int type, const uint8_t *rdata,
-	uint8_t out_auth_tag[STATIC_PARAM DNSSD_AUTHENTICATION_TAG_SIZE]);
-
 static void
 _dx_kqueue_locked(const char *description, bool need_lock, dx_block_t block);
 
@@ -541,6 +578,20 @@ _dx_qc_result_is_add(QC_result qc_result);
 
 static bool
 _dx_qc_result_is_suppressed(QC_result qc_result);
+
+static QueryRecordClientRequest *
+_dx_query_record_client_request_start(const QueryRecordClientRequestParams *params,
+	QueryRecordResultHandler handler, void *context, DNSServiceErrorType *out_error);
+
+static void
+_dx_query_record_client_request_forget(QueryRecordClientRequest **request_ptr);
+
+static GetAddrInfoClientRequest *
+_dx_get_addr_info_client_request_start(const GetAddrInfoClientRequestParams *params,
+	QueryRecordResultHandler handler, void *context, DNSServiceErrorType *out_error);
+
+static void
+_dx_get_addr_info_client_request_forget(GetAddrInfoClientRequest **request_ptr);
 
 //======================================================================================================================
 // MARK: - Logging
@@ -632,6 +683,12 @@ _dx_server_handle_new_connection(const xpc_connection_t connection)
 		_dx_server_register_session(session);
 		_dx_forget(&session);
 	} else {
+		const pid_t client_pid = xpc_connection_get_pid(connection);
+		char client_name[MAXCOMLEN];
+		client_name[0] = '\0';
+		mdns_system_pid_to_name(client_pid, client_name);
+		os_log_fault(_mdns_server_log(),
+			"Failed to create session for connection -- client pid: %d (%{public}s)", client_pid, client_name);
 		xpc_connection_cancel(connection);
 	}
 }
@@ -758,18 +815,30 @@ _dx_invalidate(const dx_any_t any)
 static dx_session_t
 _dx_session_create(const xpc_connection_t connection)
 {
-	const dx_session_t obj = _dx_session_new();
+	dx_session_t session = NULL;
+	dx_session_t obj = _dx_session_new();
 	require_quiet(obj, exit);
 
 	obj->connection = connection;
 	xpc_retain(obj->connection);
-	xpc_connection_get_audit_token(obj->connection, &obj->audit_token);
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+	audit_token_t token;
+	memset(&token, 0, sizeof(token));
+	xpc_connection_get_audit_token(obj->connection, &token);
+	obj->peer_token = mdns_audit_token_create(&token);
+	require_quiet(obj->peer_token, exit);
+#endif
+
 	obj->client_pid  = xpc_connection_get_pid(obj->connection);
 	obj->client_euid = xpc_connection_get_euid(obj->connection);
 	mdns_system_pid_to_name(obj->client_pid, obj->client_name);
+	session = obj;
+	obj = NULL;
 
 exit:
-	return obj;
+	static_analyzer_malloc_freed(obj); // Analyzer isn't aware that obj will be freed if non-NULL.
+	_dx_forget(&obj);
+	return session;
 }
 
 //======================================================================================================================
@@ -813,6 +882,17 @@ _dx_session_invalidate(const dx_session_t me)
 		_dx_invalidate(req);
 		_dx_release(req);
 	}
+}
+
+//======================================================================================================================
+
+static void
+_dx_session_finalize(const dx_session_t me)
+{
+	xpc_forget(&me->connection);
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+	mdns_forget(&me->peer_token);
+#endif
 }
 
 //======================================================================================================================
@@ -1320,8 +1400,9 @@ _dx_gai_request_trust_check(const dx_gai_request_t me, bool * const out_defer_st
 	DNSServiceErrorType err;
 	bool defer_start = false;
 	const dx_session_t session = me->base.session;
+    const audit_token_t *const token = mdns_audit_token_get_token(session->peer_token);
 	mdns_trust_flags_t flags = mdns_trust_flags_none;
-	const mdns_trust_status_t status = mdns_trust_check_getaddrinfo(session->audit_token, me->hostname, &flags);
+	const mdns_trust_status_t status = mdns_trust_check_getaddrinfo(*token, me->hostname, &flags);
 	switch (status) {
 		case mdns_trust_status_granted:
 			err = kDNSServiceErr_NoError;
@@ -1329,7 +1410,7 @@ _dx_gai_request_trust_check(const dx_gai_request_t me, bool * const out_defer_st
 
 		case mdns_trust_status_denied:
 		case mdns_trust_status_pending:
-			me->trust = mdns_trust_create(session->audit_token, NULL, flags);
+			me->trust = mdns_trust_create(*token, NULL, flags);
 			require_action_quiet(me->trust, exit, err = kDNSServiceErr_NoMemory);
 
 			_dx_retain(me);
@@ -1379,15 +1460,6 @@ exit:
 //======================================================================================================================
 
 static void
-_dx_gai_request_init(const dx_gai_request_t me)
-{
-	me->cnames_a_expire_idx    = -1;
-	me->cnames_aaaa_expire_idx = -1;
-}
-
-//======================================================================================================================
-
-static void
 _dx_gai_request_invalidate(const dx_gai_request_t me)
 {
 	_dx_gai_request_log_stop(me);
@@ -1419,9 +1491,10 @@ _dx_gai_request_finalize(const dx_gai_request_t me)
 	ForgetMem(&me->svcb_name_memory);
 	xpc_forget(&me->cnames_a);
 	xpc_forget(&me->cnames_aaaa);
-	ForgetMem(&me->delegator_audit_token);
+	mdns_forget(&me->delegator_token);
 	xpc_forget(&me->fallback_dns_config);
 	ForgetMem(&me->resolver_uuid);
+	_dx_forget(&me->pending_suppresed_a);
 }
 
 //======================================================================================================================
@@ -1455,9 +1528,13 @@ _dx_gai_request_parse_params(const dx_gai_request_t me, const xpc_object_t param
 	pid_t delegator_pid;
 	const uint8_t *delegator_uuid;
 	audit_token_t storage;
-	const audit_token_t * const delegator_audit_token = dnssd_xpc_parameters_get_delegate_audit_token(params, &storage);
-	if (delegator_audit_token) {
-		delegator_pid  = audit_token_to_pid(*delegator_audit_token);
+	const audit_token_t * const delegator_token = dnssd_xpc_parameters_get_delegate_audit_token(params, &storage);
+	if (delegator_token) {
+		me->delegator_token = mdns_audit_token_create(delegator_token);
+		require_action_quiet(me->delegator_token, exit, err = kDNSServiceErr_NoMemory);
+	}
+	if (me->delegator_token) {
+		delegator_pid  = mdns_audit_token_get_pid(me->delegator_token);
 		delegator_uuid = NULL;
 	} else {
 		delegator_uuid = dnssd_xpc_parameters_get_delegate_uuid(params);
@@ -1467,15 +1544,9 @@ _dx_gai_request_parse_params(const dx_gai_request_t me, const xpc_object_t param
 			delegator_pid = dnssd_xpc_parameters_get_delegate_pid(params, NULL);
 		}
 	}
-	if (delegator_audit_token || delegator_uuid || (delegator_pid != 0)) {
+	if (me->delegator_token || delegator_uuid || (delegator_pid != 0)) {
 		const bool entitled = _dx_session_has_delegate_entitlement(session);
 		require_action_quiet(entitled, exit, err = kDNSServiceErr_NoAuth);
-
-		if (delegator_audit_token) {
-			me->delegator_audit_token = (audit_token_t *)mdns_memdup(delegator_audit_token,
-				sizeof(*delegator_audit_token));
-			require_action_quiet(me->delegator_audit_token, exit, err = kDNSServiceErr_NoMemory);
-		}
 	}
 
 	// Determine effective IDs.
@@ -1486,15 +1557,6 @@ _dx_gai_request_parse_params(const dx_gai_request_t me, const xpc_object_t param
 	} else {
 		uuid_clear(me->effective_uuid);
 		me->effective_pid = (delegator_pid != 0) ? delegator_pid : session->client_pid;
-	}
-
-	// Determine if authentication tags are needed.
-	if (dnssd_xpc_parameters_get_need_authentication_tags(params)) {
-		if (uuid_is_null(me->effective_uuid)) {
-			err = mdns_system_pid_to_uuid(me->effective_pid, me->effective_uuid);
-			require_noerr_action_quiet(err, exit, err = kDNSServiceErr_Unknown);
-		}
-		me->options |= mdns_gai_option_auth_tags;
 	}
 
 	// Determine if an SVCB or HTTPS query is necessary.
@@ -1679,16 +1741,15 @@ _dx_gai_request_start_client_requests_internal(const dx_gai_request_t me,
 		}
 #endif
 		// If present, run the query for SVCB/HTTPS first, in case the ALPN and address hints come back first.
-		if (query_params && !(me->state & dx_gai_state_query_is_active)) {
-			err = QueryRecordClientRequestStart(&me->query, query_params, _dx_gai_request_query_result_handler, me);
+		if (query_params && !me->query) {
+			me->query = _dx_query_record_client_request_start(query_params, _dx_gai_request_query_result_handler, me,
+				&err);
 			require_noerr_return(err);
-			me->state |= dx_gai_state_query_is_active;
 		}
 		// Run the A/AAAA lookup.
-		if (gai_params && !(me->state & dx_gai_state_gai_is_active)) {
-			err = GetAddrInfoClientRequestStart(&me->gai, gai_params, _dx_gai_request_gai_result_handler, me);
+		if (gai_params && !me->gai) {
+			me->gai = _dx_get_addr_info_client_request_start(gai_params, _dx_gai_request_gai_result_handler, me, &err);
 			require_noerr_return(err);
-			me->state |= dx_gai_state_gai_is_active;
 		}
 	});
 	if (err) {
@@ -1704,14 +1765,8 @@ _dx_gai_request_stop_client_requests(const dx_gai_request_t me, const bool need_
 {
 	_dx_kqueue_locked("dx_gai_request: stopping client requests", need_lock,
 	^{
-		if (me->state & dx_gai_state_gai_is_active) {
-			GetAddrInfoClientRequestStop(&me->gai);
-			me->state &= ~dx_gai_state_gai_is_active;
-		}
-		if (me->state & dx_gai_state_query_is_active) {
-			QueryRecordClientRequestStop(&me->query);
-			me->state &= ~dx_gai_state_query_is_active;
-		}
+		_dx_get_addr_info_client_request_forget(&me->gai);
+		_dx_query_record_client_request_forget(&me->query);
 	});
 }
 
@@ -1722,7 +1777,6 @@ _dx_gai_request_restart_client_requests_in_failover_mode(const dx_gai_request_t 
 {
 	if (!(me->state & dx_gai_state_failover_mode)) {
 		_dx_gai_request_stop_client_requests(me, false);
-		_dx_gai_result_list_forget(&me->results);
 		os_log(_mdns_server_log(), "[R%u] getaddrinfo failover restart", me->base.request_id);
 		me->state |= dx_gai_state_failover_mode;
 		_dx_gai_request_start_client_requests(me, false);
@@ -1732,33 +1786,25 @@ _dx_gai_request_restart_client_requests_in_failover_mode(const dx_gai_request_t 
 //======================================================================================================================
 
 static xpc_object_t *
-_dx_gai_request_get_cnames_ptr(const dx_gai_request_t me, const int qtype, bool ** const out_changed_ptr,
-	ssize_t **out_expire_idx_ptr)
+_dx_gai_request_get_cnames_ptr(const dx_gai_request_t me, const int qtype, bool ** const out_changed_ptr)
 {
-	ssize_t *expire_idx_ptr;
 	xpc_object_t *cnames_ptr;
 	bool *changed_ptr;
 	switch (qtype) {
 		case kDNSServiceType_A:
 			cnames_ptr		= &me->cnames_a;
 			changed_ptr		= &me->cnames_a_changed;
-			expire_idx_ptr	= &me->cnames_a_expire_idx;
 			break;
 
 		case kDNSServiceType_AAAA:
 			cnames_ptr		= &me->cnames_aaaa;
 			changed_ptr		= &me->cnames_aaaa_changed;
-			expire_idx_ptr	= &me->cnames_aaaa_expire_idx;
 			break;
 
 		default:
 			cnames_ptr		= NULL;
-			expire_idx_ptr	= NULL;
 			changed_ptr		= NULL;
 			break;
-	}
-	if (out_expire_idx_ptr) {
-		*out_expire_idx_ptr = expire_idx_ptr;
 	}
 	if (out_changed_ptr) {
 		*out_changed_ptr = changed_ptr;
@@ -1769,12 +1815,28 @@ _dx_gai_request_get_cnames_ptr(const dx_gai_request_t me, const int qtype, bool 
 //======================================================================================================================
 
 static void
-_dx_gai_request_append_cname(const dx_gai_request_t me, const int qtype, const domainname * const cname,
-	const bool expired, const bool unwind)
+_dx_gai_request_reset_cnames(const dx_gai_request_t me, const int qtype)
 {
 	bool *changed_ptr;
-	ssize_t *expire_idx_ptr;
-	xpc_object_t * const cnames_ptr = _dx_gai_request_get_cnames_ptr(me, qtype, &changed_ptr, &expire_idx_ptr);
+	xpc_object_t * const cnames_ptr = _dx_gai_request_get_cnames_ptr(me, qtype, &changed_ptr);
+	require_quiet(cnames_ptr, exit);
+
+	xpc_forget(cnames_ptr);
+	*cnames_ptr = xpc_array_create_empty();
+	*changed_ptr = true;
+
+exit:
+	return;
+}
+
+//======================================================================================================================
+
+static void
+_dx_gai_request_append_cname(const dx_gai_request_t me, const int qtype, const domainname * const cname,
+	const bool expired)
+{
+	bool *changed_ptr;
+	xpc_object_t * const cnames_ptr = _dx_gai_request_get_cnames_ptr(me, qtype, &changed_ptr);
 	require_quiet(cnames_ptr, exit);
 
 	const char *cname_str = NULL;
@@ -1787,33 +1849,8 @@ _dx_gai_request_append_cname(const dx_gai_request_t me, const int qtype, const d
 	}
 	_dx_request_locked(me,
 	^{
-		if (unwind) {
-			const ssize_t expire_idx = *expire_idx_ptr;
-			if (*cnames_ptr && (expire_idx >= 0)) {
-				xpc_object_t new_cnames = xpc_array_create(NULL, 0);
-				if (new_cnames && (expire_idx > 0)) {
-					xpc_array_apply(*cnames_ptr,
-					^ bool (const size_t index, const xpc_object_t _Nonnull value)
-					{
-						bool proceed = false;
-						if (index < (size_t)expire_idx) {
-							xpc_array_append_value(new_cnames, value);
-							proceed = true;
-						}
-						return proceed;
-					});
-				}
-				xpc_forget(cnames_ptr);
-				*cnames_ptr		= new_cnames;
-				*changed_ptr	= true;
-			}
-			*expire_idx_ptr = -1;
-		}
 		if (cname_str) {
 			xpc_object_t cnames = *cnames_ptr;
-			if (expired && (*expire_idx_ptr < 0)) {
-				*expire_idx_ptr = cnames ? (ssize_t)xpc_array_get_count(cnames) : 0;
-			}
 			if (!cnames) {
 				cnames = xpc_array_create(NULL, 0);
 				*cnames_ptr = cnames;
@@ -1824,6 +1861,13 @@ _dx_gai_request_append_cname(const dx_gai_request_t me, const int qtype, const d
 			}
 		}
 	});
+	if ((me->state & dx_gai_state_avoid_suppressed_a_result) && !expired) {
+		// An intermediate CNAME result for the A DNSQuestion means that the last pending negative result is no
+		// longer relevant, so it can be dropped.
+		if (cname && (qtype == kDNSType_A)) {
+			_dx_forget(&me->pending_suppresed_a);
+		}
+	}
 
 exit:
 	return;
@@ -1836,7 +1880,7 @@ _dx_gai_request_copy_cname_update(const dx_gai_request_t me, const int qtype)
 {
 	__block xpc_object_t result = NULL;
 	bool *changed_ptr;
-	xpc_object_t * const cnames_ptr = _dx_gai_request_get_cnames_ptr(me, qtype, &changed_ptr, NULL);
+	xpc_object_t * const cnames_ptr = _dx_gai_request_get_cnames_ptr(me, qtype, &changed_ptr);
 	require_quiet(cnames_ptr, exit);
 
 	_dx_request_locked(me,
@@ -1861,24 +1905,23 @@ _dx_gai_request_failover_check_gai_answer(dx_gai_request_t request, const Resour
 
 static void
 _dx_gai_request_gai_result_handler(mDNS * const m, DNSQuestion * const q, const ResourceRecord * const answer,
-	const QC_result qc_result, const DNSServiceErrorType error, void * const context)
+	const mDNSBool expired, const QC_result qc_result, const DNSServiceErrorType error, void * const context)
 {
 	(void)m;
 	bool failover_restart = false;
 	const dx_gai_request_t me = (dx_gai_request_t)context;
 	if (!error || (error == kDNSServiceErr_NoSuchRecord)) {
 		_dx_gai_request_failover_check_gai_answer(me, answer);
-		const bool expired = (answer->mortality == Mortality_Ghost) || (q->firstExpiredQname.c[0] != 0);
+		if (q->CNAMEReferrals == 0) {
+			_dx_gai_request_reset_cnames(me, q->qtype);
+		}
 		if (answer->rrtype == kDNSServiceType_CNAME) {
 			require_quiet(!error, exit);
 
-			_dx_gai_request_append_cname(me, q->qtype, &answer->rdata->u.name, expired, q->CNAMEReferrals == 0);
+			_dx_gai_request_append_cname(me, q->qtype, &answer->rdata->u.name, expired);
 		}
 		require_quiet((answer->rrtype == kDNSServiceType_A) || (answer->rrtype == kDNSServiceType_AAAA), exit);
 
-		if (q->CNAMEReferrals == 0) {
-			_dx_gai_request_unwind_cnames_if_necessary(me, q->qtype);
-		}
 		const uint8_t *rdata_ptr;
 		uint16_t rdata_len;
 		if (!error) {
@@ -1911,7 +1954,8 @@ static void
 _dx_gai_request_failover_check_gai_answer(const dx_gai_request_t me, const ResourceRecord * const answer)
 {
 	if ((me->state & DX_GAI_STATE_WAITING_FOR_RESULTS) && !(me->state & dx_gai_state_service_allowed_failover)) {
-		if (answer->dnsservice && mdns_dns_service_allows_failover(answer->dnsservice)) {
+		const mdns_dns_service_t dnsservice = mdns_cache_metadata_get_dns_service(answer->metadata);
+		if (dnsservice && mdns_dns_service_allows_failover(dnsservice)) {
 			me->state |= dx_gai_state_service_allowed_failover;
 		}
 	}
@@ -1921,7 +1965,7 @@ _dx_gai_request_failover_check_gai_answer(const dx_gai_request_t me, const Resou
 
 static void
 _dx_gai_request_query_result_handler(mDNS * const m, DNSQuestion * const q, const ResourceRecord * const answer,
-	const QC_result qc_result, const DNSServiceErrorType error, void * const context)
+    const mDNSBool expired, const QC_result qc_result, const DNSServiceErrorType error, void * const context)
 {
 	(void)m;
 	bool failover_restart = false;
@@ -1956,7 +2000,6 @@ _dx_gai_request_query_result_handler(mDNS * const m, DNSQuestion * const q, cons
 			rdata_ptr = NULL;
 			rdata_len = 0;
 		}
-		const bool expired = (answer->mortality == Mortality_Ghost) || (q->firstExpiredQname.c[0] != 0);
 		failover_restart = _dx_gai_request_check_for_failover_restart(me, answer, expired, rdata_len > 0);
 		if (!failover_restart) {
 			_dx_gai_request_enqueue_result(me, qc_result, answer, expired, rdata_ptr, rdata_len, error, q);
@@ -1969,6 +2012,35 @@ exit:
 	if (failover_restart) {
 		_dx_gai_request_restart_client_requests_in_failover_mode(me);
 	}
+}
+
+//======================================================================================================================
+
+static bool
+_dx_gai_request_needs_sensitive_logging(const dx_gai_request_t me)
+{
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+	return (me->log_privacy_level == dnssd_log_privacy_level_private);
+#else
+	return false;
+#endif
+}
+
+//======================================================================================================================
+
+static void
+_dx_gai_request_append_result(const dx_gai_request_t me, const dx_gai_result_t result)
+{
+	result->cname_update = _dx_gai_request_copy_cname_update(me, mdns_resource_record_get_type(result->record));
+	_dx_request_locked(me,
+	^{
+		dx_gai_result_t *ptr = &me->results;
+		while (*ptr) {
+			ptr = &(*ptr)->next;
+		}
+		*ptr = result;
+		_dx_retain(*ptr);
+	});
 }
 
 //======================================================================================================================
@@ -2005,6 +2077,8 @@ _dx_gai_request_enqueue_result(const dx_gai_request_t me, const QC_result qc_res
 		if (rdata_len <= 0) {
 			result->negative_reason = _dx_get_negative_answer_reason(answer, qc_result);
 		}
+		result->extended_dns_error = mdns_cache_metadata_get_extended_dns_error(answer->metadata);
+		mdns_retain_null_safe(result->extended_dns_error);
 	}
 	if (answer_is_expired) {
 		flags |= kDNSServiceFlagsExpiredAnswer;
@@ -2013,22 +2087,17 @@ _dx_gai_request_enqueue_result(const dx_gai_request_t me, const QC_result qc_res
 	result->flags       = flags;
 	result->error       = result_error;
 	result->ifindex     = mDNSPlatformInterfaceIndexfromInterfaceID(&mDNSStorage, answer->InterfaceID, mDNStrue);
-	result->protocol    = answer->protocol;
+	result->protocol    = mdns_cache_metadata_get_protocol(answer->metadata);
 	result->question_id = mDNSVal16(q->TargetQID);
-	if (answer->dnsservice) {
-		result->provider_name = mdns_dns_service_copy_provider_name(answer->dnsservice);
+	const mdns_dns_service_t dnsservice = mdns_cache_metadata_get_dns_service(answer->metadata);
+	if (dnsservice) {
+		result->provider_name = mdns_dns_service_copy_provider_name(dnsservice);
 	}
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+	result->sensitive_logging = _dx_gai_request_needs_sensitive_logging(me);
+#endif
 	const uint16_t record_type = mdns_resource_record_get_type(result->record);
 	if (is_add && !result_error) {
-		if (me->options & mdns_gai_option_auth_tags) {
-			uint8_t auth_tag[DNSSD_AUTHENTICATION_TAG_SIZE];
-			const bool ok = _dx_authenticate_address_rdata(me->effective_uuid, me->hostname, record_type,
-				mdns_resource_record_get_rdata_bytes_ptr(result->record), auth_tag);
-			if (ok) {
-				check_compile_time(sizeof(*result->auth_tag) == sizeof(auth_tag));
-				result->auth_tag = (dx_auth_tag_t *)mdns_memdup(auth_tag, sizeof(*result->auth_tag));
-			}
-		}
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
 		if (me->signed_resolve && ((record_type == kDNSType_A) || (record_type == kDNSType_AAAA))) {
 			OSStatus create_err;
@@ -2048,13 +2117,14 @@ _dx_gai_request_enqueue_result(const dx_gai_request_t me, const QC_result qc_res
 		}
 #endif
 	}
-	result->cname_update = _dx_gai_request_copy_cname_update(me, record_type);
 #if MDNSRESPONDER_SUPPORTS(APPLE, TRACKER_STATE)
 	if (resolved_cache_is_enabled() && is_add) {
 		const char *hostname = NULL;
 		const char *owner = NULL;
 		bool approved_domain = false;
-		const tracker_state_t tracker_state = resolved_cache_get_tracker_state(q, &hostname, &owner, &approved_domain);
+		bool can_block_request = false;
+		const tracker_state_t tracker_state = resolved_cache_get_tracker_state(q, &hostname, &owner, &approved_domain,
+			&can_block_request);
 		if ((tracker_state == tracker_state_known_tracker) && hostname) {
 			mdns_xpc_string_recreate(&me->last_tracker_hostname, hostname);
 			require_action_quiet(me->last_tracker_hostname, exit, err = kDNSServiceErr_NoMemory);
@@ -2071,18 +2141,44 @@ _dx_gai_request_enqueue_result(const dx_gai_request_t me, const QC_result qc_res
 			if (approved_domain) {
 				result->tracker_is_approved = true;
 			}
+			if (can_block_request) {
+				result->tracker_can_block = true;
+			}
 		}
 	}
 #endif
-	_dx_request_locked(me,
-	^{
-		dx_gai_result_t *ptr = &me->results;
-		while (*ptr) {
-			ptr = &(*ptr)->next;
+	if ((me->state & dx_gai_state_avoid_suppressed_a_result) && !answer_is_expired) {
+		switch (record_type) {
+			case kDNSType_A:
+				if (result->negative_reason == dnssd_negative_reason_query_suppressed) {
+					// Put a negative suppressed A result on hold.
+					_dx_replace(&me->pending_suppresed_a, result);
+					err = kDNSServiceErr_NoError;
+					goto exit;
+				} else {
+					// Any other type of A result means that if there's a pending negative suppressed A result,
+					// then it can be dropped. It also means that we no longer care about avoiding negative
+					// suppressed A results.
+					_dx_forget(&me->pending_suppresed_a);
+					SetOrClearBits(&me->state, dx_gai_state_avoid_suppressed_a_result, false);
+				}
+				break;
+
+			case kDNSType_AAAA:
+				// A AAAA result means that if there's a pending negative suppressed A result, then it should no
+				// longer be kept from the client. It also means that we no longer care about avoiding negative
+				// suppressed A results because if the A DNSQuestion was stuck at a DNS service that suppresses A
+				// queries, then it should have advanced past it by now if there was a CNAME chain to traverse
+				// because the AAAA DNSQuestion just did.
+				if (me->pending_suppresed_a) {
+					_dx_gai_request_append_result(me, me->pending_suppresed_a);
+					_dx_forget(&me->pending_suppresed_a);
+				}
+				SetOrClearBits(&me->state, dx_gai_state_avoid_suppressed_a_result, false);
+				break;
 		}
-		*ptr = result;
-	});
-	result = NULL;
+	}
+	_dx_gai_request_append_result(me, result);
 	err = kDNSServiceErr_NoError;
 
 exit:
@@ -2096,7 +2192,8 @@ exit:
 static dnssd_negative_reason_t
 _dx_get_negative_answer_reason(const ResourceRecord * const answer, const QC_result qc_result)
 {
-	if (answer->dnsservice) {
+	const mdns_dns_service_t dnsservice = mdns_cache_metadata_get_dns_service(answer->metadata);
+	if (dnsservice) {
 		if (_dx_qc_result_is_suppressed(qc_result)) {
 			return dnssd_negative_reason_query_suppressed;
 		} else {
@@ -2153,31 +2250,42 @@ _dx_gai_request_is_for_in_app_browser(const xpc_object_t params)
 
 //======================================================================================================================
 
+#define _dx_log_private_string_with_formatted_bookends(SENSITIVE, PREFIX_FMT, SUFFIX_FMT, ...)			\
+	do {																								\
+		if (SENSITIVE) {																				\
+			os_log(_mdns_server_log(), PREFIX_FMT "%{sensitive,mask.hash}s" SUFFIX_FMT, __VA_ARGS__);	\
+		} else {																						\
+			os_log(_mdns_server_log(), PREFIX_FMT "%{private,mask.hash}s" SUFFIX_FMT, __VA_ARGS__);		\
+		}																								\
+	} while (0)
+
 static void
 _dx_gai_request_log_start(const dx_gai_request_t me, const pid_t delegator_pid, const uuid_t delegator_uuid)
 {
 	const dx_session_t session = me->base.session;
+	const bool sensitive_logging = _dx_gai_request_needs_sensitive_logging(me);
 	if (delegator_uuid) {
-		os_log(_mdns_server_log(),
-			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: %{private,mask.hash}s, "
-			"options: %{mdns:gaiopts}X, client pid: %lld (%{public}s), delegator uuid: %{public,uuid_t}.16P",
-			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname, me->options,
-			(long long)session->client_pid, session->client_name, delegator_uuid);
+		_dx_log_private_string_with_formatted_bookends(sensitive_logging,
+			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: ", /* hostname */
+			", options: %{mdns:gaiopts}X, client pid: %lld (%{public}s), delegator uuid: %{public,uuid_t}.16P",
+			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname,
+			me->options, (long long)session->client_pid, session->client_name, delegator_uuid);
 	} else if (delegator_pid != 0) {
 		char delegator_name[MAXCOMLEN];
 		delegator_name[0] = '\0';
 		mdns_system_pid_to_name(delegator_pid, delegator_name);
-		os_log(_mdns_server_log(),
-			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: %{private,mask.hash}s, "
-			"options: %{mdns:gaiopts}X, client pid: %lld (%{public}s), delegator pid: %lld (%{public}s)",
-			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname, me->options,
-			(long long)session->client_pid, session->client_name, (long long)delegator_pid, delegator_name);
+		_dx_log_private_string_with_formatted_bookends(sensitive_logging,
+			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: ", /* hostname */
+			", options: %{mdns:gaiopts}X, client pid: %lld (%{public}s), delegator pid: %lld (%{public}s)",
+			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname,
+			me->options, (long long)session->client_pid, session->client_name, (long long)delegator_pid,
+			delegator_name);
 	} else {
-		os_log(_mdns_server_log(),
-			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: %{private,mask.hash}s, "
-			"options: %{mdns:gaiopts}X, client pid: %lld (%{public}s)",
-			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname, me->options,
-			(long long)session->client_pid, session->client_name);
+		_dx_log_private_string_with_formatted_bookends(sensitive_logging,
+			"[R%u] getaddrinfo start -- flags: 0x%X, ifindex: %d, protocols: %u, hostname: ", /* hostname */
+			", options: %{mdns:gaiopts}X, client pid: %lld (%{public}s)",
+			me->base.request_id, me->flags, (int32_t)me->ifindex, me->protocols, me->hostname,
+			me->options, (long long)session->client_pid, session->client_name);
 	}
 }
 
@@ -2187,13 +2295,14 @@ static void
 _dx_gai_request_log_stop(const dx_gai_request_t me)
 {
 	const dx_session_t session = me->base.session;
+	const bool sensitive_logging = _dx_gai_request_needs_sensitive_logging(me);
 	if (session->terminated) {
-		os_log(_mdns_server_log(),
-			"[R%u] getaddrinfo stop (forced) -- hostname: %{private,mask.hash}s, client pid: %lld (%{public}s)",
+		_dx_log_private_string_with_formatted_bookends(sensitive_logging,
+			"[R%u] getaddrinfo stop (forced) -- hostname: ", /* hostname */ ", client pid: %lld (%{public}s)",
 			me->base.request_id, me->hostname, (long long)session->client_pid, session->client_name);
 	} else {
-		os_log(_mdns_server_log(),
-			"[R%u] getaddrinfo stop -- hostname: %{private,mask.hash}s, client pid: %lld (%{public}s)",
+		_dx_log_private_string_with_formatted_bookends(sensitive_logging,
+			"[R%u] getaddrinfo stop -- hostname: ", /* hostname */ ", client pid: %lld (%{public}s)",
 			me->base.request_id, me->hostname, (long long)session->client_pid, session->client_name);
 	}
 }
@@ -2208,6 +2317,21 @@ _dx_gai_request_log_error(const dx_gai_request_t me, const DNSServiceErrorType e
 		"[R%u] getaddrinfo error -- hostname: %{private,mask.hash}s, error: %{mdns:err}ld"", "
 		"client pid: %lld (%{public}s)",
 		me->base.request_id, me->hostname, (long)error, (long long)session->client_pid, session->client_name);
+}
+
+//======================================================================================================================
+
+static bool
+_dx_gai_request_involves_parallel_a_and_aaaa_questions(const dx_gai_request_t me)
+{
+	switch (me->protocols & (kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6)) {
+		case 0:
+			return true;
+
+		case (kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6):
+			return true;
+	}
+	return false;
 }
 
 //======================================================================================================================
@@ -2234,13 +2358,17 @@ _dx_gai_request_start_client_requests(const dx_gai_request_t me, const bool need
 	gai_params.prohibitEncryptedDNS		= (me->options & mdns_gai_option_prohibit_encrypted_dns) != 0;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-	gai_params.peerAuditToken			= &session->audit_token;
-	gai_params.delegatorAuditToken		= me->delegator_audit_token;
+	gai_params.peerToken				= session->peer_token;
+	gai_params.delegatorToken			= me->delegator_token;
 	gai_params.isInAppBrowserRequest	= (me->options & mdns_gai_option_in_app_browser) != 0;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-	gai_params.logPrivacyLevel			= me->log_privacy_level;
+	gai_params.logPrivacyLevel				= me->log_privacy_level;
 #endif
+	const bool will_have_parallel_a_and_aaaa = _dx_gai_request_involves_parallel_a_and_aaaa_questions(me);
+	SetOrClearBits(&me->state, dx_gai_state_avoid_suppressed_a_result, will_have_parallel_a_and_aaaa);
+	_dx_forget(&me->pending_suppresed_a);
+	gai_params.persistWhenARecordsUnusable  = will_have_parallel_a_and_aaaa;
 
 	// Set up QueryRecord parameters.
 	QueryRecordClientRequestParams query_params;
@@ -2262,8 +2390,8 @@ _dx_gai_request_start_client_requests(const dx_gai_request_t me, const bool need
 		query_params.prohibitEncryptedDNS	= (me->options & mdns_gai_option_prohibit_encrypted_dns) != 0;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-		query_params.peerAuditToken			= &session->audit_token;
-		query_params.delegatorAuditToken	= me->delegator_audit_token;
+		query_params.peerToken				= session->peer_token;
+		query_params.delegatorToken			= me->delegator_token;
 		query_params.isInAppBrowserRequest	= (me->options & mdns_gai_option_in_app_browser) != 0;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
@@ -2280,32 +2408,39 @@ static bool
 _dx_gai_request_check_for_failover_restart(const dx_gai_request_t me, const ResourceRecord * const answer,
 	const bool answer_is_expired, const bool answer_is_positive)
 {
-	bool restart = false;
+	__block bool restart = false;
+	__block dx_gai_result_t free_list = NULL;
 	if ((me->state & DX_GAI_STATE_WAITING_FOR_RESULTS) && !answer_is_expired) {
-		if (answer_is_positive) {
-			switch (answer->rrtype) {
-				case kDNSType_A:
-				case kDNSType_AAAA:
-				case kDNSType_HTTPS:
-					me->state &= ~DX_GAI_STATE_WAITING_FOR_RESULTS;
-					break;
-			}
-		} else {
-			switch (answer->rrtype) {
-				case kDNSServiceType_A:
-					me->state &= ~dx_gai_state_waiting_for_a;
-					break;
+		_dx_request_locked(me,
+		^{
+			if (answer_is_positive) {
+				switch (answer->rrtype) {
+					case kDNSType_A:
+					case kDNSType_AAAA:
+					case kDNSType_HTTPS:
+						me->state &= ~DX_GAI_STATE_WAITING_FOR_RESULTS;
+						break;
+				}
+			} else {
+				switch (answer->rrtype) {
+					case kDNSServiceType_A:
+						me->state &= ~dx_gai_state_waiting_for_a;
+						break;
 
-				case kDNSServiceType_AAAA:
-					me->state &= ~dx_gai_state_waiting_for_aaaa;
-					break;
+					case kDNSServiceType_AAAA:
+						me->state &= ~dx_gai_state_waiting_for_aaaa;
+						break;
+				}
+				const dx_gai_state_t state = me->state;
+				if (!(state & DX_GAI_STATE_WAITING_FOR_RESULTS) && (state & dx_gai_state_service_allowed_failover)) {
+					restart = true;
+					free_list = me->results;
+					me->results = NULL;
+				}
 			}
-			const dx_gai_state_t state = me->state;
-			if (!(state & DX_GAI_STATE_WAITING_FOR_RESULTS) && (state & dx_gai_state_service_allowed_failover)) {
-				restart = true;
-			}
-		}
+		});
 	}
+	_dx_gai_result_list_forget(&free_list);
 	return restart;
 }
 
@@ -2320,10 +2455,10 @@ _dx_gai_result_finalize(const dx_gai_result_t me)
 	xpc_forget(&me->cname_update);
 	mdns_xpc_string_forget(&me->tracker_hostname);
 	mdns_xpc_string_forget(&me->tracker_owner);
-	ForgetMem(&me->auth_tag);
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
 	mdns_forget(&me->signed_hostname);
 #endif
+	mdns_forget(&me->extended_dns_error);
 }
 
 //======================================================================================================================
@@ -2366,9 +2501,6 @@ _dx_gai_result_to_dictionary(const dx_gai_result_t me)
 	if (me->provider_name) {
 		dnssd_xpc_result_set_provider_name(result, me->provider_name);
 	}
-	if (me->auth_tag) {
-		dnssd_xpc_result_set_authentication_tag(result, me->auth_tag, sizeof(*me->auth_tag));
-	}
 	if (me->cname_update) {
 		dnssd_xpc_result_set_cname_update(result, me->cname_update);
 	}
@@ -2378,6 +2510,7 @@ _dx_gai_result_to_dictionary(const dx_gai_result_t me)
 			dnssd_xpc_result_set_tracker_owner(result, me->tracker_owner);
 		}
 		dnssd_xpc_result_set_tracker_is_approved(result, me->tracker_is_approved);
+		dnssd_xpc_result_set_tracker_can_block_request(result, me->tracker_can_block);
 	}
 #if MDNSRESPONDER_SUPPORTS(APPLE, SIGNED_RESULTS)
 	if (me->signed_hostname) {
@@ -2388,10 +2521,63 @@ _dx_gai_result_to_dictionary(const dx_gai_result_t me)
 		}
 	}
 #endif
+	const mdns_extended_dns_error_t ede = me->extended_dns_error;
+	if (ede) {
+		const uint16_t code = mdns_extended_dns_error_get_code(ede);
+		const mdns_xpc_string_t text = mdns_extended_dns_error_get_extra_text(ede);
+		dnssd_xpc_result_set_extended_dns_error(result, code, text);
+	}
 	return result;
 }
 
 //======================================================================================================================
+
+static bool
+_dx_gai_result_needs_sensitive_logging(const dx_gai_result_t me)
+{
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+	return me->sensitive_logging;
+#else
+	return false;
+#endif
+}
+
+//======================================================================================================================
+
+#define _dx_log_name_and_record_with_formatted_bookends(NAME, RECORD, SENSITIVE, PREFIX_FMT, MID_FMT, SUFFIX_FMT,	\
+	REQUEST_ID, QUESTION_ID, IS_ADD, IFINDEX, RRTYPE, EXPIRED)														\
+	do {																											\
+		const bool _sensitive = SENSITIVE;																			\
+		const mdns_domain_name_t _name = NAME;																		\
+		char *_sensitive_name_desc = _sensitive ? mdns_copy_private_description(_name) : NULL;						\
+		const mdns_resource_record_t _record = RECORD;																\
+		char *_sensitive_record_desc = _sensitive ? mdns_copy_private_description(_record) : NULL;					\
+		if (_sensitive_name_desc && _sensitive_record_desc) {														\
+			os_log(_mdns_server_log(), PREFIX_FMT "%{public}s" MID_FMT "%{public}s" SUFFIX_FMT,						\
+				REQUEST_ID, QUESTION_ID, IS_ADD, IFINDEX, _sensitive_name_desc, RRTYPE, _sensitive_record_desc,		\
+				EXPIRED);																							\
+		} else {																									\
+			os_log(_mdns_server_log(), PREFIX_FMT "%@" MID_FMT "%@" SUFFIX_FMT,										\
+				REQUEST_ID, QUESTION_ID, IS_ADD, IFINDEX, _name, RRTYPE, _record, EXPIRED);							\
+		}																											\
+		ForgetMem(&_sensitive_name_desc);																			\
+		ForgetMem(&_sensitive_record_desc);																			\
+	} while (0)
+
+#define _dx_log_name_with_formatted_bookends(NAME, SENSITIVE, PREFIX_FMT, SUFFIX_FMT, REQUEST_ID, QUESTION_ID,	\
+	IS_ADD,	IFINDEX, RRTYPE, NEGATIVE_REASON)																	\
+	do {																										\
+		const mdns_domain_name_t _name = NAME;																	\
+		char *_sensitive_name_desc = (SENSITIVE) ? mdns_copy_private_description(_name) : NULL;					\
+		if (_sensitive_name_desc) {																				\
+			os_log(_mdns_server_log(), PREFIX_FMT "%{public}s" SUFFIX_FMT,										\
+				REQUEST_ID, QUESTION_ID, IS_ADD, IFINDEX, _sensitive_name_desc, RRTYPE, NEGATIVE_REASON);		\
+			ForgetMem(&_sensitive_name_desc);																	\
+		} else {																								\
+			os_log(_mdns_server_log(), PREFIX_FMT "%@" SUFFIX_FMT,												\
+				REQUEST_ID, QUESTION_ID, IS_ADD, IFINDEX, _name, RRTYPE, NEGATIVE_REASON);						\
+		}																										\
+	} while (0)
 
 static void
 _dx_gai_result_log(const dx_gai_result_t me, const uint32_t request_id)
@@ -2399,75 +2585,23 @@ _dx_gai_result_log(const dx_gai_result_t me, const uint32_t request_id)
 	const bool is_add = (me->flags & kDNSServiceFlagsAdd) ? true : false;
 	const mdns_domain_name_t name = me->record ? mdns_resource_record_get_name(me->record) : NULL;
 	const int type = me->record ? mdns_resource_record_get_type(me->record) : 0;
+	const bool sensitive_logging = _dx_gai_result_needs_sensitive_logging(me);
 	if (me->record && (mdns_resource_record_get_rdata_length(me->record) > 0)) {
 		const bool expired = (me->flags & kDNSServiceFlagsExpiredAnswer) != 0;
-		os_log(_mdns_server_log(),
-			"[R%u->Q%u] getaddrinfo result -- event: %{mdns:addrmv}d, ifindex: %d, name: %@, type: %{mdns:rrtype}d,"
-			" rdata: %@, expired: %{mdns:yesno}d",
-			request_id, me->question_id, is_add, me->ifindex, name, type, me->record, expired);
+		_dx_log_name_and_record_with_formatted_bookends(name, me->record, sensitive_logging,
+			"[R%u->Q%u] getaddrinfo result -- event: %{mdns:addrmv}d, ifindex: %d, name: ", /* name */
+			", type: %{mdns:rrtype}d, rdata: ", /* rdata */ ", expired: %{mdns:yesno}d",
+			request_id, me->question_id, is_add, me->ifindex, type, expired);
 	} else {
-		os_log(_mdns_server_log(),
-			"[R%u->Q%u] getaddrinfo result -- event: %{mdns:addrmv}d, ifindex: %d, name: %@, type: %{mdns:rrtype}d,"
-			" rdata: <none>, reason: %{mdns:nreason}d",
-			request_id, me->question_id, is_add, me->ifindex, name, type, me->negative_reason);
+		_dx_log_name_with_formatted_bookends(name, sensitive_logging,
+			"[R%u->Q%u] getaddrinfo result -- event: %{mdns:addrmv}d, ifindex: %d, name: ", /* name */
+			", type: %{mdns:rrtype}d, rdata: <none>, reason: %{mdns:nreason}d",
+			request_id, me->question_id, is_add, me->ifindex, type, me->negative_reason);
 	}
 }
 
 //======================================================================================================================
 // MARK: - Helper Functions
-
-typedef struct {
-	struct necp_client_resolver_answer	hdr;
-	uint8_t								hostname[MAX_ESCAPED_DOMAIN_NAME];
-} dx_necp_answer_t;
-
-check_compile_time(sizeof_field(dx_necp_answer_t, hdr) == offsetof(dx_necp_answer_t, hostname));
-
-static bool
-_dx_authenticate_address_rdata(uuid_t effective_uuid, const char * const hostname, const int type,
-	const uint8_t * const rdata, uint8_t out_auth_tag[STATIC_PARAM DNSSD_AUTHENTICATION_TAG_SIZE])
-{
-	bool ok = false;
-	require_quiet((type == kDNSServiceType_A) || (type == kDNSServiceType_AAAA), exit);
-
-	dx_necp_answer_t answer;
-	struct necp_client_resolver_answer * const hdr = &answer.hdr;
-	memset(hdr, 0, sizeof(*hdr));
-	uuid_copy(hdr->client_id, effective_uuid);
-
-	hdr->sign_type = NECP_CLIENT_SIGN_TYPE_RESOLVER_ANSWER;
-	if (type == kDNSServiceType_A) {
-		hdr->address_answer.sa.sa_family	= AF_INET;
-		hdr->address_answer.sa.sa_len		= sizeof(struct sockaddr_in);
-		memcpy(&hdr->address_answer.sin.sin_addr.s_addr, rdata, 4);
-	} else {
-		hdr->address_answer.sa.sa_family	= AF_INET6;
-		hdr->address_answer.sa.sa_len		= sizeof(struct sockaddr_in6);
-		memcpy(hdr->address_answer.sin6.sin6_addr.s6_addr, rdata, 16);
-	}
-	const size_t hostname_len = strlen(hostname);
-	require_quiet(hostname_len <= sizeof(answer.hostname), exit);
-
-	hdr->hostname_length = (uint32_t)hostname_len;
-	memcpy(answer.hostname, hostname, hdr->hostname_length);
-
-	static int necp_fd = -1;
-	if (necp_fd < 0) {
-		necp_fd = necp_open(0);
-	}
-	require_quiet(necp_fd >= 0, exit);
-
-	const int err = necp_client_action(necp_fd, NECP_CLIENT_ACTION_SIGN, (uint8_t *)&answer.hdr,
-		sizeof(answer.hdr) + hdr->hostname_length, out_auth_tag, DNSSD_AUTHENTICATION_TAG_SIZE);
-	require_noerr_quiet(err, exit);
-
-	ok = true;
-
-exit:
-	return ok;
-}
-
-//======================================================================================================================
 
 static void
 _dx_kqueue_locked(const char * const description, const bool need_lock, const dx_block_t block)
@@ -2529,4 +2663,68 @@ _dx_qc_result_is_suppressed(const QC_result qc_result)
 			break;
 	}
 	return false;
+}
+
+//======================================================================================================================
+
+static QueryRecordClientRequest *
+_dx_query_record_client_request_start(const QueryRecordClientRequestParams * const params,
+	const QueryRecordResultHandler handler, void * const context, DNSServiceErrorType * const out_error)
+{
+	DNSServiceErrorType err;
+	QueryRecordClientRequest *query = (QueryRecordClientRequest *)mdns_calloc(1, sizeof(*query));
+	mdns_require_action_quiet(query, exit, err = kDNSServiceErr_NoMemory);
+
+	err = QueryRecordClientRequestStart(query, params, handler, context);
+	if (err) {
+		ForgetMem(&query);
+	}
+
+exit:
+	mdns_assign(out_error, err);
+	return query;
+}
+
+//======================================================================================================================
+
+static void
+_dx_query_record_client_request_forget(QueryRecordClientRequest ** const request_ptr)
+{
+	QueryRecordClientRequest * const query = *request_ptr;
+	if (query) {
+		QueryRecordClientRequestStop(query);
+		ForgetMem(request_ptr);
+	}
+}
+
+//======================================================================================================================
+
+static GetAddrInfoClientRequest *
+_dx_get_addr_info_client_request_start(const GetAddrInfoClientRequestParams * const params,
+	const QueryRecordResultHandler handler, void * const context, DNSServiceErrorType * const out_error)
+{
+	DNSServiceErrorType err;
+	GetAddrInfoClientRequest *gai = (GetAddrInfoClientRequest *)mdns_calloc(1, sizeof(*gai));
+	mdns_require_action_quiet(gai, exit, err = kDNSServiceErr_NoMemory);
+
+	err = GetAddrInfoClientRequestStart(gai, params, handler, context);
+	if (err) {
+		ForgetMem(&gai);
+	}
+
+exit:
+	mdns_assign(out_error, err);
+	return gai;
+}
+
+//======================================================================================================================
+
+static void
+_dx_get_addr_info_client_request_forget(GetAddrInfoClientRequest ** const request_ptr)
+{
+	GetAddrInfoClientRequest * const gai = *request_ptr;
+	if (gai) {
+		GetAddrInfoClientRequestStop(gai);
+		ForgetMem(request_ptr);
+	}
 }

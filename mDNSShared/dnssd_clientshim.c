@@ -251,7 +251,7 @@ DNSServiceErrorType DNSServiceRegister
 )
 {
     mStatus err = mStatus_NoError;
-    const char *errormsg = "Unknown";
+    const char *errormsg;
     domainlabel n;
     domainname t, d, h, srv;
     mDNSIPPort port;
@@ -422,7 +422,7 @@ DNSServiceErrorType DNSServiceBrowse
 )
 {
     mStatus err = mStatus_NoError;
-    const char *errormsg = "Unknown";
+    const char *errormsg;
     domainname t, d;
     mDNS_DirectOP_Browse *x;
     (void)flags;            // Unused
@@ -505,7 +505,7 @@ DNSServiceErrorType DNSServiceResolve
 )
 {
     mStatus err = mStatus_NoError;
-    const char *errormsg = "Unknown";
+    const char *errormsg;
     domainlabel n;
     domainname t, d, srv;
     mDNS_DirectOP_Resolve *x;
@@ -671,7 +671,7 @@ DNSServiceErrorType DNSServiceQueryRecord
 )
 {
     mStatus err = mStatus_NoError;
-    const char *errormsg = "Unknown";
+    const char *errormsg;
     mDNS_DirectOP_QueryRecord *x;
 
     // Allocate memory, and handle failure
@@ -837,7 +837,7 @@ DNSServiceErrorType DNSSD_API DNSServiceGetAddrInfo(
     DNSServiceGetAddrInfoReply inCallback,
     void                      *inContext )
 {
-    const char                *errormsg = "Unknown";
+    const char                *errormsg;
     DNSServiceErrorType        err;
     mDNS_DirectOP_GetAddrInfo *x;
 

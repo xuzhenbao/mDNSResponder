@@ -34,10 +34,14 @@
 #include "dns-msg.h"
 #include "srp-crypto.h"
 #include "ioloop.h"
-#include "dnssd-proxy.h"
 #include "srp-gw.h"
 #include "config-parse.h"
 #include "srp-proxy.h"
+#include "cti-services.h"
+#include "srp-mdns-proxy.h"
+#include "dnssd-proxy.h"
+#include "srp-replication.h"
+
 
 static dns_name_t *service_update_zone; // The zone to update when we receive an update for default.service.arpa.
 
@@ -225,6 +229,7 @@ srp_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection_t *
     bool found_serial = false;
     char namebuf1[DNS_MAX_NAME_SIZE], namebuf2[DNS_MAX_NAME_SIZE];
 
+
     // Update requires a single SOA record as the question
     if (message->qdcount != 1) {
         ERROR("update received with qdcount > 1");
@@ -241,6 +246,11 @@ srp_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection_t *
         ERROR("update received with rrtype %d instead of SOA in question section.",
               message->questions[0].type);
         return false;
+    }
+
+
+    if (srpl_connection == NULL) {
+        raw_message->received_time = srp_time();
     }
 
     update_zone = message->questions[0].name;
@@ -688,12 +698,14 @@ srp_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection_t *
     // mean the host that send this doesn't have a working clock.   One being zero and the other not isn't
     // valid unless it's 1970.
     if (signature->data.sig.inception != 0 || signature->data.sig.expiry != 0) {
+        gettimeofday(&now, NULL);
         if (raw_message->received_time != 0) {
-            now.tv_sec = raw_message->received_time;
+            // The received time is in srp_time, but the signature time will be in wall clock time, so
+            // convert from srpl_time to wall clock time.
+            now.tv_sec = raw_message->received_time - srp_time() + now.tv_sec;
             now.tv_usec = 0;
-        } else {
-            gettimeofday(&now, NULL);
         }
+
         // The sender does the bracketing, so we can just do a simple comparison.
         if ((uint32_t)(now.tv_sec & UINT32_MAX) > signature->data.sig.expiry ||
             (uint32_t)(now.tv_sec & UINT32_MAX) < signature->data.sig.inception) {
@@ -759,12 +771,22 @@ srp_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection_t *
 
     // Start the update.
     DNS_NAME_GEN_SRP(host_description->name, host_description_name_buf);
-    INFO("update for " PRI_DNS_NAME_SRP " xid %x validates, lease time %d%s, serial %" PRIu32 "%s.",
-         DNS_NAME_PARAM_SRP(host_description->name, host_description_name_buf), raw_message->wire.id,
-         lease_time, found_lease ? " (found)" : "", serial_number, found_serial ? " (found)" : " (not sent)");
+    char time_buf[28];
+    if (raw_message->received_time == 0) {
+        static char msg[] = "not set";
+        memcpy(time_buf, msg, sizeof(msg));
+    } else {
+        srp_format_time_offset(time_buf, sizeof(time_buf), srp_time() - raw_message->received_time);
+    }
+
+    INFO("update for " PRI_DNS_NAME_SRP " xid %x validates, lease time %d%s, receive_time "
+         PUB_S_SRP ", remote " PRI_S_SRP ".",
+         DNS_NAME_PARAM_SRP(host_description->name, host_description_name_buf), raw_message->wire.id, lease_time,
+         found_lease ? " (found)" : "", time_buf, srpl_connection == NULL ? "(none)" : srpl_connection->name);
     rcode = dns_rcode_noerror;
-    ret = srp_update_start(connection, server_state, srpl_connection, message, raw_message, host_description, service_instances,
-                           services, removes, replacement_zone == NULL ? update_zone : replacement_zone,
+    ret = srp_update_start(connection, server_state, srpl_connection, message, raw_message, host_description,
+                           service_instances, services, removes,
+                           replacement_zone == NULL ? update_zone : replacement_zone,
                            lease_time, key_lease_time, serial_number, found_serial);
     if (ret) {
         goto success;
@@ -773,8 +795,13 @@ srp_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection_t *
     goto out;
 
 badsig:
-    // True means it was intended for us, and shouldn't be forwarded.
-    ret = true;
+    if (srpl_connection == NULL) {
+        // True means it was intended for us, and shouldn't be forwarded.
+        ret = true;
+    } else {
+        // For SRP replication, we need to return false when the signature check fails.
+        ret = false;
+    }
     // We're not actually going to return this; it simply indicates that we aren't sending a fail response.
     rcode = dns_rcode_noerror;
     // Because we're saying this is ours, we have to free the parsed message.
@@ -796,7 +823,7 @@ success:
         dp = next;
     }
 
-    if (ret == true && rcode != dns_rcode_noerror) {
+    if (ret == true && rcode != dns_rcode_noerror && srpl_connection == NULL) {
         if (connection != NULL) {
             send_fail_response(connection, raw_message, rcode);
         }
@@ -836,11 +863,15 @@ srp_dns_evaluate(comm_t *connection, srp_server_t *server_state, srpl_connection
 
     // We need the wire message to validate the signature...
     if (!srp_evaluate(connection, server_state, srpl_connection, parsed_message, message)) {
-        // The message wasn't invalid, but wasn't an SRP message.
-        dns_message_free(parsed_message);
-        // dns_forward(connection)
-        if (connection != NULL) {
-            send_fail_response(connection, message, dns_rcode_refused);
+        // For srpl connections, a false return value means the update failed. For regular SRP updates,
+        // a false return value means that the update was not consumed.
+        if (!srpl_connection) {
+            // The message wasn't invalid, but wasn't an SRP message.
+            dns_message_free(parsed_message);
+            // dns_forward(connection)
+            if (connection != NULL) {
+                send_fail_response(connection, message, dns_rcode_refused);
+            }
         }
         return false;
     }
@@ -860,76 +891,14 @@ struct srp_proxy_listener_state {
     comm_t *NULLABLE udp_listener;
 };
 
-void
-srp_proxy_listener_cancel(srp_proxy_listener_state_t *listener_state)
+comm_t *
+srp_proxy_listen(uint16_t *avoid_ports, int num_avoid_ports, ready_callback_t ready, cancel_callback_t cancel_callback,
+                 void *context)
 {
-    if (listener_state->tcp_listener != NULL) {
-        ioloop_listener_cancel(listener_state->tcp_listener);
-        ioloop_listener_release(listener_state->tcp_listener);
-    }
-    if (listener_state->tls_listener != NULL) {
-        ioloop_listener_cancel(listener_state->tls_listener);
-        ioloop_listener_release(listener_state->tls_listener);
-    }
-    if (listener_state->udp_listener != NULL) {
-        ioloop_listener_cancel(listener_state->udp_listener);
-        ioloop_listener_release(listener_state->udp_listener);
-    }
-    free(listener_state);
-}
-
-srp_proxy_listener_state_t *
-srp_proxy_listen(uint16_t *avoid_ports, int num_avoid_ports, ready_callback_t ready, srp_server_t *server_state)
-{
-#if SRP_STREAM_LISTENER_ENABLED
-    uint16_t tcp_listen_port;
-#ifndef EXCLUDE_TLS
-    uint16_t tls_listen_port;
-#endif
-#endif
-    srp_proxy_listener_state_t *listeners = calloc(1, sizeof *listeners);
-    if (listeners == NULL) {
-        ERROR("srp_proxy_listen: no memory for listeners structure.");
-        return NULL;
-    }
-    (void)avoid_ports;
-    (void)num_avoid_ports;
-
-#if SRP_STREAM_LISTENER_ENABLED
-    tcp_listen_port = 53;
-    tls_listen_port = 853;
-#endif
-
-    // Set up listeners
     // XXX UDP listeners should bind to interface addresses, not INADDR_ANY.
-    listeners->udp_listener = ioloop_listener_create(false, false, avoid_ports,
-                                                     num_avoid_ports, NULL, NULL, "UDP listener", dns_input,
-                                                     NULL, NULL, ready, NULL, NULL, server_state);
-    if (listeners->udp_listener == NULL) {
-        srp_proxy_listener_cancel(listeners);
-        ERROR("UDP listener: fail.");
-        return 0;
-    }
-#ifdef SRP_STREAM_LISTENER_ENABLED
-    listeners->tcp_listener = ioloop_listener_create(true, false, NULL, 0, NULL, NULL,
-                                                     "TCP listener", dns_input, NULL, NULL, ready, NULL, NULL, server_state);
-    if (listeners->tcp_listener == NULL) {
-        srp_proxy_listener_cancel(listeners);
-        ERROR("TCP listener: fail.");
-        return 0;
-    }
-#ifndef EXCLUDE_TLS
-    listeners->tls_listener = ioloop_listener_create(true, true, NULL, 0, NULL, NULL,
-                                                     "TLS listener", dns_input, NULL, NULL, ready, NULL, NULL, server_state);
-    if (listeners->tls_listener == NULL) {
-        srp_proxy_listener_cancel(listeners);
-        ERROR("TLS listener: fail.");
-        return 0;
-    }
-#endif
-#endif
-
-    return listeners;
+    return ioloop_listener_create(false, false, avoid_ports,
+                                  num_avoid_ports, NULL, NULL, "SRP UDP listener", dns_input,
+                                  NULL, cancel_callback, ready, NULL, NULL, context);
 }
 
 void

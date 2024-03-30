@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 #define __RESOLVER_DISCOVER_H__
 
 #include "mDNSFeatures.h" // for MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)
-#include "mdns_strict.h"
 
 #if MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)
 
@@ -30,8 +29,15 @@
 // MARK: - Headers
 
 #include "mDNSEmbeddedAPI.h"
+#include "general.h"
+
 #include <stdbool.h>
+
 #include "nullability.h"
+
+MDNS_ASSUME_NONNULL_BEGIN
+
+MDNS_C_DECLARATIONS_BEGIN
 
 //======================================================================================================================
 // MARK: - Functions
@@ -55,7 +61,7 @@
  */
 
 bool
-resolver_discovery_add(const domainname * NONNULL domain_to_discover, bool grab_mdns_lock);
+resolver_discovery_add(const domainname *domain_to_discover, bool grab_mdns_lock);
 
 /*!
  *	@brief
@@ -77,10 +83,46 @@ resolver_discovery_add(const domainname * NONNULL domain_to_discover, bool grab_
  */
 
 bool
-resolver_discovery_remove(const domainname * NONNULL domain_to_discover, bool grab_mdns_lock);
+resolver_discovery_remove(const domainname *domain_to_discover, bool grab_mdns_lock);
 
+/*!
+ *	@brief
+ *		Get the next time when mDNSCore should start processing the previously scheduled task for the resolver discovery.
+ *
+ *	@result
+ *		The next time to perform resolver discovery related tasks.
+ */
+mDNSs32
+resolver_discovery_get_next_scheduled_event(void);
+#define ResolverDiscovery_GetNextScheduledEvent(...)	resolver_discovery_get_next_scheduled_event(__VA_ARGS__)
+
+/*!
+ *	@brief
+ *		Perform resolver discovery related tasks.
+ */
+void
+resolver_discovery_perform_periodic_tasks(void);
+#define ResolverDiscovery_PerformPeriodicTasks(...)		resolver_discovery_perform_periodic_tasks(__VA_ARGS__)
+
+/*!
+ *	@brief
+ *		Check if the current DNS question is allowed to do resolve discovery, if so, return the domain that can do resolver discovery.
+ *
+ *	@param q
+ *		The DNS question.
+ *
+ *	@param out_domain
+ *		The pointer of the domain name to do resolver discovery when the DNS question is allowed to discover it.
+ *
+ *	@result
+ *		Returns true if the question is capable of doing resolver discovery and `out_domain` contains the domain, otherwise, false.
+ */
 bool
-dns_question_requires_resolver_discovery(const DNSQuestion * NONNULL q, const domainname * NULLABLE * NONNULL out_domain);
+dns_question_requires_resolver_discovery(const DNSQuestion *q, const domainname * NULLABLE * NONNULL out_domain);
+
+MDNS_C_DECLARATIONS_END
+
+MDNS_ASSUME_NONNULL_END
 
 #endif // MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)
 

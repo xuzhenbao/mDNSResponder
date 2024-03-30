@@ -1,6 +1,6 @@
 /* dnssd-proxy.c
  *
- * Copyright (c) 2018-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,11 +61,11 @@
 #include "dso.h"
 #include "srp-tls.h"
 #include "config-parse.h"
+#include "srp-mdns-proxy.h"
 #include "dnssd-proxy.h"
 #include "srp-tls.h"
 #include "srp-gw.h"
 #include "srp-proxy.h"
-#include "srp-mdns-proxy.h"
 #include "cti-services.h"
 #include "route.h"
 #include "srp-replication.h"
@@ -76,7 +76,7 @@
 
 #define RESPONSE_WINDOW 6 // in seconds.
 
-extern route_state_t *route_states;
+extern srp_server_t *srp_servers;
 
 // When do we build dnssd-proxy?
 // 1. When we are integrating dnssd-proxy into srp-mdns-proxy: SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY == 1
@@ -127,9 +127,6 @@ struct served_domain {
     question_t *NULLABLE questions;             // Questions that have been asked in the served domain.
 };
 
-// Questions that aren't in a served domain
-question_t *NULLABLE questions_without_domain;
-
 // There are two ways that a dnssd_query_t can be created. One is that a DNS datagram comes in that's a DNS
 // query.  In this case, we create the query, ask the question, generate a single DNS response, send it, and
 // the dnssd query is finished. We could optimize retransmissions, but currently do not. UDP queries can
@@ -158,6 +155,12 @@ question_t *NULLABLE questions_without_domain;
 // the tracker is collected. If there is a DSO object on the tracker, the tracker is not responsible for tracking
 // idle state.
 
+typedef enum {
+    dp_tracker_session_none,
+    dp_tracker_session_push,
+    dp_tracker_session_srpl
+} dp_tracker_session_type_t;
+
 typedef struct dnssd_query dnssd_query_t;
 typedef struct dp_tracker {
     int ref_count;
@@ -165,6 +168,7 @@ typedef struct dp_tracker {
     dnssd_query_t *dns_queries;
     dso_state_t *dso;
     wakeup_t *idle_timeout;
+    dp_tracker_session_type_t session_type;
 } dp_tracker_t;
 
 struct answer {
@@ -182,10 +186,11 @@ struct question {
     question_t *next;               // List of questions that are being asked.
     served_domain_t *served_domain;
     dnssd_query_t *queries;         // dnssd queries that are asking this question.
-    dnssd_txn_t *txn;
+    dnssd_txn_t *txn;               // Subordinate DNSServiceRef for this question
     char *name;                     // The name we are looking up.
     answer_t *answers;              // Answers this question has received.
     int64_t start_time;             // When this question was started.
+    int serviceFlags;               // Service flags to use with this question.
     int ref_count;                  // Reference count.
     uint32_t interface_index;       // Which interface the query should use.
     uint16_t type;                  // The type.
@@ -200,21 +205,22 @@ struct dnssd_query {
     wakeup_t *wakeup;
     dns_name_pointer_t enclosing_domain_pointer;
 
-    message_t *question;
+    message_t *message;
     dso_state_t *dso;               // If this is a DNS Push query, the DSO state associated with it.
     dso_activity_t *activity;
-    int serviceFlags;               // Service flags to use with this query.
+    int num_questions;              // In case of a multi-question query, how many questions were asked
     bool is_edns0;
     dns_towire_state_t towire;
     uint8_t *p_dso_length;          // Where to store the DSO length just before we write out a push notification.
     dns_wire_t *response;
+    dns_message_t *response_msg;    // In case we need to decompose the message to construct a multi-answer message.
     size_t data_size;               // Size of the data payload of the response.
     dnssd_query_t *question_next;   // Linked list of queries on the question this query is subscribed to.
-    question_t *question_asked;     // Question asked by this query pointing to a cache entry.
+    question_t *question;     // Question asked by this query pointing to a cache entry.
+    bool satisfied;                 // If true, this query has gotten an answer. Only relevant for straight DNS.
 };
 
 // Structure that is used to setup the mDNS discovery for dnssd-proxy.
-typedef struct dnssd_proxy_advertisements dnssd_proxy_advertisements_t;
 struct dnssd_proxy_advertisements {
     wakeup_t *wakeup_timer;         // Used to setup a timer to advertise records repeatedly until it succeeds.
     dnssd_txn_t *txn;               // Contains event loop.
@@ -222,6 +228,8 @@ struct dnssd_proxy_advertisements {
     DNSRecordRef ns_record_ref;     // Used to update the advertised NS record.
     DNSRecordRef ptr_record_ref;    // Used to update the advertised PTR record.
     char *domain_to_advertise;      // The domain to be advertised in NS and PTR records.
+    srp_server_t *server_state;
+    SCDynamicStoreContext sc_context;
 };
 
 // Configuration file settings
@@ -240,10 +248,15 @@ char *tls_key_filename = "/etc/dnssd-proxy/server.key";
 
 comm_t *listener[4 + MAX_ADDRS];
 int num_listeners;
+question_t *questions_without_domain; // Questions that aren't in a served domain
 served_domain_t *served_domains;
-int num_dso_connections; // Number of connections from DNS Push clients
+int num_push_sessions; // Number of connections from DNS Push clients
+int dp_num_outstanding_queries;
 
-static dnssd_proxy_advertisements_t advertisements;
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+dnssd_txn_t *shared_discovery_txn;
+#endif // SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+wakeup_t *discovery_restart_wakeup;
 
 #if SRP_FEATURE_DYNAMIC_CONFIGURATION
 static CFStringRef sc_dynamic_store_key_host_name;
@@ -283,6 +296,11 @@ bool tls_fail = false; // Command line argument, for testing.
 #define BUSY_RETRY_DELAY_MS (5 * 60 * 1000) // Five minutes.
 #define MAX_DSO_CONNECTIONS 15 // Should be enough for a typical home network, assuming more hosts -> more BRs
 
+// RFC8766 says for us to clamp the TTL on proxied mDNS records to 10s. In practice this appears to be much
+// too short, because if the DNSSD server (e.g. mDNSResponder) is doing an LLQ, this results in a refresh
+// interval of <10s, which is kind of painful.
+#define RFC8766_TTL_CLAMP 300
+
 #define VALIDATE_TRACKER_CONNECTION_NON_NULL()                      \
     do {                                                            \
         if (query->tracker == NULL) {                               \
@@ -306,6 +324,8 @@ find_served_domain(const char *const NONNULL domain);
 static bool
 string_ends_with(const char *const NONNULL str, const char *const NONNULL suffix);
 
+static void dp_query_towire_reset(dnssd_query_t *query);
+
 #if SRP_FEATURE_DYNAMIC_CONFIGURATION
 static served_domain_t *NONNULL
 add_new_served_domain_with_interface(const char *const NONNULL name,
@@ -320,20 +340,212 @@ dnssd_hardwired_setup_dns_push_for_domain(served_domain_t *const NONNULL served_
 #endif // SRP_FEATURE_DYNAMIC_CONFIGURATION
 
 static bool
-start_timer_to_advertise(dnssd_proxy_advertisements_t *const NONNULL context,
+start_timer_to_advertise(dnssd_proxy_advertisements_t *NONNULL context,
     const char *const NULLABLE domain_to_advertise, const uint32_t interval);
 
 static bool
 interface_process_addr_change(dp_interface_t *const NONNULL interface, const addr_t *const NONNULL address,
                               const addr_t *const NONNULL mask, const enum interface_address_change event_type);
 
-// Functions
+static void dns_question_callback(DNSServiceRef UNUSED sdRef, DNSServiceFlags flags, uint32_t UNUSED interfaceIndex,
+                                  DNSServiceErrorType errorCode, const char *fullname, uint16_t rrtype,
+                                  uint16_t rrclass, uint16_t rdlen, const void *rdata, uint32_t ttl, void *context);
+static void dns_push_callback(void *context, void *event_context, dso_state_t *dso, dso_event_type_t eventType);
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+static void dp_setup_shared_discovery_txn(void);
+#endif
+static void dp_handle_server_disconnect(void *UNUSED context, int status);
+static void question_finalize(question_t *question);
 
 // For debugging
 static wakeup_t *connection_dropper;
 extern dso_state_t *dso_connections;
 static void dp_drop_connections(void *UNUSED context);
-static void dns_push_callback(void *context, void *event_context, dso_state_t *dso, dso_event_type_t eventType);
+
+static void
+dp_question_context_release(void *context)
+{
+    question_t *question = context;
+    RELEASE_HERE(question, question);
+}
+
+static DNSServiceErrorType
+dp_start_question(question_t *question, bool dns64)
+{
+    DNSServiceErrorType err;
+    DNSServiceRef sdref;
+    size_t len;
+    char name[DNS_MAX_NAME_SIZE + 1];
+    char *np;
+
+    // If a query has a served domain, query->question->name is the subdomain of the served domain that is
+    // being queried; otherwise query->question->name is the whole name.
+    if (question->served_domain != NULL) {
+        len = strlen(question->name);
+        if (question->served_domain->interface != NULL) {
+            if (len + sizeof local_suffix > sizeof name) {
+                ERROR("question name %s is too long for .local.", name);
+                return kDNSServiceErr_BadParam;
+            }
+            memcpy(name, question->name, len);
+            memcpy(&name[len], local_suffix, sizeof local_suffix);
+        } else {
+            size_t dlen = strlen(question->served_domain->domain_ld) + 1;
+            if (len + dlen > sizeof name) {
+                ERROR("question name %s is too long for %s.", name, question->served_domain->domain);
+                return kDNSServiceErr_BadParam;
+            }
+            memcpy(name, question->name, len);
+            memcpy(&name[len], question->served_domain->domain_ld, dlen);
+        }
+        np = name;
+    } else {
+        np = question->name;
+    }
+
+    int shared_connection_flag = 0;
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+    dp_setup_shared_discovery_txn();
+    if (shared_discovery_txn != NULL) {
+        sdref = shared_discovery_txn->sdref;
+        shared_connection_flag = kDNSServiceFlagsShareConnection;
+    }
+#endif // SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+
+#if SRP_FEATURE_NAT64
+    const DNSServiceAttribute *attr = NULL;
+    if (dns64 && (question->type == dns_rrtype_aaaa) && (question->qclass == dns_qclass_in)) {
+        attr = &kDNSServiceAttributeAAAAFallback;
+    }
+    err = DNSServiceQueryRecordWithAttribute(&sdref, question->serviceFlags | shared_connection_flag,
+                                             question->interface_index, np, question->type,
+                                             question->qclass, attr, dns_question_callback, question);
+#else
+    (void)dns64;
+    err = DNSServiceQueryRecord(&sdref, question->serviceFlags | shared_connection_flag, question->interface_index, np,
+                                question->type, question->qclass, dns_question_callback, question);
+#endif
+    if (err != kDNSServiceErr_NoError) {
+        ERROR("DNSServiceQueryRecord failed for '%s': %d", np, err);
+    } else {
+        INFO("txn %p new sdref %p", question->txn, sdref);
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTION
+        question->txn = ioloop_dnssd_txn_add_subordinate(sdref, dp_question_context_release, NULL);
+#else
+        question->txn = ioloop_dnssd_txn_add(sdref, question, dp_question_context_release, dp_handle_server_disconnect);
+#endif // SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+        RETAIN_HERE(question, question); // For the callback
+#if SRP_FEATURE_NAT64
+        INFO("DNSServiceQueryRecordWithAttribute started for '" PRI_S_SRP "': %d", np, err);
+#else
+        INFO("DNSServiceQueryRecord started for '" PRI_S_SRP "': %d", np, err);
+#endif // SRP_FEATURE_NAT64
+    }
+    return err;
+}
+
+static bool
+dp_iterate_questions_on_list(question_t *list, bool (*callback)(question_t *question, void *context), void *context)
+{
+    for (question_t *question = list; question; question = question->next) {
+        if (callback(question, context)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+dp_iterate_questions(bool (*callback)(question_t *question, void *context), void *context)
+{
+    if (dp_iterate_questions_on_list(questions_without_domain, callback, context)) {
+        return true;
+    }
+
+    for (served_domain_t *domain = served_domains; domain != NULL; domain = domain->next) {
+        if (dp_iterate_questions_on_list(domain->questions, callback, context)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+dp_restart_question(question_t *question, void *context)
+{
+    bool dns64 = *((bool *)context);
+    if (question->txn == NULL) {
+        dp_start_question(question, dns64);
+    }
+    return false;
+}
+
+static void
+dp_restart_all_questions(void *UNUSED context)
+{
+    bool dns64 = false;
+#if SRP_FEATURE_NAT64
+    if (srp_servers->srp_nat64_enabled) {
+        dns64 = nat64_is_active();
+    }
+#endif
+    dp_iterate_questions(dp_restart_question, &dns64);
+}
+
+static bool
+dp_void_question(question_t *question, void *UNUSED context)
+{
+    if (question->txn != NULL) {
+        INFO("question->txn = %p", question->txn);
+        question->txn->sdref = NULL;
+        ioloop_dnssd_txn_release(question->txn);
+        question->txn = NULL;
+    }
+    return false;
+}
+
+// NULLs out all outstanding questions (after an mDNSResponder crash). These pointers are rendered invalid when the
+// parent transaction is deallocated, so this should not result in any leaks.
+static void
+dp_void_all_questions(void)
+{
+    dp_iterate_questions(dp_void_question, NULL);
+}
+
+static void
+dp_handle_server_disconnect(void *UNUSED context, int status)
+{
+    INFO("status %d", status);
+    dp_void_all_questions();
+    if (discovery_restart_wakeup == NULL) {
+        discovery_restart_wakeup = ioloop_wakeup_create();
+    }
+    if (discovery_restart_wakeup != NULL) {
+        // Try to reconnect to mDNSResponder after a second.
+        ioloop_add_wake_event(discovery_restart_wakeup, NULL, dp_restart_all_questions, NULL, 1000);
+    }
+}
+
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+static void
+dp_setup_shared_discovery_txn(void)
+{
+    if (shared_discovery_txn == NULL) {
+        DNSServiceRef sdref;
+        int err = DNSServiceCreateConnection(&sdref);
+        if (err != kDNSServiceErr_NoError) {
+            return false;
+        }
+        shared_discovery_txn = ioloop_dnssd_txn_add(sdref, NULL, NULL, dp_handle_server_disconnect);
+        if (shared_discovery_txn == NULL) {
+            ERROR("unable to create shared connection for registration.");
+            DNSServiceRefDeallocate(sdref);
+            return false;
+        }
+        INFO("shared_discovery_txn = %p  sdref = %p", shared_discovery_txn, sdref);
+    }
+}
+#endif // SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
 
 void
 dp_start_dropping(void)
@@ -379,7 +591,6 @@ dp_tracker_finalize(dp_tracker_t *tracker)
     free(tracker);
 }
 
-// The answer_finalize function frees name, answer data structure and rdata
 static void
 answer_free(answer_t *answer)
 {
@@ -389,21 +600,12 @@ answer_free(answer_t *answer)
     }
 }
 
-static void
-question_free(question_t *question)
-{
-    if (question != NULL) {
-        free(question->name);
-        free(question);
-    }
-}
-
 // The finalize function will deallocate answers associated with the question,
 // remove question from the question list and deallocate the question.
 static void
-dp_question_finalize(question_t *question)
+question_finalize(question_t *question)
 {
-    INFO("dp_question_finalize on type %d class %d " PRI_S_SRP,
+    INFO("type %d class %d " PRI_S_SRP,
          question->type, question->qclass, question->name);
     // De-allocate answers
     answer_t *answer = question->answers;
@@ -414,12 +616,21 @@ dp_question_finalize(question_t *question)
         answer = next;
     }
     question->answers = NULL;
+    free(question->name);
+    free(question);
+}
+
+static void
+dp_question_cancel(question_t *question)
+{
     if (question->txn != NULL) {
+        INFO("question->txn = %p sdref=%p", question->txn, question->txn->sdref);
         ioloop_dnssd_txn_cancel(question->txn);
         ioloop_dnssd_txn_release(question->txn);
         question->txn = NULL;
     }
-    // De-allocate question and de-link from cache
+
+    // Remove the question from its list.
     question_t **questions, *q_cur;
     if (question->served_domain != NULL) {
         questions = &question->served_domain->questions;
@@ -430,33 +641,12 @@ dp_question_finalize(question_t *question)
         q_cur = *questions;
         if (q_cur == question) {
             *questions = q_cur->next;
-            question_free(q_cur);
             break;
         } else {
             questions = &q_cur->next;
         }
     }
-}
-
-// De-link the query from the question cache
-// the query will be freed in the caller
-static void
-dp_question_cache_remove_query(dnssd_query_t *query)
-{
-    question_t *question = query->question_asked;
-    dnssd_query_t **pptr = &(question->queries);
-    dnssd_query_t *cquery;
-    while (*pptr != NULL) {
-        cquery = *pptr;
-        if (cquery == query) {
-            *pptr = cquery->question_next;
-            RELEASE_HERE(query->question_asked, dp_question_finalize);
-            query->question_asked = NULL;
-            return;
-        } else {
-            pptr = &cquery->question_next;
-        }
-    }
+    RELEASE_HERE(question, question); // Release from the list.
 }
 
 // Called when the last reference on the query has been released.
@@ -464,36 +654,81 @@ static void
 dnssd_query_finalize(void *context)
 {
     dnssd_query_t *query = context;
-    INFO("dnssd_query_finalize on " PRI_S_SRP PUB_S_SRP,
-         query->question_asked == NULL ? "<null>" : query->question_asked->name,
-         query->question_asked == NULL ? "" : ((query->question_asked->served_domain
-         ? (query->question_asked->served_domain->interface ? DOT_LOCAL : query->question_asked->served_domain->domain_ld)
-         : "")));
     if (query->tracker != NULL) {
-        RELEASE_HERE(query->tracker, dp_tracker_finalize);
+        RELEASE_HERE(query->tracker, dp_tracker);
+        query->tracker = NULL;
     }
-    if (query->question != NULL) {
-        ioloop_message_release(query->question);
+    if (query->message != NULL) {
+        ioloop_message_release(query->message);
+        query->message = NULL;
     }
     if (query->wakeup != NULL) {
         ioloop_wakeup_release(query->wakeup);
+        query->wakeup = NULL;
     }
     if (query->response != NULL) {
         free(query->response);
+        query->response = NULL;
+    }
+    if (query->response_msg != NULL) {
+        dns_message_free(query->response_msg);
+        query->response_msg = NULL;
+    }
+    if (query->question != NULL) {
+        RELEASE_HERE(query->question, question);
+        query->question = NULL;
+    }
+    free(query);
+    dp_num_outstanding_queries--;
+}
+
+// Remove any finished queries from the question cache query list.
+static void
+dp_question_cache_remove_queries(question_t *question)
+{
+    // Convenience
+    if (question == NULL) {
+        return;
     }
 
-    // remove query from the list of queries that have asked this question
-    dp_question_cache_remove_query(query);
-    query->question_asked = NULL;
-
-    free(query);
+    dnssd_query_t **pptr = &(question->queries);
+    RETAIN_HERE(question, question);
+    if (question->queries != NULL) {
+        while (*pptr != NULL) {
+            dnssd_query_t *cquery = *pptr;
+            if (cquery->satisfied) {
+                *pptr = cquery->question_next;
+                RELEASE_HERE(cquery, dnssd_query);
+            } else {
+                pptr = &cquery->question_next;
+            }
+        }
+        if (question->queries == NULL) {
+            dp_question_cancel(question);
+        }
+    }
+    RELEASE_HERE(question, question);
 }
 
 static void
 dp_tracker_context_release(void *context)
 {
     dp_tracker_t *tracker = context;
-    RELEASE_HERE(tracker, dp_tracker_finalize);
+    RELEASE_HERE(tracker, dp_tracker);
+}
+
+static void
+dp_tracker_went_away(dp_tracker_t *tracker)
+{
+    // Reduce the number of outstanding connections (should never go below zero).
+    if (tracker->session_type == dp_tracker_session_push) {
+        if (--num_push_sessions < 0) {
+            FAULT("DNS Push connection count went negative");
+            num_push_sessions = 0;
+        } else {
+            INFO("dso connection count dropped: %d", num_push_sessions);
+        }
+    }
 }
 
 static void
@@ -536,51 +771,73 @@ dp_tracker_idle_after(dp_tracker_t *tracker, int seconds, dnssd_query_t *query)
     }
 }
 
+static bool
+dp_same_message(message_t *a, message_t *b)
+{
+    // Code commented out below catches retransmissions, but right now this won't work and we'll leak queries,
+    // so saving it for rdar://111808637 (dnssd-proxy is way too complicated)
+    if (a == b /*  || (a != NULL && b != NULL && a->wire.id == b->wire.id) */ ) {
+        return true;
+    }
+    return false;
+}
+
 // Called at any time (prior to release!) to cancel a query.
 static void
 dnssd_query_cancel(dnssd_query_t *query)
 {
-    if (query->wakeup != NULL) {
-        ioloop_wakeup_release(query->wakeup);
-        query->wakeup = NULL;
-    }
+    INFO(PRI_S_SRP PUB_S_SRP,
+         query->question == NULL ? "<null>" : query->question->name,
+         query->question == NULL ? "" : ((query->question->served_domain
+         ? (query->question->served_domain->interface ? DOT_LOCAL : query->question->served_domain->domain_ld)
+         : "")));
+    // Retain the query for the duration of dnssd_query_cancel so that it doesn't get released while we are working on it.
+    RETAIN_HERE(query, dnssd_query);
     if (query->tracker != NULL) {
         dp_tracker_t *tracker = query->tracker;
 
-        // If we have a connection, and we've become idle, we need to set an idle timer and disconnect when
-        // it goes off. If tracker->dso is not null, the DSO engine handles idle timeouts. If tracker is
-        // tracking more queries than this one, we don't need an idle timeout, because we're not
-        // idle. Otherwise, set up an idle timeout. This doesn't apply to POSIX udp listeners.
-        dp_tracker_idle_after(tracker, 15, query);
+        // Retain the tracker so it doesn't get released while we are working on it.
+        RETAIN_HERE(tracker, dp_tracker);
 
         if (query->dso == NULL) {
-            dnssd_query_t **qp = &tracker->dns_queries;
-            bool matched = false;
-            while (*qp != NULL) {
-                if (*qp == query) {
-                    *qp = query->next;
-                    matched = true;
-                    break;
-                } else {
-                    qp = &(*qp)->next;
+            bool unsatisfied = false;
+            for (dnssd_query_t *list_query = tracker->dns_queries; list_query != NULL; list_query = list_query->next) {
+                if (dp_same_message(query->message, list_query->message)) {
+                    if (!query->satisfied) {
+                        unsatisfied = true;
+                    }
                 }
             }
-            // Release this query's reference to the tracker
-            RELEASE_HERE(tracker, dp_tracker_finalize);
-            query->tracker = NULL;
 
-            if (matched) {
-                // The tracker was holding a reference to the query.
-                RELEASE_HERE(query, dnssd_query_finalize);
+            if (!unsatisfied) {
+                // Scan the list freeing all queries relating to the message attached to the query that's been canceled.
+                // A UDP message will never have any other queries, but TCP connections can have multiple messages.
+                for (dnssd_query_t **qp = &tracker->dns_queries; *qp != NULL; ) {
+                    dnssd_query_t *list_query = *qp;
+
+                    // Release the current query either if it's the query that's being canceled, or this is a UDP message.
+                    if (dp_same_message(query->message, list_query->message)) {
+                        *qp = list_query->next;
+
+                        // This might release the query, but we know that the tracker holds a reference to it, so
+                        // we don't need another reference to it.
+                        if (list_query->wakeup != NULL) {
+                            ioloop_wakeup_release(list_query->wakeup);
+                            list_query->wakeup = NULL;
+                        }
+
+                        // Release this query's reference to the tracker
+                        RELEASE_HERE(tracker, dp_tracker);
+                        list_query->tracker = NULL;
+
+                        // The tracker was holding a reference to the query.
+                        RELEASE_HERE(list_query, dnssd_query);
+                    } else {
+                        qp = &list_query->next;
+                    }
+                }
             }
-            // Query is now potentially invalid.
         } else {
-            // Query is holding a reference to the tracker, but the tracker isn't holding a reference to the
-            // query--the activity is. So dropping the activity may or may not finalize the query, but I think
-            // in practice will always finalize it. Just in case, though, null out the tracker now, since we
-            // can't safely null it out later.
-            query->tracker = NULL;
-
             // For DNS Push queries, drop the activity, which will release the query.
             if (query->activity != NULL && query->dso != NULL) {
                 dso_activity_t *activity = query->activity;
@@ -588,12 +845,35 @@ dnssd_query_cancel(dnssd_query_t *query)
                 query->activity = NULL;
                 dso_drop_activity(dso, activity);
             }
-            // Now release the reference the query had on the tracker, which may or may not finalize the tracker,
-            // depending on whether the connection is still alive.
-            RELEASE_HERE(tracker, dp_tracker_finalize);
+            // Now release the reference the query had on the tracker.
+            query->tracker = NULL;
+            RELEASE_HERE(tracker, dp_tracker);
+        }
+
+        // For TCP connections, wait for it to become idle before closing.
+        if (tracker->connection != NULL && tracker->dns_queries == NULL) {
+            if (tracker->connection->tcp_stream) {
+                dp_tracker_idle_after(tracker, 15, query);
+            } else {
+#if UDP_LISTENER_USES_CONNECTION_GROUPS
+                ioloop_comm_cancel(tracker->connection);
+#else
+                ioloop_comm_release(tracker->connection);
+                tracker->connection = NULL;
+#endif
+            }
+        }
+
+        // Release the reference we retained on entry.
+        RELEASE_HERE(tracker, dp_tracker);
+    } else {
+        if (query->wakeup != NULL) {
+            ioloop_wakeup_release(query->wakeup);
+            query->wakeup = NULL;
         }
     }
-    // We can't touch query or tracker here, just in case.
+    query->satisfied = true;
+    RELEASE_HERE(query, dnssd_query);
 }
 
 static void
@@ -609,7 +889,7 @@ dp_query_track(dp_tracker_t *tracker, dnssd_query_t *query)
         qp = &(*qp)->next;
     }
     *qp = query;
-    RETAIN_HERE(query);
+    RETAIN_HERE(query, dnssd_query);
 }
 
 static void
@@ -635,13 +915,8 @@ dp_tracker_disconnected(comm_t *UNUSED connection, void *context, int UNUSED err
             activity = tracker->dso->activities;
         }
         dso_state_cancel(tracker->dso);
-        // Reduce the number of outstanding connections (should never go below zero).
-        if (--num_dso_connections < 0) {
-            FAULT("dso connection count went negative");
-            num_dso_connections = 0;
-        } else {
-            INFO("dso connection count dropped: %d", num_dso_connections);
-        }
+        dp_tracker_went_away(tracker);
+        tracker->session_type = dp_tracker_session_none;
         tracker->dso = NULL;
     }
 
@@ -657,30 +932,7 @@ dp_tracker_disconnected(comm_t *UNUSED connection, void *context, int UNUSED err
     while (*qp != NULL) {
         query = *qp;
         *qp = query->next;
-        RELEASE_HERE(query, dnssd_query_finalize);
-    }
-}
-
-static void
-dnssd_question_close_callback(void *context, int status)
-{
-    question_t *question = context;
-
-    ERROR("DNSServiceProcessResult on %s%s returned %d",
-          question->name, (question->served_domain != NULL
-          ? (question->served_domain->interface != NULL ? DOT_LOCAL : question->served_domain->domain_ld)
-          : ""), status);
-    dnssd_query_t *next, *query = question->queries;
-    while (query != NULL) {
-        next = query->question_next;
-        dnssd_query_cancel(query);
-        query = next;
-    }
-
-    if (question->txn != NULL) {
-        ioloop_dnssd_txn_cancel(question->txn);
-        ioloop_dnssd_txn_release(question->txn);
-        question->txn = NULL;
+        RELEASE_HERE(query, dnssd_query);
     }
 }
 
@@ -695,10 +947,12 @@ dns_push_cancel(dso_activity_t *activity)
     // it, so we mustn't call back in to dnssd_query_cancel.
     if (query->activity != NULL) {
         query->activity = NULL;
+        query->satisfied = true;
+        dp_question_cache_remove_queries(query->question);
         dnssd_query_cancel(query);
     }
     // The activity held a reference to the query.
-    RELEASE_HERE(query, dnssd_query_finalize);
+    RELEASE_HERE(query, dnssd_query);
 }
 
 static void
@@ -789,7 +1043,7 @@ dp_query_add_data_to_response(dnssd_query_t *query, const char *fullname, uint16
     // Only do the translation if:
     // 1. We serve the domain.
     // 2. The response we will add does not come from our hardwired response set.
-    const bool translate = (query->question_asked->served_domain != NULL) && (!hardwired_response);
+    const bool translate = (query->question->served_domain != NULL) && (!hardwired_response);
 
     if (rdlen == 0) {
         INFO("Eliding zero-length response for " PRI_S_SRP " %d %d", fullname, rrtype, rrclass);
@@ -834,15 +1088,15 @@ dp_query_add_data_to_response(dnssd_query_t *query, const char *fullname, uint16
     INFO("survived for rrtype %d rdlen %d", rrtype, rdlen);
 
     // Rewrite the domain if it's .local.
-    if (query->question_asked->served_domain != NULL) {
+    if (query->question->served_domain != NULL) {
         TOWIRE_CHECK("concatenate_name_to_wire", towire,
-                     dns_concatenate_name_to_wire(towire, NULL, query->question_asked->name, query->question_asked->served_domain->domain));
+                     dns_concatenate_name_to_wire(towire, NULL, query->question->name, query->question->served_domain->domain));
         INFO(PUB_S_SRP " answer:  type %02d class %02d " PRI_S_SRP "." PRI_S_SRP, query->dso != NULL ? "PUSH" : "DNS ",
-             rrtype, rrclass, query->question_asked->name, query->question_asked->served_domain->domain);
+             rrtype, rrclass, query->question->name, query->question->served_domain->domain);
     } else {
-        TOWIRE_CHECK("compress_name_to_wire", towire, dns_concatenate_name_to_wire(towire, NULL, NULL, query->question_asked->name));
+        TOWIRE_CHECK("compress_name_to_wire", towire, dns_concatenate_name_to_wire(towire, NULL, NULL, query->question->name));
         INFO(PUB_S_SRP " answer:  type %02d class %02d " PRI_S_SRP " (p)",
-             query->dso != NULL ? "push" : " dns", rrtype, rrclass, query->question_asked->name);
+             query->dso != NULL ? "push" : " dns", rrtype, rrclass, query->question->name);
     }
     TOWIRE_CHECK("rrtype", towire, dns_u16_to_wire(towire, rrtype));
     TOWIRE_CHECK("rrclass", towire, dns_u16_to_wire(towire, rrclass));
@@ -891,8 +1145,8 @@ dp_query_add_data_to_response(dnssd_query_t *query, const char *fullname, uint16
             truncate_local(name);
             dns_name_print(name, pbuf, sizeof pbuf);
             TOWIRE_CHECK("concatenate_name_to_wire 2", towire,
-                         dns_concatenate_name_to_wire(towire, name, NULL, query->question_asked->served_domain->domain));
-            INFO("translating " PRI_S_SRP " to " PRI_S_SRP " . " PRI_S_SRP, rbuf, pbuf, query->question_asked->served_domain->domain);
+                         dns_concatenate_name_to_wire(towire, name, NULL, query->question->served_domain->domain));
+            INFO("translating " PRI_S_SRP " to " PRI_S_SRP " . " PRI_S_SRP, rbuf, pbuf, query->question->served_domain->domain);
         } else {
             TOWIRE_CHECK("concatenate_name_to_wire 2", towire,
                          dns_concatenate_name_to_wire(towire, name, NULL, NULL));
@@ -1777,7 +2031,180 @@ embiggen(dnssd_query_t *query)
 }
 
 static void
-dp_query_send_dns_response(dnssd_query_t *query)
+dp_move_rrs(dns_rr_t *first_section, unsigned *p_first_count, dns_rr_t *source_section, unsigned source_count, unsigned count, bool rdata_present)
+{
+    unsigned first_count = *p_first_count;
+
+    // Copy the rrs into the combined section.
+    for (unsigned i = 0; i < source_count; i++) {
+        // Skip this RR if there's already another one just like it in the section (most likely to happen
+        // with authority records.
+        bool duplicate = false;
+        for (unsigned j = 0; j < first_count; j++) {
+            if (dns_rrs_equal(&first_section[j], &source_section[i], rdata_present)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+
+        // Only if there is space...
+        if (first_count < count) {
+            first_section[first_count] = source_section[i];
+            first_count++;
+            source_section[i].type = dns_invalid_rr;
+        } else {
+            ERROR("first_count %d unexpectedly equal to count %d with i = %d", first_count, count, i);
+        }
+    }
+    *p_first_count = first_count;
+}
+
+static dnssd_query_t *
+dp_dns_queries_finished(dnssd_query_t *answered_query)
+{
+    dns_message_t *first_message = NULL;
+    unsigned qdcount = 0, ancount = 0, nscount = 0, arcount = 0;
+    unsigned first_qdcount, first_ancount, first_nscount, first_arcount;
+    dnssd_query_t *first_query = NULL;
+    dp_tracker_t *tracker = answered_query->tracker;
+
+    // response_query will be set to NULL if we don't want anything sent yet, to query if query is the
+    // only query or if there's an error in this function, or to the query that holds the aggregate response
+    // otherwise.
+    dnssd_query_t *response_query = answered_query;
+    const char *name = answered_query->question != NULL ? answered_query->question->name : "(null)";
+
+    require_action_quiet(tracker != NULL, exit,
+                         dns_rcode_set(answered_query->response, dns_rcode_servfail);
+                         ERROR("NULL tracker on " PRI_S_SRP, name));
+    require_action_quiet(tracker->dns_queries != NULL, exit,
+                         dns_rcode_set(answered_query->response, dns_rcode_servfail);
+                         ERROR("NULL tracker->dns_queries on " PRI_S_SRP, name));
+
+    // The usual case, there's only one question in the DNS message, so we can just
+    // return the answer now.
+    if (answered_query->num_questions == 1) {
+        goto exit;
+    }
+
+    // Otherwise, we have more than one query, so see if any remain unsatisfied.
+    int satisfied = 0;
+    for (dnssd_query_t *match = tracker->dns_queries; match != NULL; match = match->next) {
+        // It's possible we could creep in here without actually generating one of the responses,
+        // in which case we should definitely fail at this point.
+        require_action_quiet(match->response != NULL,
+                             exit,
+                             ERROR("null response on match query");
+                             dns_rcode_set(response_query->response, dns_rcode_servfail));
+        if (match->message == answered_query->message) {
+            if (!match->satisfied) {
+                response_query = NULL; // More answers coming.
+                goto exit;
+            }
+            satisfied++;
+        }
+    }
+    if (satisfied != answered_query->num_questions) {
+        response_query = NULL;
+        goto exit;
+    }
+    // All queries have been satisfied.
+
+    // Parse all of the messages (this is gross--later on we should just never convert to wire format until
+    // we get here.
+    for (dnssd_query_t *source = tracker->dns_queries; source != NULL; source = source->next) {
+        if (source->message == answered_query->message) {
+            // This should never fail, but...
+            require_action_quiet(dns_wire_parse(&source->response_msg, source->response,
+                                                (unsigned)(source->towire.p - source->response->data) + DNS_HEADER_SIZE, false),
+                                 exit,
+                                 dns_rcode_set(response_query->response, dns_rcode_servfail));
+
+            if (first_query == NULL) {
+                first_query = source;
+                first_message = first_query->response_msg;
+                first_qdcount = first_message->qdcount;
+                first_ancount = first_message->ancount;
+                first_nscount = first_message->nscount;
+                first_arcount = first_message->arcount;
+            }
+            qdcount += source->response_msg->qdcount;
+            ancount += source->response_msg->ancount;
+            nscount += source->response_msg->nscount;
+            arcount += source->response_msg->arcount;
+        }
+    }
+
+    // Copy records from the response.
+    for (int i = 0; i < 4; i++) {
+        dns_rr_t *section, **first_section = NULL, **source_section = NULL;
+        unsigned section_count = 0, source_count = 0, *first_count = NULL;
+
+        // Start with the second message, since the first is already populated.
+        for (dnssd_query_t *source = tracker->dns_queries;
+             source != NULL && answered_query->message == source->message ; source = source->next)
+        {
+#define SECTION_CASE(index, counter_name, section_name)                   \
+            case index:                                                   \
+                first_section = &first_message->section_name;             \
+                source_section = &source->response_msg->section_name;     \
+                section_count = counter_name;                             \
+                source_count = source->response_msg->counter_name;        \
+                first_count = &first_message->counter_name;               \
+                break
+
+            switch (i) {
+                    SECTION_CASE(0, qdcount, questions);
+                    SECTION_CASE(1, ancount, answers);
+                    SECTION_CASE(2, nscount, authority);
+                    SECTION_CASE(3, arcount, additional);
+            }
+
+            // If this is the first matching query, expand the current section to be able to fit all of the data we're
+            // copying in, and then copy the data from the first section.
+            if (first_section == source_section) {
+                section = calloc(section_count, sizeof(*section));
+                require_action_quiet(section != NULL, exit,
+                                     dns_rcode_set(answered_query->response, dns_rcode_servfail);
+                                     ERROR("Unable to allocate memory for query response section on " PRI_S_SRP, name));
+                memcpy(section, *first_section, source_count * sizeof(*section));
+                memset(*first_section, 0, source_count * sizeof(*section)); // NULL out any pointers
+                free(*first_section);
+                *first_section = section;
+            } else {
+                dp_move_rrs(*first_section, first_count, *source_section, source_count, section_count, i != 0);
+            }
+        }
+    }
+
+    // Use the response in the first query to turn the answer to wire format.
+redo_message:
+    dp_query_towire_reset(first_query);
+    dns_message_rrs_to_wire(&first_query->towire, first_query->response_msg);
+    if (first_query->towire.truncated) {
+        if (first_query->tracker->connection->tcp_stream) {
+            if (embiggen(first_query)) {
+                first_query->towire.error = false;
+                first_query->towire.truncated = false;
+                goto redo_message;
+            }
+        }
+    }
+    first_query->response->qdcount = htons(first_message->qdcount);
+    first_query->response->ancount = htons(first_message->ancount);
+    first_query->response->nscount = htons(first_message->nscount);
+    first_query->response->arcount = htons(first_message->arcount);
+    response_query = first_query;
+
+exit:
+    return response_query;
+}
+
+static void
+dp_query_send_dns_response(dnssd_query_t *query, const char *context_description)
 {
     struct iovec iov;
     dns_towire_state_t *towire = &query->towire;
@@ -1786,11 +2213,15 @@ dp_query_send_dns_response(dnssd_query_t *query)
     uint16_t tc = towire->truncated ? dns_flags_tc : 0;
     uint16_t bitfield = ntohs(query->response->bitfield);
     uint16_t mask = 0;
+    int rcode = dns_rcode_get(query->response);
+
+    // Mark this query as complete.
+    query->satisfied = true;
 
     VALIDATE_TRACKER_CONNECTION_NON_NULL();
 
     // Send an SOA record if it's a .local query.
-    if (query->question_asked->served_domain != NULL && query->question_asked->served_domain->interface != NULL && !towire->truncated) {
+    if (query->question->served_domain != NULL && query->question->served_domain->interface != NULL && !towire->truncated) {
     redo:
         // DNSSD Hybrid, Section 6.1.
         TOWIRE_CHECK("&query->enclosing_domain_pointer 1", towire,
@@ -1843,63 +2274,137 @@ dp_query_send_dns_response(dnssd_query_t *query)
         bitfield = bitfield | dns_flags_ra | tc;
         bitfield = bitfield & mask;
     }
+
+    INFO("[QID %x] query %p ->p %p ->lim %p len %zd rcode %d " PUB_S_SRP, ntohs(query->message->wire.id), query, query->towire.p,
+         &query->towire.message->data[0], query->towire.p - &query->towire.message->data[0],
+         dns_rcode_get(query->response), context_description);
+
+    // In the case that we get an error looking something up, we return that error immediately on the query that failed,
+    // rather than trying to assemble a complete answer. In returning the error, we cancel any outstanding queries.
+    dnssd_query_t *send_query;
+
+    if (!towire->error && rcode == dns_rcode_noerror) {
+        // It's possible that we got a query with qdcount > 1. In this case, we are going to marshal all of the
+        // answers from the responses we've constructed into a new response and send it after all of the queries
+        // have responses.  So at this point, if we don't have all the responses yet, there's no point in adding
+        // the edns0 option.  If we do, dp_dns_update_queries_finished will marshal all the answers into one
+        // message and after that we can add the edns0 option. If there's only one query, this is a no-op.
+        send_query = dp_dns_queries_finished(query);
+        if (send_query == NULL) {
+#ifdef DNSSD_PROXY_DUMP_TRACKER_QUERIES
+            if (query->tracker == NULL) {
+                ERROR("query->tracker is NULL");
+            } else {
+                char logbuf[200];
+                char *lbp = logbuf;
+                char *lbend = logbuf + sizeof(logbuf);
+                char *lbrestart;
+                bool print_last = true;
+                if (query->tracker->connection != NULL && query->tracker->connection->tcp_stream) {
+                    int len = snprintf(logbuf, sizeof(logbuf), "TCP %p %d: ", query, query->num_questions);
+                    lbrestart = logbuf + len;
+                } else {
+                    int len = snprintf(logbuf, sizeof(logbuf), "UDP %p %d: ", query, query->num_questions);
+                    lbrestart = logbuf + len;
+                }
+                lbp = logbuf + strlen(logbuf);
+                for (dnssd_query_t *list_query = query->tracker->dns_queries;
+                     list_query != NULL; list_query = list_query->next)
+                {
+                    if (list_query->message != query->message) {
+                        continue;
+                    }
+                    int len = snprintf(lbp, lbend - lbp, "%p%s ", list_query, list_query->satisfied ? "+" : "=");
+                    if (lbp + len < lbend) {
+                        lbp += len;
+                        print_last = true;
+                    } else {
+                        *lbp = 0;
+                        INFO(PUB_S_SRP, logbuf);
+                        lbp = lbrestart;
+                        *lbp = 0;
+                        print_last = false;
+                    }
+                }
+                if (print_last) {
+                    INFO(PUB_S_SRP, logbuf);
+                }
+            }
+#endif // DNSSD_PROXY_DUMP_TRACKER_QUERIES
+            return;
+        }
+        if (dns_rcode_get(send_query->response) != dns_rcode_noerror) {
+            rcode = dns_rcode_get(send_query->response);
+        }
+
+        towire = &send_query->towire;
+        revert = towire->p;
+    } else {
+        send_query = query;
+    }
+
     // Not authentic, checking not disabled.
     mask = ~(dns_flags_rd | dns_flags_ad | dns_flags_cd);
     bitfield = bitfield & mask;
-    query->response->bitfield = htons(bitfield);
+    send_query->response->bitfield = htons(bitfield);
 
     // This is a response
-    dns_qr_set(query->response, dns_qr_response);
+    dns_qr_set(send_query->response, dns_qr_response);
 
+    // If we got a failure from dp_dns_queries_finished(), skip adding the opt RR and checking for a towire error.
+    if (rcode == dns_rcode_noerror) {
     // Send an OPT RR if we got one
     // XXX reserve space so we can always send an OPT RR?
-    if (query->is_edns0) {
-    redo_edns0:
-        TOWIRE_CHECK("Root label", towire, dns_u8_to_wire(towire, 0));     // Root label
-        TOWIRE_CHECK("dns_rrtype_opt", towire, dns_u16_to_wire(towire, dns_rrtype_opt));
-        TOWIRE_CHECK("UDP Payload size", towire, dns_u16_to_wire(towire, 4096)); // UDP Payload size
-        TOWIRE_CHECK("extended-rcode", towire, dns_u8_to_wire(towire, 0));     // extended-rcode
-        TOWIRE_CHECK("EDNS version 0", towire, dns_u8_to_wire(towire, 0));     // EDNS version 0
-        TOWIRE_CHECK("No extended flags", towire, dns_u16_to_wire(towire, 0));    // No extended flags
-        TOWIRE_CHECK("No payload", towire, dns_u16_to_wire(towire, 0));    // No payload
-        if (towire->truncated) {
-            query->towire.p = revert;
-            if (query->tracker->connection->tcp_stream) {
-                if (embiggen(query)) {
-                    query->towire.error = false;
-                    query->towire.truncated = false;
-                    goto redo_edns0;
+        if (send_query->is_edns0) {
+        redo_edns0:
+            TOWIRE_CHECK("Root label", towire, dns_u8_to_wire(towire, 0));     // Root label
+            TOWIRE_CHECK("dns_rrtype_opt", towire, dns_u16_to_wire(towire, dns_rrtype_opt));
+            TOWIRE_CHECK("UDP Payload size", towire, dns_u16_to_wire(towire, 4096)); // UDP Payload size
+            TOWIRE_CHECK("extended-rcode", towire, dns_u8_to_wire(towire, 0));     // extended-rcode
+            TOWIRE_CHECK("EDNS version 0", towire, dns_u8_to_wire(towire, 0));     // EDNS version 0
+            TOWIRE_CHECK("No extended flags", towire, dns_u16_to_wire(towire, 0));    // No extended flags
+            TOWIRE_CHECK("No payload", towire, dns_u16_to_wire(towire, 0));    // No payload
+            if (towire->truncated) {
+                send_query->towire.p = revert;
+                if (send_query->tracker->connection->tcp_stream) {
+                    if (embiggen(send_query)) {
+                        send_query->towire.error = false;
+                        send_query->towire.truncated = false;
+                        goto redo_edns0;
+                    }
                 }
+            } else {
+#if SRP_FEATURE_NAT64
+                send_query->response->arcount = htons(ntohs(send_query->response->arcount) + 1);
+#else
+                send_query->response->arcount = htons(1);
+#endif
+            }
+        }
+
+        if (towire->error) {
+            ERROR("failed on %s", failnote);
+            if (tc == dns_flags_tc) {
+                dns_rcode_set(send_query->response, dns_rcode_noerror);
+            } else {
+                dns_rcode_set(send_query->response, dns_rcode_servfail);
             }
         } else {
-#if SRP_FEATURE_NAT64
-            query->response->arcount = htons(ntohs(query->response->arcount) + 1);
-#else
-            query->response->arcount = htons(1);
-#endif
-        }
-    }
-
-    if (towire->error) {
-        ERROR("dp_query_send_dns_response failed on %s", failnote);
-        if (tc == dns_flags_tc) {
-            dns_rcode_set(query->response, dns_rcode_noerror);
-        } else {
-            dns_rcode_set(query->response, dns_rcode_servfail);
+            // No error.
+            dns_rcode_set(send_query->response, dns_rcode_noerror);
         }
     } else {
-        // No error.
-        dns_rcode_set(query->response, dns_rcode_noerror);
+        dns_rcode_set(send_query->response, rcode);
     }
 
-    iov.iov_len = (query->towire.p - (uint8_t *)query->response);
-    iov.iov_base = query->response;
-    INFO("" PRI_S_SRP " (len %zd)", query->question_asked->name, iov.iov_len);
+    iov.iov_len = (send_query->towire.p - (uint8_t *)send_query->response);
+    iov.iov_base = send_query->response;
+    INFO("[QID %x] (len %zd)", ntohs(send_query->message->wire.id), iov.iov_len);
 
-    ioloop_send_message(query->tracker->connection, query->question, &iov, 1);
+    ioloop_send_message(send_query->tracker->connection, send_query->message, &iov, 1);
 
-    // Cancel the query.
-    dnssd_query_cancel(query);
+    // Cancel the send_query.
+    dnssd_query_cancel(send_query);
 }
 
 static void
@@ -1953,11 +2458,11 @@ dp_push_response(dnssd_query_t *query)
         int16_t dso_length = query->towire.p - query->p_dso_length - 2;
         iov.iov_len = (query->towire.p - (uint8_t *)query->response);
         iov.iov_base = query->response;
-        INFO("" PRI_S_SRP " (len %zd)", query->question_asked->name, iov.iov_len);
+        INFO("" PRI_S_SRP " (len %zd)", query->question->name, iov.iov_len);
 
         query->towire.p = query->p_dso_length;
         dns_u16_to_wire(&query->towire, dso_length);
-        ioloop_send_message(query->tracker->connection, query->question, &iov, 1);
+        ioloop_send_message(query->tracker->connection, query->message, &iov, 1);
         dp_query_towire_reset(query);
     }
 }
@@ -1968,9 +2473,9 @@ dnssd_hardwired_response(dnssd_query_t *query, DNSServiceQueryRecordReply UNUSED
     hardwired_t *hp;
     bool got_response = false;
 
-    for (hp = query->question_asked->served_domain->hardwired_responses; hp; hp = hp->next) {
-        if ((query->question_asked->type == hp->type || query->question_asked->type == dns_rrtype_any) &&
-            query->question_asked->qclass == dns_qclass_in && !strcasecmp(hp->name, query->question_asked->name)) {
+    for (hp = query->question->served_domain->hardwired_responses; hp; hp = hp->next) {
+        if ((query->question->type == hp->type || query->question->type == dns_rrtype_any) &&
+            query->question->qclass == dns_qclass_in && !strcasecmp(hp->name, query->question->name)) {
             if (query->dso != NULL) {
                 dns_push_start(query);
                 // Since hardwired response is set by the dnssd-proxy itself, do not do ".local" translation.
@@ -1994,7 +2499,7 @@ dnssd_hardwired_response(dnssd_query_t *query, DNSServiceQueryRecordReply UNUSED
             dp_push_response(query);
         } else {
             // Send the answer(s).
-            dp_query_send_dns_response(query);
+            dp_query_send_dns_response(query, "hardwired");
         }
         return true;
     }
@@ -2019,8 +2524,8 @@ dp_query_append_nat64_prefix_records(dnssd_query_t *query)
     memcpy(rdata, prefix->s6_addr, sizeof(rdata));
     for (size_t i = 0; i < countof(ipv4_addrs);) {
         memcpy(&rdata[12], ipv4_addrs[i], 4);
-        const bool added = dp_query_add_data_to_response(query, "ipv4only.arpa.", dns_rrtype_aaaa, query->question_asked->qclass,
-                                                         (uint16_t)sizeof(rdata), rdata, 10, true);
+        const bool added = dp_query_add_data_to_response(query, "ipv4only.arpa.", dns_rrtype_aaaa, query->question->qclass,
+                                                         (uint16_t)sizeof(rdata), rdata, RFC8766_TTL_CLAMP, true);
         if (query->towire.truncated) {
             if (query->tracker->connection->tcp_stream) {
                 if (embiggen(query)) {
@@ -2044,25 +2549,25 @@ dp_query_append_nat64_prefix_records(dnssd_query_t *query)
 static void
 dns_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCode,
                          const char *fullname, uint16_t rrtype, uint16_t rrclass,
-                         uint16_t rdlen, const void *rdata, uint32_t ttl, void *context)
+                         uint16_t rdlen, const void *rdata, uint32_t ttl, dnssd_query_t *query)
 {
-    dnssd_query_t *query = context;
     bool record_added;
 
-    INFO(PRI_S_SRP " %d %d %x %d", fullname, rrtype, rrclass, rdlen, errorCode);
+    INFO(PRI_S_SRP PUB_S_SRP " %d %d %x %d %p", fullname, (flags & kDNSServiceFlagsMoreComing) ? " m" : "",
+         rrtype, rrclass, rdlen, errorCode, query);
 
     VALIDATE_TRACKER_CONNECTION_NON_NULL();
 
     if (errorCode == kDNSServiceErr_NoError) {
 #if SRP_FEATURE_NAT64
-        const bool aaaa_query_got_a_record = (query->question_asked->type == dns_rrtype_aaaa) && (rrtype == dns_rrtype_a);
-        if (route_states->srp_server->srp_nat64_enabled && (ntohs(query->response->arcount) != 0) && !aaaa_query_got_a_record) {
+        const bool aaaa_query_got_a_record = (query->question->type == dns_rrtype_aaaa) && (rrtype == dns_rrtype_a);
+        if (srp_servers->srp_nat64_enabled && (ntohs(query->response->arcount) != 0) && !aaaa_query_got_a_record) {
             return;
         }
 #endif
     re_add:
         record_added = dp_query_add_data_to_response(query, fullname, rrtype, rrclass, rdlen, rdata,
-            ttl > 10 ? 10 : ttl, false); // Per dnssd-hybrid 5.5.1, limit ttl to 10 seconds
+            ttl > RFC8766_TTL_CLAMP ? RFC8766_TTL_CLAMP : ttl, false);
         if (query->towire.truncated) {
             if (query->tracker->connection->tcp_stream) {
                 if (embiggen(query)) {
@@ -2071,14 +2576,14 @@ dns_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCode,
                     goto re_add;
                 } else {
                     dns_rcode_set(query->response, dns_rcode_servfail);
-                    dp_query_send_dns_response(query);
+                    dp_query_send_dns_response(query, "failed embiggen");
                     return;
                 }
             }
         } else {
 #if SRP_FEATURE_NAT64
             if (record_added) {
-                if (route_states->srp_server->srp_nat64_enabled && aaaa_query_got_a_record) {
+                if (srp_servers->srp_nat64_enabled && aaaa_query_got_a_record) {
                     query->response->arcount = htons(ntohs(query->response->arcount) + 1);
                 } else {
                     query->response->ancount = htons(ntohs(query->response->ancount) + 1);
@@ -2092,22 +2597,23 @@ dns_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCode,
         if (!(flags & kDNSServiceFlagsMoreComing) || query->towire.truncated) {
             // When we get a CNAME response, we may not get the record it points to with the MoreComing
             // flag set, so don't respond yet.
-            if (query->question_asked->type != dns_rrtype_cname && rrtype == dns_rrtype_cname) {
+            if (query->question->type != dns_rrtype_cname && rrtype == dns_rrtype_cname) {
+                INFO("not responding yet because CNAME.");
             } else {
 #if SRP_FEATURE_NAT64
-                if (route_states->srp_server->srp_nat64_enabled && (ntohs(query->response->arcount) != 0)) {
+                if (srp_servers->srp_nat64_enabled && (ntohs(query->response->arcount) != 0)) {
                     dp_query_append_nat64_prefix_records(query);
                 }
 #endif
-                dp_query_send_dns_response(query);
+                dp_query_send_dns_response(query, "normal success");
             }
         }
     } else if (errorCode == kDNSServiceErr_NoSuchRecord) {
         // If we get "no such record," we can't really do much except return the answer.
-        dp_query_send_dns_response(query);
+        dp_query_send_dns_response(query, "no such record");
     } else {
         dns_rcode_set(query->response, dns_rcode_servfail);
-        dp_query_send_dns_response(query);
+        dp_query_send_dns_response(query, "unhandled error");
     }
 }
 
@@ -2136,7 +2642,7 @@ answer_match(const answer_t *answer, uint32_t rdlen, const char *fullname, uint1
 static void
 dns_push_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCode,
                               const char *fullname, uint16_t rrtype, uint16_t rrclass,
-                              uint16_t rdlen, const void *rdata, uint32_t ttl, void *context);
+                              uint16_t rdlen, const void *rdata, uint32_t ttl, dnssd_query_t *query);
 
 // This is the callback for both dns query and dns push query results.
 static void
@@ -2144,7 +2650,7 @@ dns_question_callback(DNSServiceRef UNUSED sdRef, DNSServiceFlags flags, uint32_
                       DNSServiceErrorType errorCode, const char *fullname, uint16_t rrtype, uint16_t rrclass,
                       uint16_t rdlen, const void *rdata, uint32_t ttl, void *context)
 {
-    question_t *q = context;
+    question_t *question = context;
     dnssd_query_t *query, *next;
 
     // For dns push query,  insert or remove answer from the question cache depending on the flags
@@ -2175,28 +2681,32 @@ dns_question_callback(DNSServiceRef UNUSED sdRef, DNSServiceFlags flags, uint32_
             memcpy(answer->rdata, rdata, rdlen);
             answer->next = NULL;
             // Insert answer at the tail
-            answer_t **tail = &(q->answers);
+            answer_t **tail = &(question->answers);
             while (*tail != NULL) {
                 tail = &((*tail)->next);
             }
             *tail = answer;
             // Received data; reset no_data flag.
-            q->no_data = false;
+            question->no_data = false;
             INFO("add answer to cache - "
-                 "name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u.",
-                 fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen);
+                 "name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u." PUB_S_SRP,
+                 fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen,
+                 (flags & kDNSServiceFlagsMoreComing) ? " more coming" : " done");
         } else {
             // Remove
-            answer_t **answer = &(q->answers);
+            answer_t **answer = &(question->answers);
             answer_t *cur = NULL;
+            bool matched = false;
             while (*answer != NULL) {
                 cur = *answer;
                 if (answer_match(cur, rdlen, fullname, rrtype, rrclass, rdata)) {
                     INFO("remove answer from cache - "
-                         "name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u.",
-                         fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen);
+                         "name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u." PUB_S_SRP,
+                         fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen,
+                         (flags & kDNSServiceFlagsMoreComing) ? " more coming" : " done");
                     *answer = cur->next;
                     answer_free(cur);
+                    matched = true;
                     // If individual RR to be removed, get out of the loop once the RR has been removed
                     if (rdlen != 0) {
                         break;
@@ -2205,26 +2715,46 @@ dns_question_callback(DNSServiceRef UNUSED sdRef, DNSServiceFlags flags, uint32_
                     answer = &cur->next;
                 }
             }
+            if (!matched) {
+                INFO("remove not found in cache - "
+                     "name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u." PUB_S_SRP,
+                     fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen,
+                     (flags & kDNSServiceFlagsMoreComing) ? " more coming" : " done");
+            }
             if (*answer == NULL) {
                 // All the answers get removed; set no_data flag.
-                q->no_data = true;
+                question->no_data = true;
             }
         }
     } else if (errorCode == kDNSServiceErr_NoSuchRecord) {
-        q->no_data = true;
+        INFO("no data - name: " PRI_S_SRP ", rrtype: " PUB_S_SRP ", rrclass: " PUB_S_SRP ", rdlen: %u." PUB_S_SRP,
+             fullname, dns_rrtype_to_string(rrtype), dns_qclass_to_string(rrclass), rdlen,
+             (flags & kDNSServiceFlagsMoreComing) ? " more coming" : " done");
+        question->no_data = true;
+#if SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
+    } else if (errorCode == kDNSServiceErr_ServiceNotRunning || errorCode == kDNSServiceErr_DefunctConnection) {
+        if (shared_discovery_txn != NULL) {
+            ioloop_dnssd_txn_cancel(shared_discovery_txn);
+            ioloop_dnssd_txn_release(shared_discovery_txn);
+            shared_discovery_txn = NULL;
+            dp_handle_server_disconnect();
+        }
+        return; // This doesn't count as a result.
+#endif // SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTIONS
     }
-    query = q->queries;
+    query = question->queries;
     while(query != NULL) {
         next = query->question_next;
         if (query->dso != NULL) {
             dns_push_query_answer_process(flags, errorCode, fullname, rrtype, rrclass,
-                                          rdlen, rdata, ttl, (void *)query);
+                                          rdlen, rdata, ttl, query);
         } else {
             dns_query_answer_process(flags, errorCode, fullname, rrtype, rrclass,
-                                     rdlen, rdata, ttl, (void *)query);
+                                     rdlen, rdata, ttl, query);
         }
         query = next;
     }
+    dp_question_cache_remove_queries(question);
 }
 
 static void
@@ -2232,24 +2762,35 @@ dp_query_wakeup(void *context)
 {
     dnssd_query_t *query = context;
     char name[DNS_MAX_NAME_SIZE + 1];
-    size_t namelen = strlen(query->question_asked->name);
+    size_t namelen = strlen(query->question->name);
+
+    if (query->question->answers != NULL) {
+        FAULT("answers present, but dp_query_wakeup reached for query %p question %p name " PRI_S_SRP,
+              query, query->question, query->question->name);
+    } else {
+        query->question->no_data = true;
+    }
 
     // Should never happen.
-    if (namelen + (query->question_asked->served_domain
-                   ? (query->question_asked->served_domain->interface != NULL
+    if (namelen + (query->question->served_domain
+                   ? (query->question->served_domain->interface != NULL
                       ? sizeof local_suffix
                       // XXX why are we checking this but not copying in the served domain name below?
-                      : strlen(query->question_asked->served_domain->domain_ld) + 1)
+                      : strlen(query->question->served_domain->domain_ld) + 1)
                    : 0) > sizeof name) {
-        ERROR("db_query_wakeup: no space to construct name.");
+        ERROR("no space to construct name.");
         dnssd_query_cancel(query);
+        return;
     }
 
-    memcpy(name, query->question_asked->name, namelen + 1);
-    if (query->question_asked->served_domain != NULL) {
+    memcpy(name, query->question->name, namelen + 1);
+    if (query->question->served_domain != NULL) {
         memcpy(name + namelen, local_suffix, sizeof(local_suffix));
     }
-    dp_query_send_dns_response(query);
+    RETAIN_HERE(query, dnssd_query);
+    dp_query_send_dns_response(query, "query wakeup");
+    dp_question_cache_remove_queries(query->question);
+    RELEASE_HERE(query, dnssd_query);
 }
 
 // Search asked question in the cache; if not existing, create one.
@@ -2262,7 +2803,7 @@ dp_query_question_cache_copy(dns_rr_t *search_term, bool *new)
     if (sdt == NULL) {
         dns_name_print(search_term->name, name, sizeof name);
     }
-    question_t **questions, *question;
+    question_t **questions, *ret = NULL;
     question_t *new_question = NULL;
     // if the query is in served domain, lookup in served_domain->questions
     // otherwise lookup in the out-of-domain question cache
@@ -2272,25 +2813,23 @@ dp_query_question_cache_copy(dns_rr_t *search_term, bool *new)
         questions = &questions_without_domain;
     }
     *new = false;
-    question = *questions;
-    while (question != NULL) {
+    while (*questions != NULL) {
+        question_t *question = *questions;
         if (search_term->type == question->type &&
             search_term->qclass == question->qclass &&
             !strcmp(name, question->name))
         {
-            // Find the entry, retain it
-            RETAIN_HERE(question);
+            ret = question;
             break;
         }
-        question = question->next;
+        questions = &question->next;
     }
 
     // If no cache entry was found, create one
-    if (question == NULL) {
+    if (*questions == NULL) {
         new_question = calloc(1, sizeof(*new_question));
         require_action_quiet(new_question != NULL, exit,
                              ERROR("Unable to allocate memory for question entry on " PRI_S_SRP, name));
-        RETAIN_HERE(new_question);
         new_question->name = strdup(name);
         require_action_quiet(new_question->name != NULL, exit,
                              ERROR("unable to allocate memory for question name on " PRI_S_SRP, name));
@@ -2301,26 +2840,33 @@ dp_query_question_cache_copy(dns_rr_t *search_term, bool *new)
         new_question->served_domain = sdt;
         new_question->queries = NULL;
         new_question->no_data = false;
+
         if (sdt != NULL && sdt->interface != NULL) {
             new_question->interface_index = sdt->interface->ifindex;
+            new_question->serviceFlags = kDNSServiceFlagsForceMulticast;
         } else {
             new_question->interface_index = kDNSServiceInterfaceIndexAny;
+            new_question->serviceFlags = kDNSServiceFlagsReturnIntermediates;
         }
 
         // Link the new_question to the question list.
         new_question->next = *questions;
         *questions = new_question;
+        RETAIN_HERE(*questions, question); // retain
 
         // Successfully created a new question, which will be the returned question.
-        question = new_question;
+        ret = new_question;
         new_question = NULL;
         *new = true;
     }
 exit:
     if (new_question != NULL) {
-        RELEASE_HERE(new_question, dp_question_finalize);
+        RELEASE_HERE(new_question, question);
     }
-    return question;
+    if (ret != NULL) {
+        RETAIN_HERE(ret, question);
+    }
+    return ret;
 }
 
 // Look for answers in the cache for the current query
@@ -2332,14 +2878,15 @@ dp_query_reply_from_cache(question_t *question, dnssd_query_t *query)
     // [DNS Discovery Proxy RFC, RFC 8766, Section 5.6]
     if (query->dso == NULL &&
         (question->no_data == true ||
-        (question->answers == NULL &&
-        time(NULL) - question->start_time > RESPONSE_WINDOW)))
+         (question->answers == NULL &&
+          time(NULL) - question->start_time > RESPONSE_WINDOW)))
     {
         INFO("no data for question - type %d class %d " PRI_S_SRP,
              question->type, question->qclass, question->name);
         dns_query_answer_process(0, kDNSServiceErr_NoSuchRecord, question->name,
                                  question->type, question->qclass, 0,
                                  NULL, 0, query);
+        dp_question_cache_remove_queries(question);
         return;
     }
     // answers are available for the question being asked
@@ -2350,7 +2897,8 @@ dp_query_reply_from_cache(question_t *question, dnssd_query_t *query)
         answer_t *answer = question->answers;
         while (answer != NULL) {
             flags = kDNSServiceFlagsAdd;
-            if (answer->next != NULL) {
+            answer_t *next = answer->next;
+            if (next != NULL) {
                 flags |= kDNSServiceFlagsMoreComing;
             }
             if (query->dso == NULL) {
@@ -2362,52 +2910,28 @@ dp_query_reply_from_cache(question_t *question, dnssd_query_t *query)
                                               answer->rrtype, answer->rrclass, answer->rdlen,
                                               answer->rdata, answer->ttl, query);
             }
-            answer = answer->next;
+            answer = next;
         }
+        dp_question_cache_remove_queries(question);
     }
 }
 
 static bool
 dp_query_start(dnssd_query_t *query, int *rcode, bool dns64)
 {
-    char name[DNS_MAX_NAME_SIZE + 1];
-    char *np;
     bool local = false;
-    size_t len;
-    DNSServiceRef sdref;
-    int err;
-    question_t *question = query->question_asked;
+    question_t *question = query->question;
 
-    // If a query has a served domain, query->question_asked->name is the subdomain of the served domain that is
-    // being queried; otherwise query->question_asked->name is the whole name.
     if (question->served_domain != NULL) {
         if (dnssd_hardwired_response(query, dns_question_callback)) {
             *rcode = dns_rcode_noerror;
+            INFO("hardwired response");
+            dp_question_cache_remove_queries(query->question);
+            RELEASE_HERE(query->question, question);
+            query->question = NULL;
             return true;
         }
-        len = strlen(question->name);
-        if (question->served_domain->interface != NULL) {
-            if (len + sizeof local_suffix > sizeof name) {
-                *rcode = dns_rcode_servfail;
-                ERROR("question name %s is too long for .local.", name);
-                return false;
-            }
-            memcpy(name, question->name, len);
-            memcpy(&name[len], local_suffix, sizeof local_suffix);
-        } else {
-            size_t dlen = strlen(question->served_domain->domain_ld) + 1;
-            if (len + dlen > sizeof name) {
-                *rcode = dns_rcode_servfail;
-                ERROR("question name %s is too long for %s.", name, query->question_asked->served_domain->domain);
-                return false;
-            }
-            memcpy(name, question->name, len);
-            memcpy(&name[len], question->served_domain->domain_ld, dlen);
-        }
-        np = name;
         local = true;
-    } else {
-        np = question->name;
     }
 
     // If we get an SOA query for record that's under a zone cut we're authoritative for, which
@@ -2416,49 +2940,28 @@ dp_query_start(dnssd_query_t *query, int *rcode, bool dns64)
     if (question->served_domain != NULL && question->served_domain->interface != NULL &&
         (question->type == dns_rrtype_soa ||
          question->type == dns_rrtype_ns ||
-         question->type == dns_rrtype_ds) && question->qclass == dns_qclass_in && query->dso == NULL) {
-        dp_query_send_dns_response(query);
+         question->type == dns_rrtype_ds) && question->qclass == dns_qclass_in && query->dso == NULL)
+    {
+        dp_query_send_dns_response(query, "query start");
+        dp_question_cache_remove_queries(query->question);
+        RELEASE_HERE(query->question, question);
+        query->question = NULL;
         return true;
     }
 
     // Check if DNSServiceQueryRecord call needs to be made
-    if (question->txn != NULL) {
-        return true;
-    }
-
-    // Issue a DNSServiceQueryRecord call
-    if(__builtin_available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * )) {
-#if SRP_FEATURE_NAT64
-        const DNSServiceAttribute *attr = NULL;
-        if (dns64 && (question->type == dns_rrtype_aaaa) && (question->qclass == dns_qclass_in)) {
-            attr = &kDNSServiceAttributeAAAAFallback;
-        }
-        err = DNSServiceQueryRecordWithAttribute(&sdref, query->serviceFlags, question->interface_index, np, question->type,
-                                                 question->qclass, attr, dns_question_callback, question);
-#else
-        (void)dns64;
-        err = DNSServiceQueryRecord(&sdref, query->serviceFlags, question->interface_index, np, question->type, question->qclass,
-                                    dns_question_callback, question);
-#endif
-    } else {
-        (void)dns64;
-        err = DNSServiceQueryRecord(&sdref, query->serviceFlags, question->interface_index, np, question->type, question->qclass,
-                                    dns_question_callback, question);
-    }
-    if (err != kDNSServiceErr_NoError) {
-        ERROR("dp_query_start: DNSServiceQueryRecord failed for '%s': %d", np, err);
-        *rcode = dns_rcode_servfail;
-        return false;
-    } else {
-        question->txn = ioloop_dnssd_txn_add(sdref, question, NULL, dnssd_question_close_callback);
-        if (question->txn == NULL) {
+    if (question->txn == NULL) {
+        if (dp_start_question(question, dns64) != kDNSServiceErr_NoError) {
+            *rcode = dns_rcode_servfail;
+            INFO("couldn't start question");
             return false;
         }
-#if SRP_FEATURE_NAT64
-        INFO("DNSServiceQueryRecordWithAttribute started for '" PRI_S_SRP "': %d", np, err);
-#else
-        INFO("DNSServiceQueryRecord started for '" PRI_S_SRP "': %d", np, err);
-#endif // SRP_FEATURE_NAT64
+    } else {
+        if (question->answers != NULL || question->no_data) {
+            INFO("answering immediately from cache");
+            *rcode = dns_rcode_noerror;
+            return true;
+        }
     }
 
     // If this isn't a DNS Push subscription, we need to respond quickly with as much data as we have.  It
@@ -2473,9 +2976,10 @@ dp_query_start(dnssd_query_t *query, int *rcode, bool dns64)
                 return false;
             }
         }
-        ioloop_add_wake_event(query->wakeup, query, dp_query_wakeup, NULL, IOLOOP_SECOND * 6);
+        ioloop_add_wake_event(query->wakeup, query, dp_query_wakeup, NULL, 6 * IOLOOP_SECOND);
     }
 
+    INFO("waiting for wakeup or response");
     return true;
 }
 
@@ -2484,77 +2988,71 @@ dp_query_create(dp_tracker_t *tracker, dns_rr_t *question, message_t *message, d
 {
     char name[DNS_MAX_NAME_SIZE + 1];
     served_domain_t *sdt = dp_served(question->name, name, sizeof name);
-
-    // If it's a query for a name served by the local discovery proxy, do an mDNS lookup.
-    if (sdt) {
-        INFO(PUB_S_SRP " question: type %d class %d " PRI_S_SRP "." PRI_S_SRP " -> " PRI_S_SRP DOT_LOCAL,
-             dso != NULL ? "push" : " dns", question->type, question->qclass, name, sdt->domain, name);
-    } else {
-        dns_name_print(question->name, name, sizeof name);
-        INFO(PUB_S_SRP " question: type %d class %d " PRI_S_SRP,
-             dso != NULL ? "push" : " dns", question->type, question->qclass, name);
-    }
+    int xid = message == NULL ? 0 : ntohs(message->wire.id);
 
     dnssd_query_t *query = calloc(1,sizeof *query);
     require_action_quiet(query != NULL, exit, *rcode = dns_rcode_servfail;
-        ERROR("Unable to allocate memory for query on " PRI_S_SRP, name));
-    RETAIN_HERE(query);
+        ERROR("[QID %x] Unable to allocate memory for query on " PRI_S_SRP, xid, name));
+    RETAIN_HERE(query, dnssd_query); // for the caller
+
+    // If it's a query for a name served by the local discovery proxy, do an mDNS lookup.
+    if (sdt) {
+        INFO("[QID %x] msg %p " PUB_S_SRP " question: type %d class %d " PRI_S_SRP "." PRI_S_SRP " -> " PRI_S_SRP DOT_LOCAL,
+             xid, message, dso != NULL ? "push" : " dns", question->type, question->qclass, name, sdt->domain, name);
+    } else {
+        dns_name_print(question->name, name, sizeof name);
+        INFO("[QID %x] msg %p " PUB_S_SRP " question: type %d class %d " PRI_S_SRP, xid, message,
+             dso != NULL ? "push" : " dns", question->type, question->qclass, name);
+    }
 
     query->response = malloc(sizeof *query->response);
     require_action_quiet(query->response != NULL, exit, *rcode = dns_rcode_servfail;
-        ERROR("Unable to allocate memory for query response on " PRI_S_SRP, name));
+                         ERROR("[QID %x] Unable to allocate memory for query response on " PRI_S_SRP,
+                               xid, name));
 
     query->data_size = DNS_DATA_SIZE;
 
     // Zero out the DNS header, but not the data.
     memset(query->response, 0, DNS_HEADER_SIZE);
 
-    query->serviceFlags = 0;
-
-    // If this is a local query, add ".local" to the end of the name and require multicast.
-    if (sdt != NULL && sdt->interface) {
-        query->serviceFlags |= kDNSServiceFlagsForceMulticast;
-    } else {
-        query->serviceFlags |= kDNSServiceFlagsReturnIntermediates;
-    }
     // Name now contains the name we want mDNSResponder to look up.
 
     // The only thing holding a reference to query is its tracker.
     query->tracker = tracker;
-    RETAIN_HERE(query->tracker);
+    RETAIN_HERE(query->tracker, dp_tracker);
 
     // Remember whether this is a long-lived query.
     query->dso = dso;
 
     // Retain the question, as we will need it to send a response.
     if (message != NULL) {
-        query->question = message;
-        ioloop_message_retain(query->question);
+        query->message = message;
+        ioloop_message_retain(query->message);
     }
 
     // Start writing the response
     dp_query_towire_reset(query);
 
     bool new_entry;
-    question_t *question_asked = dp_query_question_cache_copy(question, &new_entry);
-    require_action_quiet(question_asked != NULL, exit, *rcode = dns_rcode_servfail);
-    query->question_asked = question_asked;
-    // Ownership has been transferred to query->question_asked; NULL question_asked.
-    question_asked = NULL;
+    query->question = dp_query_question_cache_copy(question, &new_entry);
+    require_action_quiet(query->question != NULL, exit, *rcode = dns_rcode_servfail);
 
     // add the query to the list of queries that are asking this question.
-    dnssd_query_t **qr = &(query->question_asked->queries);
+    dnssd_query_t **qr = &(query->question->queries);
     while (*qr != NULL) {
         qr = &(*qr)->question_next;
     }
     *qr = query;
-    INFO(PUB_S_SRP " cache entry for question: type %d class %d " PRI_S_SRP,
-         new_entry ? "new" : " existing", question->type, question->qclass, name);
+    // Question query list holds a reference to the query.
+    RETAIN_HERE(*qr, dnssd_query);
+    INFO("[QID %x] msg %p " PUB_S_SRP " cache entry for question: type %d class %d " PRI_S_SRP,
+         xid, query->message, new_entry ? "new" : " existing", question->type, question->qclass, name);
     *rcode = dns_rcode_noerror;
+    dp_num_outstanding_queries++;
 
 exit:
     if (*rcode != dns_rcode_noerror && query != NULL) {
-        RELEASE_HERE(query, dnssd_query_finalize);
+        RELEASE_HERE(query, dnssd_query);
         query = NULL;
     }
     return query;
@@ -2564,9 +3062,8 @@ exit:
 static void
 dns_push_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCode,
                               const char *fullname, uint16_t rrtype, uint16_t rrclass,
-                              uint16_t rdlen, const void *rdata, uint32_t ttl, void *context)
+                              uint16_t rdlen, const void *rdata, uint32_t ttl, dnssd_query_t *query)
 {
-    dnssd_query_t *query = context;
     uint8_t *revert = query->towire.p;
 
     VALIDATE_TRACKER_CONNECTION_NON_NULL();
@@ -2581,7 +3078,7 @@ dns_push_query_answer_process(DNSServiceFlags flags, DNSServiceErrorType errorCo
     // all outstanding queries that aren't waiting on a time trigger.   This is because more-coming isn't
     // query-specific
 
-    INFO("PUSH " PRI_S_SRP " %d %d %x %d", fullname, rrtype, rrclass, rdlen, errorCode);
+    INFO("PUSH " PRI_S_SRP " %d %d %x %d %p", fullname, rrtype, rrclass, rdlen, errorCode, query);
 
     // query_state_waiting means that we're answering a regular DNS question
     if (errorCode == kDNSServiceErr_NoError) {
@@ -2656,25 +3153,26 @@ dns_push_subscribe(dp_tracker_t *tracker, const dns_wire_t *header, dso_state_t 
 
     dso_activity_t *activity = dso_add_activity(dso, activity_name, push_subscription_activity_type, query,
                                                 dns_push_cancel);
-    RETAIN_HERE(query); // The activity holds a reference to the query.
+    RETAIN_HERE(query, dnssd_query); // The activity holds a reference to the query.
     query->activity = activity;
     bool dns64 = false;
 #if SRP_FEATURE_NAT64
-    if (route_states->srp_server->srp_nat64_enabled) {
-        dns64 = nat64_is_active() && !srp_adv_host_is_homekit_accessory(route_states->srp_server, &tracker->connection->address);
+    if (srp_servers->srp_nat64_enabled) {
+        dns64 = nat64_is_active();
     }
 #endif
     if (!dp_query_start(query, &rcode, dns64)) {
         dso_simple_response(tracker->connection, NULL, header, rcode);
+        dp_question_cache_remove_queries(query->question);
         dnssd_query_cancel(query);
     } else {
         dso_simple_response(tracker->connection, NULL, header, dns_rcode_noerror);
-        dp_query_reply_from_cache(query->question_asked, query);
+        dp_query_reply_from_cache(query->question, query);
     }
     // dp_query_create() returned the query retained; when we added the query to the activity, we retained it again;
     // if something went wrong, the second retain was released, but whether or not something went wrong, we can now
     // safely release the initial retain.
-    RELEASE_HERE(query, dnssd_query_finalize);
+    RELEASE_HERE(query, dnssd_query);
 }
 
 static void
@@ -2796,8 +3294,41 @@ out:
     dns_name_free(question.name);
 }
 
+static bool
+dso_limit(dp_tracker_t *tracker, message_t *message, dp_tracker_session_type_t session_type)
+{
+    if (num_push_sessions == MAX_DSO_CONNECTIONS) {
+        // We are too busy. Return a retry-delay response.
+        INFO("no more DNS Push connections allowed--sending retry-delay: %d", num_push_sessions);
+        dso_retry_delay_response(tracker->connection, message, &message->wire, dns_rcode_servfail, BUSY_RETRY_DELAY_MS);
+
+        // Cancel the connection after five seconds
+        dp_tracker_idle_after(tracker, 5, NULL);
+        return true;
+    }
+
+    // Count this as a DSO connection.
+    (num_push_sessions)++;
+    INFO("new DNS Push connection, count is now %d", num_push_sessions);
+
+    tracker->session_type = session_type;
+    return false;
+}
+
 static void dso_message(dp_tracker_t *tracker, message_t *message, dso_state_t *dso)
 {
+    // For the first DSO message we get on a connection, see if we already have too many connections of
+    // the same type. We track SRP replication and DNS Push separately, because we don't want a surfeit of
+    // DNS Push messages to prevent replication from working. A surfeit of SRP Replication connections is
+    // less likely, and less problematic.
+    if (tracker->session_type == dp_tracker_session_none) {
+        if (dso->primary.opcode != kDSOType_SRPLSession) {
+            if (dso_limit(tracker, message, dp_tracker_session_push)) {
+                return;
+            }
+        }
+    }
+
     switch(dso->primary.opcode) {
     case kDSOType_DNSPushSubscribe:
         dns_push_subscription_change("DNS Push Subscribe", tracker, &message->wire, dso);
@@ -2823,7 +3354,7 @@ static void dso_message(dp_tracker_t *tracker, message_t *message, dso_state_t *
                   tracker->connection->name);
             return;
         }
-        srpl_dso_server_message(tracker->connection, message, dso, route_states->srp_server);
+        srpl_dso_server_message(tracker->connection, message, dso, srp_servers);
         break;
 #endif
 
@@ -2897,39 +3428,50 @@ static void dns_push_callback(void *context, void *event_context,
     }
 }
 
-static void
-dp_dns_query(dp_tracker_t *tracker, message_t *message, dns_rr_t *question)
+static bool
+dp_dns_query(dp_tracker_t *tracker, message_t *message, dns_rr_t *question, int num_questions)
 {
     int rcode;
+
+    // Limit outstanding queries if we don't have shared connection support
+    if (dp_num_outstanding_queries >= 256) {
+        dso_simple_response(tracker->connection, message, &message->wire, dns_rcode_servfail);
+        ERROR("[QID %x] dropping query because there are too many", ntohs(message->wire.id));
+        return false;
+    }
 
     // We do not support queries in the ".local" domain
     if (is_in_local_domain(question->name)) {
         dso_simple_response(tracker->connection, message, &message->wire, dns_rcode_refused);
-        return;
+        ERROR("[QID %x] dropping query to local domain", ntohs(message->wire.id));
+        return false;
     }
 
     dnssd_query_t *query = dp_query_create(tracker, question, message, NULL, &rcode);
     const char *failnote = NULL;
     if (!query) {
+        ERROR("[QID %x] query create failed", ntohs(message->wire.id));
         dso_simple_response(tracker->connection, message, &message->wire, rcode);
-        return;
+        return false;
     }
+    query->num_questions = num_questions;
+
     dns_rcode_set(query->response, dns_rcode_noerror);
 
     // For DNS queries, we need to return the question.
     query->response->qdcount = htons(1);
-    if (query->question_asked->served_domain != NULL) {
-        TOWIRE_CHECK("name", &query->towire, dns_name_to_wire(NULL, &query->towire, query->question_asked->name));
+    if (query->question->served_domain != NULL) {
+        TOWIRE_CHECK("name", &query->towire, dns_name_to_wire(NULL, &query->towire, query->question->name));
         TOWIRE_CHECK("enclosing_domain", &query->towire,
                      dns_full_name_to_wire(&query->enclosing_domain_pointer,
-                                           &query->towire, query->question_asked->served_domain->domain));
+                                           &query->towire, query->question->served_domain->domain));
     } else {
-        TOWIRE_CHECK("full name", &query->towire, dns_full_name_to_wire(NULL, &query->towire, query->question_asked->name));
+        TOWIRE_CHECK("full name", &query->towire, dns_full_name_to_wire(NULL, &query->towire, query->question->name));
     }
     TOWIRE_CHECK("TYPE", &query->towire, dns_u16_to_wire(&query->towire, question->type));    // TYPE
     TOWIRE_CHECK("CLASS", &query->towire, dns_u16_to_wire(&query->towire, question->qclass));  // CLASS
     if (failnote != NULL) {
-        ERROR("dp_dns_query: failure encoding question: %s", failnote);
+        ERROR("[QID %x] failure encoding question: " PUB_S_SRP, ntohs(message->wire.id), failnote);
         goto fail;
     }
 
@@ -2941,31 +3483,67 @@ dp_dns_query(dp_tracker_t *tracker, message_t *message, dns_rr_t *question)
 
     bool dns64 = false;
 #if SRP_FEATURE_NAT64
-    if (route_states->srp_server->srp_nat64_enabled) {
-        dns64 = nat64_is_active() && !srp_adv_host_is_homekit_accessory(route_states->srp_server, &tracker->connection->address);
+    if (srp_servers->srp_nat64_enabled) {
+        dns64 = nat64_is_active();
     }
 #endif
+    dp_query_track(tracker, query);
     if (dp_query_start(query, &rcode, dns64)) {
-        dp_query_track(tracker, query);
-        dp_query_reply_from_cache(query->question_asked, query);
+        // If query->question isn't NULL, we need to reply from cache
+        if (query->question != NULL) {
+            INFO("replying from cache");
+            dp_query_reply_from_cache(query->question, query);
+            dp_question_cache_remove_queries(query->question);
+        } else {
+            INFO("not replying from cache");
+        }
     } else {
+        ERROR("[QID %x] query start failed", ntohs(message->wire.id));
     fail:
         dso_simple_response(tracker->connection, message, &message->wire, rcode);
+        query->satisfied = true;
+        dp_question_cache_remove_queries(query->question);
+        dnssd_query_cancel(query);
+        RELEASE_HERE(query, dnssd_query);
+        return false;
     }
     // Query is returned retained, and dp_query_track retains it, so we always need to release the reference here.
-    RELEASE_HERE(query, dnssd_query_finalize);
+    RELEASE_HERE(query, dnssd_query);
+    return true;
 }
 
 static void
-dso_transport_finalize(comm_t *comm, const char *whence)
+dp_tracker_dso_cleanup(void *UNUSED context)
 {
-    dso_state_t *dso = comm->dso;
-    INFO(PRI_S_SRP " (" PUB_S_SRP ")", dso->remote_name, whence);
-    if (comm) {
-        ioloop_comm_cancel(comm);
+    dso_cleanup(false);
+}
+
+static bool
+dp_tracker_dso_state_change(const dso_life_cycle_t cycle, void *const context, dso_state_t *const dso)
+{
+    if (cycle == dso_life_cycle_cancel) {
+        dp_tracker_t *tracker = context;
+        if (tracker->dso != NULL) {
+            tracker->dso = NULL;
+            if (tracker->connection != NULL) {
+                tracker->connection->dso = NULL;
+                ioloop_comm_cancel(tracker->connection);
+            }
+            for (dnssd_query_t *query = tracker->dns_queries; query != NULL; query = query->next) {
+                if (query->dso == dso) {
+                    query->dso = NULL;
+                }
+                if (query->activity != NULL) {
+                    query->activity = NULL;
+                    // Release the activity's reference to the query.
+                    RELEASE_HERE(query, dnssd_query);
+                }
+            }
+        }
+        ioloop_run_async(dp_tracker_dso_cleanup, NULL);
+        return true;
     }
-    free(dso);
-    comm->dso = NULL;
+    return false;
 }
 
 static void
@@ -2978,21 +3556,24 @@ dnssd_proxy_dns_evaluate(comm_t *comm, message_t *message, dp_tracker_t *tracker
         tracker = calloc(1, sizeof(*tracker));
         if (tracker == NULL) {
             ERROR(PRI_S_SRP ": no memory for a connection tracker object!", comm->name);
-            return;
+            goto fail;
         }
         tracker->connection = comm;
         ioloop_comm_retain(tracker->connection);
-        ioloop_comm_context_set(comm, tracker, dp_tracker_context_release);
-        RETAIN_HERE(tracker); // connection has a reference.
+        if (comm->tcp_stream) {
+            ioloop_comm_context_set(comm, tracker, dp_tracker_context_release);
+            RETAIN_HERE(tracker, dp_tracker); // connection has a reference.
+        }
         if (!comm->is_listener) {
             ioloop_comm_disconnect_callback_set(comm, dp_tracker_disconnected);
         }
     }
+    RETAIN_HERE(tracker, dp_tracker); // For the function.
 
     // Drop incoming responses--we're a server, so we only accept queries.
     if (dns_qr_get(&message->wire) == dns_qr_response) {
         INFO("dropping unexpected response");
-        return;
+        goto fail;
     }
 
     // If this is a DSO message, see if we have a session yet.
@@ -3001,59 +3582,75 @@ dnssd_proxy_dns_evaluate(comm_t *comm, message_t *message, dp_tracker_t *tracker
         if (!comm->tcp_stream) {
             ERROR("DSO message received on non-tcp socket %s", comm->name);
             dso_simple_response(comm, message, &message->wire, dns_rcode_notimp);
-            return;
+            goto fail;
         }
 
         if (!tracker->dso) {
-            if (num_dso_connections == MAX_DSO_CONNECTIONS) {
-                // We are too busy. Return a retry-delay response.
-                INFO("no more DSO connections allowed--sending retry-delay: %d", num_dso_connections);
-                dso_retry_delay_response(comm, message, &message->wire, dns_rcode_servfail, BUSY_RETRY_DELAY_MS);
-
-                // Cancel the connection after five seconds
-                dp_tracker_idle_after(tracker, 5, NULL);
-                return;
-            }
-            tracker->dso = dso_state_create(true, 2, comm->name, dns_push_callback, tracker, NULL, comm);
+            tracker->dso = dso_state_create(true, 2, comm->name, dns_push_callback, tracker,
+                                            dp_tracker_dso_state_change, comm);
             if (!tracker->dso) {
                 ERROR("Unable to create a dso context for %s", comm->name);
                 dso_simple_response(comm, message, &message->wire, dns_rcode_servfail);
-                ioloop_comm_cancel(comm);
-                return;
+                goto fail;
             }
-            tracker->dso->transport_finalize = dso_transport_finalize;
             comm->dso = tracker->dso;
-
-            // Count this as a DSO connection.
-            num_dso_connections++;
-            INFO("new dso connection, count is now %d", num_dso_connections);
         }
         dp_tracker_not_idle(tracker);
         dso_message_received(comm->dso, (uint8_t *)&message->wire, message->length, message);
         break;
 
-    case dns_opcode_query:
-        // In theory this is permitted but it can't really be implemented because there's no way
-        // to say "here's the answer for this, and here's why that failed.
-        if (ntohs(message->wire.qdcount) != 1) {
-            dso_simple_response(comm, message, &message->wire, dns_rcode_formerr);
-            return;
-        }
-        memset(&question, 0, sizeof(question));
-        if (!dns_rr_parse(&question, message->wire.data, message->length, &offset, false, false)) {
-            dso_simple_response(comm, message, &message->wire, dns_rcode_formerr);
-            return;
+    case dns_opcode_query: {
+        int num_questions = ntohs(message->wire.qdcount);
+
+        // Some Matter accessories will send queries with more than one question, and if we don't answer these
+        // queries, automations fail. So even though this is a bit weird, we need to answer the queries.
+        for (int i = 0; i < num_questions; i++) {
+            memset(&question, 0, sizeof(question));
+            if (!dns_rr_parse(&question, message->wire.data, message->length - DNS_HEADER_SIZE, &offset, false, false)) {
+                INFO("rr parse failed");
+                dso_simple_response(comm, message, &message->wire, dns_rcode_formerr);
+                goto fail;
+            }
+            bool success = dp_dns_query(tracker, message, &question, num_questions);
+            dns_rrdata_free(&question);
+            dns_name_free(question.name);
+            if (!success) {
+                dnssd_query_t *next = NULL, *match = NULL;
+                for (dnssd_query_t *query = tracker->dns_queries; query != NULL; query = next) {
+                    next = query->next;
+                    if (dp_same_message(query->message, message)) {
+                        query->satisfied = true;
+                        dp_question_cache_remove_queries(query->question);
+                        if (match == NULL) {
+                            match = query;
+                            RETAIN_HERE(match, dnssd_query);
+                        }
+                    }
+                }
+                if (match != NULL) {
+                    dnssd_query_cancel(match);
+                    RELEASE_HERE(match, dnssd_query);
+                }
+                goto out;
+            }
         }
         dp_tracker_not_idle(tracker);
-        dp_dns_query(tracker, message, &question);
-        dns_rrdata_free(&question);
-        dns_name_free(question.name);
         break;
-
+    }
         // No support for other opcodes yet.
     default:
         dso_simple_response(comm, message, &message->wire, dns_rcode_notimp);
         break;
+    }
+    goto out;
+fail:
+    // For connected connections, if we exit unexpectedly, we need to cancel the connection.
+    if (comm->tcp_stream) {
+        ioloop_comm_cancel(tracker->connection);
+    }
+out:
+    if (tracker != NULL) {
+        RELEASE_HERE(tracker, dp_tracker); // For the function.
     }
 }
 
@@ -3062,7 +3659,7 @@ dns_proxy_input(comm_t *comm, message_t *message, void *context)
 {
     char buf[INET6_ADDRSTRLEN];
     IOLOOP_NTOP(&comm->address, buf);
-    INFO("[QID0x%x] Received a new DNS message - src: " PRI_S_SRP ", message length: %ubytes.",
+    INFO("[QID %x] Received a new DNS message - src: " PRI_S_SRP ", message length: %u bytes.",
          ntohs(message->wire.id), buf, message->length);
 
     dnssd_proxy_dns_evaluate(comm, message, context);
@@ -3526,7 +4123,7 @@ exit:
 }
 
 static void
-dnssd_tls_listener_restart(void *const NULLABLE context)
+dnssd_tls_listener_restart(void *UNUSED context)
 {
     const bool doing_rotation = listener[tls_listener_index]->tls_rotation_ready;
     ioloop_listener_release(listener[tls_listener_index]);
@@ -3539,7 +4136,7 @@ dnssd_tls_listener_restart(void *const NULLABLE context)
             return;
         }
 
-        dnssd_tls_listener_listen(context);
+        dnssd_tls_listener_listen(NULL);
     } else {
         INFO("Creation of TLS listener failed; reattempting in 10s.");
 
@@ -4053,41 +4650,49 @@ update_my_name(CFStringRef local_host_name_cfstr)
     bool succeeded;
     size_t name_length;
 
-    // local host name to c string.
-    succeeded = CFStringGetCString(local_host_name_cfstr, local_host_name, sizeof(local_host_name),
-        kCFStringEncodingUTF8);
-    require_action_quiet(succeeded, exit, succeeded = false;
-        ERROR("CFStringGetCString failed - local host name: " PRI_S_SRP,
-            CFStringGetCStringPtr(local_host_name_cfstr, kCFStringEncodingUTF8))
-    );
-    name_length = strlen(local_host_name);
+    if (local_host_name_cfstr == NULL) {
+        // If we are a thread device and not a stub router, make up a hostname for the remote server in case we need it.
+        char localhost[] = "localhost.";
+        name_length = sizeof(localhost);
+        memcpy(local_host_name, localhost, name_length);
+        memcpy(local_host_name_dot_local, localhost, name_length);
+        memcpy(my_name_buf, localhost, name_length);
+    } else {
+        // local host name to c string.
+        succeeded = CFStringGetCString(local_host_name_cfstr, local_host_name, sizeof(local_host_name),
+                                       kCFStringEncodingUTF8);
+        require_action_quiet(succeeded, exit, succeeded = false;
+                             ERROR("CFStringGetCString failed - local host name: " PRI_S_SRP,
+                                   CFStringGetCStringPtr(local_host_name_cfstr, kCFStringEncodingUTF8))
+            );
+        name_length = strlen(local_host_name);
 
-    // Validate the local host name.
-    for (size_t i = 0; i < name_length; i++) {
-        char ch = local_host_name[i];
-        bool is_valid_char = isalnum(ch) || (ch == '-');
-        require_action_quiet(is_valid_char, exit, succeeded = false;
-            ERROR("invalid DNS name - name: " PUB_S_SRP, local_host_name));
+        // Validate the local host name.
+        for (size_t i = 0; i < name_length; i++) {
+            char ch = local_host_name[i];
+            bool is_valid_char = isalnum(ch) || (ch == '-');
+            require_action_quiet(is_valid_char, exit, succeeded = false;
+                                 ERROR("invalid DNS name - name: " PUB_S_SRP, local_host_name));
+        }
+
+        require_action_quiet(name_length + sizeof(DOT_HOME_NET_DOMAIN) <= sizeof(my_name_buf),
+                             exit,
+                             succeeded = false;
+                             ERROR("generated name too long: " PUB_S_SRP DOT_HOME_NET_DOMAIN, local_host_name));
+
+        // Update existing local host name in my_name.
+        memcpy(my_name_buf, local_host_name, name_length);
+        memcpy(my_name_buf + name_length, DOT_HOME_NET_DOMAIN, sizeof(DOT_HOME_NET_DOMAIN));
+
+        // Update existing local host name with .local suffix.
+        int bytes_written = snprintf(local_host_name_dot_local, sizeof(local_host_name_dot_local), "%s" DOT_LOCAL, local_host_name);
+        if (bytes_written < 0 || (size_t) bytes_written > sizeof(local_host_name_dot_local)) {
+           ERROR("snprintf failed - name length: %lu, max: %lu", strlen(local_host_name) + sizeof(DOT_LOCAL),
+                 sizeof(local_host_name_dot_local));
+           succeeded = false;
+           goto exit;
+        }
     }
-
-    require_action_quiet(name_length + sizeof(DOT_HOME_NET_DOMAIN) <= sizeof(my_name_buf),
-                         exit,
-                         succeeded = false;
-                         ERROR("generated name too long: " PUB_S_SRP DOT_HOME_NET_DOMAIN, local_host_name));
-
-    // Update existing local host name in my_name.
-    memcpy(my_name_buf, local_host_name, name_length);
-    memcpy(my_name_buf + name_length, DOT_HOME_NET_DOMAIN, sizeof(DOT_HOME_NET_DOMAIN));
-
-    // Update existing local host name with .local suffix.
-    int bytes_written = snprintf(local_host_name_dot_local, sizeof(local_host_name_dot_local), "%s" DOT_LOCAL, local_host_name);
-    if (bytes_written < 0 || (size_t) bytes_written > sizeof(local_host_name_dot_local)) {
-        ERROR("snprintf failed - name length: %lu, max: %lu", strlen(local_host_name) + sizeof(DOT_LOCAL),
-            sizeof(local_host_name_dot_local));
-        succeeded = false;
-        goto exit;
-    }
-
     my_name = my_name_buf;
 
     succeeded = true;
@@ -4100,10 +4705,11 @@ exit:
 
 // Gets called when name change event happens
 static void
-monitor_name_changes_callback(SCDynamicStoreRef store, CFArrayRef changed_keys, void UNUSED *context)
+monitor_name_changes_callback(SCDynamicStoreRef store, CFArrayRef changed_keys, void *context)
 {
     bool succeeded;
     CFStringRef local_host_name_cfstring = NULL;
+    dnssd_proxy_advertisements_t *advertisements = context;
 
     // Check if name changes.
     CFRange range = {0, CFArrayGetCount(changed_keys)};
@@ -4124,13 +4730,13 @@ monitor_name_changes_callback(SCDynamicStoreRef store, CFArrayRef changed_keys, 
     succeeded = served_domain_process_name_change();
     require_action_quiet(succeeded, exit, ERROR("failed to process name change for served domains"));
 
-    if (advertisements.txn != NULL) {
+    if (advertisements->txn != NULL) {
         dns_wire_t wire;
         dns_towire_state_t towire;
         towire_init(&wire, &towire);
         dns_full_name_to_wire(NULL, &towire, local_host_name_dot_local);
 
-        DNSServiceErrorType err = DNSServiceUpdateRecord(advertisements.service_ref, advertisements.ns_record_ref, 0,
+        DNSServiceErrorType err = DNSServiceUpdateRecord(advertisements->service_ref, advertisements->ns_record_ref, 0,
             towire.p - wire.data, wire.data, 0);
         if (err != kDNSServiceErr_NoError) {
             ERROR("DNSServiceUpdateRecord failed to update NS record to new name - name: " PRI_S_SRP,
@@ -4148,7 +4754,7 @@ exit:
 }
 
 static bool
-monitor_name_changes(void)
+monitor_name_changes(dnssd_proxy_advertisements_t *advertisements)
 {
     bool succeeded;
     SCDynamicStoreRef store = NULL;
@@ -4157,7 +4763,7 @@ monitor_name_changes(void)
 
     // Set the callback function for name change event.
     store = SCDynamicStoreCreate(kCFAllocatorDefault, CFSTR("dnssd-proxy:watch for name change events"),
-        monitor_name_changes_callback, NULL);
+                                 monitor_name_changes_callback, &advertisements->sc_context);
     require_action_quiet(store != NULL, exit, succeeded = false; ERROR("failed to create SCDynamicStoreRef"));
 
     // Set the key to be monitored, which is host name
@@ -4192,21 +4798,26 @@ exit:
 }
 
 static bool
-initialize_my_name_and_monitoring(void)
+initialize_my_name_and_monitoring(srp_server_t *server_state)
 {
     bool succeeded;
     CFStringRef local_host_name_cfstring = NULL;
 
-    // Set notification from configd
-    succeeded = monitor_name_changes();
-    require_action_quiet(succeeded, exit, ERROR("failed to monitor name changes"));
+    if (server_state->stub_router_enabled) {
+        // Set notification from configd.
+        succeeded = monitor_name_changes(server_state->dnssd_proxy_advertisements);
+        require_action_quiet(succeeded, exit, ERROR("failed to monitor name changes"));
 
-    // Get the initial local host name
-    local_host_name_cfstring = SCDynamicStoreCopyLocalHostName(NULL);
-    require_action_quiet(local_host_name != NULL, exit, succeeded = false; ERROR("failed to get local host name"));
+        // Get the initial local host name
+        local_host_name_cfstring = SCDynamicStoreCopyLocalHostName(NULL);
+        require_action_quiet(local_host_name != NULL, exit, succeeded = false; ERROR("failed to get local host name"));
 
-    succeeded = update_my_name(local_host_name_cfstring);
-    require_action_quiet(succeeded, exit, ERROR("failed to update myname"));
+        succeeded = update_my_name(local_host_name_cfstring);
+        require_action_quiet(succeeded, exit, ERROR("failed to update myname"));
+    } else {
+        succeeded = update_my_name(NULL);
+        require_action_quiet(succeeded, exit, ERROR("failed to update myname"));
+    }
 
 exit:
     if (local_host_name_cfstring != NULL) {
@@ -4252,14 +4863,14 @@ start_dnssd_proxy_listener(void)
     listener[num_listeners] = ioloop_listener_create(false, false, NULL, 0, &addr, NULL, "DNS UDP Listener",
                                                      dns_proxy_input, NULL, NULL, NULL, NULL, NULL, NULL);
     require_action_quiet(listener[num_listeners] != NULL, exit, succeeded = false;
-        ERROR("start_dnssd_proxy_listener: failed to start UDP listener - listerner index: %d", num_listeners));
+        ERROR("failed to start UDP listener - listener index: %d", num_listeners));
     num_listeners++;
 
     INIT_ADDR_T(tcp_port);
     listener[num_listeners] = ioloop_listener_create(true, false, NULL, 0, &addr, NULL, "TCP DNS Listener",
                                                      dns_proxy_input, NULL, NULL, NULL, NULL, NULL, NULL);
     require_action_quiet(listener[num_listeners] != NULL, exit, succeeded = false;
-        ERROR("start_dnssd_proxy_listener: failed to start TCP listener - listerner index: %d", num_listeners));
+        ERROR("failed to start TCP listener - listener index: %d", num_listeners));
     num_listeners++;
 
     for (int i = 0; i < num_listeners; i++) {
@@ -4278,7 +4889,7 @@ exit:
 static void
 advertisements_finalize(void *context)
 {
-    dnssd_proxy_advertisements_t * const advertisements_context = context;
+    dnssd_proxy_advertisements_t *advertisements_context = context;
     advertisements_context->txn = NULL;
 }
 
@@ -4290,9 +4901,9 @@ advertisements_failed(void *UNUSED context, int status)
 
 static void
 advertisements_callback(DNSServiceRef sd_ref, DNSRecordRef record_ref, DNSServiceFlags UNUSED flags,
-                     DNSServiceErrorType error, void *context)
+                        DNSServiceErrorType error, void *context)
 {
-    dnssd_proxy_advertisements_t * const advertisements_context = context;
+    dnssd_proxy_advertisements_t *advertisements_context = context;
 
     if (error == kDNSServiceErr_NoError) {
         const char * const description = record_ref == advertisements_context->ns_record_ref ? "NS" : "PTR";
@@ -4306,7 +4917,11 @@ advertisements_callback(DNSServiceRef sd_ref, DNSRecordRef record_ref, DNSServic
             ERROR("Invalid DNSServiceRef - context->service_ref: %p, sd_ref: %p", advertisements_context->service_ref,
                 sd_ref);
         }
-        DNSServiceRefDeallocate(advertisements_context->service_ref);
+        if (advertisements_context->txn != NULL) {
+            ioloop_dnssd_txn_cancel(advertisements_context->txn);
+            ioloop_dnssd_txn_release(advertisements_context->txn);
+            advertisements_context->txn = NULL;
+        }
         advertisements_context->service_ref = NULL;
 
         // Restart the advertisement.
@@ -4330,6 +4945,7 @@ advertise_dnssd_proxy_callback(void *NONNULL context)
     dns_wire_t wire;
     dns_towire_state_t towire;
     dnssd_proxy_advertisements_t *advertisement_context = context;
+    srp_server_t *server_state = advertisement_context->server_state;
     const char *const domain_to_advertise = advertisement_context->domain_to_advertise;
 
     INFO("Start advertising lb._dns-sd._udp.local. PTR and openthread.thread.home.arpa.local NS records");
@@ -4348,8 +4964,9 @@ advertise_dnssd_proxy_callback(void *NONNULL context)
     dns_full_name_to_wire(NULL, &towire, domain_to_advertise);
 
     err = DNSServiceRegisterRecord(advertisement_context->service_ref, &advertisement_context->ptr_record_ref,
-        kDNSServiceFlagsShared, 0, AUTOMATIC_BROWSING_DOMAIN, kDNSServiceType_PTR, kDNSServiceClass_IN,
-        towire.p - wire.data, wire.data, 0, advertisements_callback, &advertisements);
+                                   kDNSServiceFlagsShared, server_state->advertise_interface, AUTOMATIC_BROWSING_DOMAIN,
+                                   kDNSServiceType_PTR, kDNSServiceClass_IN, towire.p - wire.data, wire.data, 0,
+                                   advertisements_callback, advertisement_context);
     if (err != kDNSServiceErr_NoError) {
         ERROR("DNSServiceRegisterRecord failed - record: " PUB_S_SRP " PTR " PRI_S_SRP, AUTOMATIC_BROWSING_DOMAIN,
               domain_to_advertise);
@@ -4362,8 +4979,10 @@ advertise_dnssd_proxy_callback(void *NONNULL context)
     dns_full_name_to_wire(NULL, &towire, local_host_name_dot_local);
 
     err = DNSServiceRegisterRecord(advertisement_context->service_ref, &advertisement_context->ns_record_ref,
-        kDNSServiceFlagsShared | kDNSServiceFlagsForceMulticast, 0, domain_to_advertise, kDNSServiceType_NS,
-        kDNSServiceClass_IN, towire.p - wire.data, wire.data, 0, advertisements_callback, &advertisements);
+                                   kDNSServiceFlagsShared | kDNSServiceFlagsForceMulticast,
+                                   server_state->advertise_interface, domain_to_advertise, kDNSServiceType_NS,
+                                   kDNSServiceClass_IN, towire.p - wire.data, wire.data, 0,
+                                   advertisements_callback, advertisement_context);
     if (err != kDNSServiceErr_NoError) {
         ERROR("DNSServiceRegisterRecord failed - record: " PUB_S_SRP " NS " PRI_S_SRP, domain_to_advertise,
             local_host_name_dot_local);
@@ -4372,8 +4991,8 @@ advertise_dnssd_proxy_callback(void *NONNULL context)
     }
 
     // Start the running loop
-    advertisement_context->txn = ioloop_dnssd_txn_add(advertisement_context->service_ref, &advertisements,
-        advertisements_finalize, advertisements_failed);
+    advertisement_context->txn = ioloop_dnssd_txn_add(advertisement_context->service_ref, advertisement_context,
+                                                      advertisements_finalize, advertisements_failed);
     if (advertisement_context->txn == NULL) {
         ERROR("ioloop_dnssd_txn_add failed");
         succeeded = false;
@@ -4404,7 +5023,7 @@ exit:
 }
 
 static bool
-start_timer_to_advertise(dnssd_proxy_advertisements_t *const NONNULL context,
+start_timer_to_advertise(dnssd_proxy_advertisements_t *NONNULL context,
     const char *const NULLABLE domain_to_advertise, const uint32_t interval)
 {
     bool succeeded;
@@ -4454,16 +5073,16 @@ exit:
 }
 
 static bool
-advertise_dnssd_proxy(const char *const NONNULL domain_to_advertise)
+advertise_dnssd_proxy(srp_server_t *server_state, const char *const NONNULL domain_to_advertise)
 {
     // Start advertisement (wait for ADVERTISEMENT_RETRY_TIMER to allow mDNSResponder to start).
-    return start_timer_to_advertise(&advertisements, domain_to_advertise, ADVERTISEMENT_RETRY_TIMER);
+    return start_timer_to_advertise(server_state->dnssd_proxy_advertisements, domain_to_advertise, ADVERTISEMENT_RETRY_TIMER);
 }
 
 #if SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY
 #  if SRP_FEATURE_DYNAMIC_CONFIGURATION
 static bool
-served_domain_init(void)
+served_domain_init(srp_server_t *server_state)
 {
     bool succeeded;
     served_domain_t *my_name_served_domain = NULL;
@@ -4477,14 +5096,16 @@ served_domain_init(void)
     require_action_quiet(my_name_served_domain != NULL, exit, succeeded = false;
         ERROR("failed to create new served domain - domain name: " PUB_S_SRP, my_name));
 
-    // ip6.arpa.
-    // in-addr.arpa.
-    ipv6 = new_served_domain(NULL, IPV6_REVERSE_LOOKUP_DOMAIN);
-    ipv4 = new_served_domain(NULL, IPV4_REVERSE_LOOKUP_DOMAIN);
-    require_action_quiet(ipv6 != NULL && ipv4 != NULL, exit, succeeded = false;
-        ERROR("failed to create new served domain for reverse look up -  domain name: " PUB_S_SRP ", " PUB_S_SRP,
-            IPV6_REVERSE_LOOKUP_DOMAIN, IPV4_REVERSE_LOOKUP_DOMAIN)
-    );
+    if (server_state->stub_router_enabled) {
+        // ip6.arpa.
+        // in-addr.arpa.
+        ipv6 = new_served_domain(NULL, IPV6_REVERSE_LOOKUP_DOMAIN);
+        ipv4 = new_served_domain(NULL, IPV4_REVERSE_LOOKUP_DOMAIN);
+        require_action_quiet(ipv6 != NULL && ipv4 != NULL, exit, succeeded = false;
+                             ERROR("failed to create new served domain for reverse look up -  domain name: " PUB_S_SRP ", " PUB_S_SRP,
+                                   IPV6_REVERSE_LOOKUP_DOMAIN, IPV4_REVERSE_LOOKUP_DOMAIN)
+            );
+    }
 
     // THREAD_BROWSING_DOMAIN
     // It will be served by kDNSServiceInterfaceIndexLocalOnly, which is a pseudo interface.
@@ -4525,15 +5146,26 @@ exit:
 #endif // SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY
 
 bool
-init_dnssd_proxy(void)
+init_dnssd_proxy(srp_server_t *server_state)
 {
     bool succeeded;
+
+    dnssd_proxy_advertisements_t *advertisements = server_state->dnssd_proxy_advertisements;
+    if (advertisements == NULL) {
+        advertisements = calloc(1, sizeof(*advertisements));
+        require_action_quiet(advertisements != NULL, exit,
+                             succeeded = false;
+                             ERROR("no memory for advertisements"));
+        server_state->dnssd_proxy_advertisements = advertisements;
+        advertisements->server_state = server_state;
+        advertisements->sc_context.info = advertisements;
+    }
 
 #if SRP_FEATURE_DYNAMIC_CONFIGURATION
     succeeded = configure_dnssd_proxy();
     require_action_quiet(succeeded, exit, ERROR("configure_dnssd_proxy failed"));
 
-    succeeded = initialize_my_name_and_monitoring();
+    succeeded = initialize_my_name_and_monitoring(server_state);
     require_action_quiet(succeeded, exit, ERROR("initialize_my_name_and_monitoring failed"));
 #else // SRP_FEATURE_DYNAMIC_CONFIGURATION
     // Read the config file
@@ -4578,11 +5210,11 @@ init_dnssd_proxy(void)
     succeeded = start_dnssd_proxy_listener();
     require_action_quiet(succeeded, exit, ERROR("start_dnssd_proxy_listener failed"));
 
-    succeeded = advertise_dnssd_proxy(THREAD_BROWSING_DOMAIN);
+    succeeded = advertise_dnssd_proxy(server_state, THREAD_BROWSING_DOMAIN);
     require_action_quiet(succeeded, exit, ERROR("advertise_dnssd_proxy failed"));
 
 #if SRP_FEATURE_DYNAMIC_CONFIGURATION
-    succeeded = served_domain_init();
+    succeeded = served_domain_init(server_state);
 #endif
 
 exit:

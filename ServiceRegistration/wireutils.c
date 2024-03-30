@@ -523,6 +523,219 @@ dns_keys_rdata_equal(dns_rr_t *key1, dns_rr_t *key2)
     return false;
 }
 
+void
+dns_txt_data_print(char *txt_buf, size_t buf_size, uint16_t txt_length, uint8_t *txt_data)
+{
+    uint16_t index = 0;
+    char *sp = txt_buf;
+    char *lim = sp + buf_size;
+    const char *continuation_string = "";
+    const char *commasp = ", ";
+    size_t continuation_length = 0;
+    txt_buf[0] = 0;
+    while (sp < lim && index < txt_length) {
+        uint16_t hunk_len = txt_data[index];
+        uint16_t next_index = index + hunk_len + 1;
+
+        // Overflow or past the end of data?
+        if (next_index > txt_length || next_index < index) {
+            break;
+        }
+
+        // Out of space, shouldn't be possible.
+        if (sp + continuation_length + 1 >= lim) {
+            break;
+        }
+        if (hunk_len != 0) {
+            if (continuation_length != 0 && sp + continuation_length + 1 < lim) {
+                memcpy(sp, continuation_string, continuation_length);
+                sp += continuation_length;
+                *sp = 0;
+            }
+            continuation_string = commasp;
+            continuation_length = 2;
+
+            for (int i = index + 1; i < index + 1 + hunk_len; i++) {
+                if (isascii(txt_data[i]) && isprint(txt_data[i])) {
+                    if (sp + 1 < lim) {
+                        *sp++ = txt_data[i];
+                        *sp = 0;
+                    }
+                } else {
+                    if (sp + 5 < lim) {
+                        size_t ret = snprintf(sp, 5, "\%o", txt_data[i]);
+                        sp += ret; // Note that this might push sp past lim, which is fine because we'll then exit the loops.
+                    }
+                }
+            }
+        }
+        index = next_index;
+    }
+}
+
+bool
+dns_rrs_equal(dns_rr_t *a, dns_rr_t *b, bool rdata_present)
+{
+    // Obvious stuff first...  We do not compare TTL.
+    if (a->type != b->type || a->qclass != b->qclass) {
+        return false;
+    }
+    if (!dns_names_equal(a->name, b->name)) {
+        return false;
+    }
+    if (!rdata_present) {
+        return true;
+    }
+
+    switch(a->type) {
+        // There's no reason to compare invalid RRs, but if we do, they are all equally invalid.
+    case dns_invalid_rr:
+        return true;
+
+        // Anything we don't have a specific format for we store as binary data.
+    default:
+        if (a->data.unparsed.len == b->data.unparsed.len) {
+            return memcmp(a->data.unparsed.data, b->data.unparsed.data, a->data.unparsed.len) == 0;
+        }
+        break;
+
+        // All have a single name as the data
+    case dns_rrtype_ptr:
+    case dns_rrtype_ns:
+    case dns_rrtype_cname:
+        return dns_names_equal(a->data.ptr.name, b->data.ptr.name);
+
+    case dns_rrtype_srv:
+        if (a->data.srv.priority == b->data.srv.priority &&
+            a->data.srv.weight == b->data.srv.weight && a->data.srv.port == b->data.srv.port)
+        {
+            return dns_names_equal(a->data.srv.name, b->data.srv.name);
+        }
+        break;
+
+    case dns_rrtype_a:
+        return a->data.a.s_addr == b->data.a.s_addr;
+
+    case dns_rrtype_aaaa:
+        return in6addr_compare(&a->data.aaaa, &b->data.aaaa) == 0;
+
+        // We could compare signatures, but it doesn't really make sense.
+    case dns_rrtype_sig:
+        break;
+
+    case dns_rrtype_key:
+        return dns_keys_rdata_equal(a, b);
+
+    case dns_rrtype_txt:
+        if (a->data.txt.len == b->data.txt.len) {
+            return memcmp(a->data.txt.data, b->data.txt.data, a->data.txt.len) == 0;
+        }
+    }
+    return false;
+}
+
+bool
+dns_rr_to_wire(dns_towire_state_t *towire, dns_rr_t *rr, bool question)
+{
+    uint8_t *revert = towire->p;
+
+    if (towire->truncated) {
+        return false;
+    }
+
+    // Copy out the invariants.
+    dns_concatenate_name_to_wire(towire, rr->name, NULL, NULL);
+    dns_u16_to_wire(towire, rr->type);
+    dns_u16_to_wire(towire, rr->qclass);
+
+    // Questions don't have RDATA.
+    if (!question) {
+        dns_ttl_to_wire(towire, rr->ttl);
+        dns_rdlength_begin(towire);
+        switch(rr->type) {
+            // There's no reason to compare invalid RRs, but if we do, they are all equally invalid.
+        case dns_invalid_rr:
+            ERROR("invalid rr!");
+            towire->error = EINVAL;
+            break;
+
+            // Anything we don't have a specific format for we store as binary data.
+        default:
+            dns_rdata_raw_data_to_wire(towire, rr->data.unparsed.data, rr->data.unparsed.len);
+            break;
+
+            // All have a single name as the data
+        case dns_rrtype_ptr:
+        case dns_rrtype_ns:
+        case dns_rrtype_cname:
+            dns_concatenate_name_to_wire(towire, rr->data.ptr.name, NULL, NULL);
+            break;
+
+        case dns_rrtype_srv:
+            dns_u16_to_wire(towire, rr->data.srv.priority);
+            dns_u16_to_wire(towire, rr->data.srv.weight);
+            dns_u16_to_wire(towire, rr->data.srv.port);
+            dns_concatenate_name_to_wire(towire, rr->data.ptr.name, NULL, NULL);
+            break;
+
+        case dns_rrtype_a:
+            dns_rdata_raw_data_to_wire(towire, &rr->data.a, sizeof(rr->data.a));
+            break;
+
+        case dns_rrtype_aaaa:
+            dns_rdata_raw_data_to_wire(towire, &rr->data.aaaa, sizeof(rr->data.aaaa));
+            break;
+
+            // We could compare signatures, but it doesn't really make sense.
+        case dns_rrtype_sig:
+            ERROR("signature not valid here!");
+            towire->error = EINVAL;
+            break;
+
+        case dns_rrtype_key:
+            ERROR("key not valid here!");
+            towire->error = EINVAL;
+            break;
+
+        case dns_rrtype_txt:
+            dns_rdata_raw_data_to_wire(towire, rr->data.txt.data, rr->data.txt.len);
+            break;
+        }
+        dns_rdlength_end(towire);
+    }
+
+    if (towire->truncated || towire->error) {
+        towire->p = revert;
+        return false;
+    }
+    return true;
+}
+
+void
+dns_message_rrs_to_wire(dns_towire_state_t *towire, dns_message_t *message)
+{
+    bool question = true;
+    for (int i = 0; i < 4; i++) {
+        int count = 0;
+        dns_rr_t *rrs = NULL;
+        switch(i) {
+        case 0: count = message->qdcount; rrs = message->questions; break;
+        case 1: count = message->ancount; rrs = message->answers; break;
+        case 2: count = message->nscount; rrs = message->authority; break;
+        case 3: count = message->arcount; rrs = message->additional; break;
+        }
+
+        for (int j = 0; j < count; j++) {
+            dns_rr_t *rr = &rrs[j];
+            if (!dns_rr_to_wire(towire, rr, question)) {
+                // XXX if it's TCP we really need to embiggen here.
+                ERROR("no space in message for rr %d/%d %d", i, j, rr->type);
+            }
+        }
+        question = false;
+    }
+}
+
 // Local Variables:
 // mode: C
 // tab-width: 4

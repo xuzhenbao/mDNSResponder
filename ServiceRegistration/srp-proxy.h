@@ -25,9 +25,8 @@ typedef struct srp_server_state srp_server_t;
 typedef struct srpl_connection srpl_connection_t;
 
 void srp_proxy_listener_cancel(srp_proxy_listener_state_t *NONNULL listener_state);
-srp_proxy_listener_state_t *NULLABLE srp_proxy_listen(uint16_t *NULLABLE avoid_ports, int num_avoid_ports,
-                                                      ready_callback_t NULLABLE ready,
-                                                      srp_server_t *NONNULL server_state);
+comm_t *NULLABLE srp_proxy_listen(uint16_t *NULLABLE avoid_ports, int num_avoid_ports, ready_callback_t NULLABLE ready,
+                                  cancel_callback_t NULLABLE cancel, void *NONNULL context);
 void srp_proxy_init(const char *NONNULL update_zone);
 bool srp_evaluate(comm_t *NONNULL comm, srp_server_t *NULLABLE server_state,
                   srpl_connection_t *NULLABLE srpl_connection,

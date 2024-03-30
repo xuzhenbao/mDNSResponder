@@ -178,7 +178,7 @@ struct qm_trace {
 #define QMD_TRACE_ELEM(elem)
 #define QMD_TRACE_HEAD(head)
 #define TRACEBUF
-#define TRASHIT(x)
+#define TRASHIT(x)      do {(x) = (void *)0;} while (0)
 #endif  /* QUEUE_MACRO_DEBUG */
 
 /*
@@ -309,18 +309,22 @@ do {                                                                    \
 	                curelm = SLIST_NEXT(curelm, field);             \
 	        SLIST_REMOVE_AFTER(curelm, field);                      \
 	}                                                               \
-	TRASHIT((elm)->field.sle_next);                                 \
 } while (0)                                                             \
 __NULLABILITY_COMPLETENESS_POP                                      \
 __MISMATCH_TAGS_POP
 
 #define SLIST_REMOVE_AFTER(elm, field) do {                             \
+	__typeof__(elm) __remove_elem = SLIST_NEXT(elm, field);         \
 	SLIST_NEXT(elm, field) =                                        \
-	    SLIST_NEXT(SLIST_NEXT(elm, field), field);                  \
+	    SLIST_NEXT(__remove_elem, field);                           \
+	TRASHIT(__remove_elem->field.sle_next);                         \
 } while (0)
 
 #define SLIST_REMOVE_HEAD(head, field) do {                             \
-	SLIST_FIRST((head)) = SLIST_NEXT(SLIST_FIRST((head)), field);   \
+	__typeof__(SLIST_FIRST((head))) __remove_elem =                 \
+	    SLIST_FIRST((head));                                        \
+	SLIST_FIRST((head)) = SLIST_NEXT(__remove_elem, field);         \
+	TRASHIT(__remove_elem->field.sle_next);                         \
 } while (0)
 
 /*
@@ -422,26 +426,31 @@ do {                                                                    \
 	                curelm = STAILQ_NEXT(curelm, field);            \
 	        STAILQ_REMOVE_AFTER(head, curelm, field);               \
 	}                                                               \
-	TRASHIT((elm)->field.stqe_next);                                \
 } while (0)                                                             \
 __NULLABILITY_COMPLETENESS_POP                                      \
 __MISMATCH_TAGS_POP
 
 #define STAILQ_REMOVE_HEAD(head, field) do {                            \
+	__typeof__(STAILQ_FIRST((head))) __remove_elem =                \
+	    STAILQ_FIRST((head));                                       \
 	if ((STAILQ_FIRST((head)) =                                     \
-	     STAILQ_NEXT(STAILQ_FIRST((head)), field)) == NULL)         \
+	     STAILQ_NEXT(__remove_elem, field)) == NULL)                \
 	        (head)->stqh_last = &STAILQ_FIRST((head));              \
+	TRASHIT(__remove_elem->field.stqe_next);                        \
 } while (0)
 
 #define STAILQ_REMOVE_HEAD_UNTIL(head, elm, field) do {                 \
-       if ((STAILQ_FIRST((head)) = STAILQ_NEXT((elm), field)) == NULL) \
-	       (head)->stqh_last = &STAILQ_FIRST((head));              \
+	if ((STAILQ_FIRST((head)) = STAILQ_NEXT((elm), field)) == NULL) \
+	       (head)->stqh_last = &STAILQ_FIRST((head));               \
+	TRASHIT((elm)->field.stqe_next);                                \
 } while (0)
 
 #define STAILQ_REMOVE_AFTER(head, elm, field) do {                      \
+	__typeof__(elm) __remove_elem = STAILQ_NEXT(elm, field);        \
 	if ((STAILQ_NEXT(elm, field) =                                  \
-	     STAILQ_NEXT(STAILQ_NEXT(elm, field), field)) == NULL)      \
+	    STAILQ_NEXT(__remove_elem, field)) == NULL)                 \
 	        (head)->stqh_last = &STAILQ_NEXT((elm), field);         \
+	TRASHIT(__remove_elem->field.stqe_next);                        \
 } while (0)
 
 #define STAILQ_SWAP(head1, head2, type)                                 \
@@ -855,6 +864,8 @@ __MISMATCH_TAGS_POP
 	else                                                            \
 	        (elm)->field.cqe_prev->field.cqe_next =                 \
 	            (elm)->field.cqe_next;                              \
+	TRASHIT((elm)->field.cqe_next);                                 \
+	TRASHIT((elm)->field.cqe_prev);                                 \
 } while (0)
 
 #ifdef _KERNEL

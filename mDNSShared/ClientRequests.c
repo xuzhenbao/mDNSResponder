@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 
 #include "DNSCommon.h"
 #include "uDNS.h"
-#include "mdns_strict.h"
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
 #include "QuerierSupport.h"
@@ -52,6 +51,8 @@ int WCFNameResolvesToName(WCFConnection *conn, char* fromName, char* toName, uid
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
 #include "dnssec.h"
 #endif
+
+#include "mdns_strict.h"
 
 #define RecordTypeIsAddress(TYPE)   (((TYPE) == kDNSType_A) || ((TYPE) == kDNSType_AAAA))
 
@@ -92,12 +93,13 @@ typedef struct
     mDNSBool                prohibitEncryptedDNS;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    const audit_token_t *   peerAuditToken;
-    const audit_token_t *   delegatorAuditToken;
+    mdns_audit_token_t      peerToken;
+    mdns_audit_token_t      delegatorToken;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
     dnssd_log_privacy_level_t logPrivacyLevel;
 #endif
+    mDNSBool                persistWhenARecordsUnusable;
 
 }   QueryRecordOpParams;
 
@@ -217,13 +219,14 @@ mDNSexport mStatus GetAddrInfoClientRequestStart(GetAddrInfoClientRequest *inReq
     opParams.prohibitEncryptedDNS   = inParams->prohibitEncryptedDNS;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    opParams.peerAuditToken         = inParams->peerAuditToken;
-    opParams.delegatorAuditToken    = inParams->delegatorAuditToken;
+    opParams.peerToken              = inParams->peerToken;
+    opParams.delegatorToken         = inParams->delegatorToken;
     opParams.isInAppBrowserRequest  = inParams->isInAppBrowserRequest;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
     opParams.logPrivacyLevel        = inParams->logPrivacyLevel;
 #endif
+    opParams.persistWhenARecordsUnusable = inParams->persistWhenARecordsUnusable;
 
     if (inRequest->protocols & kDNSServiceProtocol_IPv6)
     {
@@ -375,13 +378,13 @@ mDNSexport mStatus QueryRecordClientRequestStart(QueryRecordClientRequest *inReq
     opParams.prohibitEncryptedDNS   = inParams->prohibitEncryptedDNS;
 #endif
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    opParams.peerAuditToken         = inParams->peerAuditToken;
-    opParams.delegatorAuditToken    = inParams->delegatorAuditToken;
+    opParams.peerToken              = inParams->peerToken;
+    opParams.delegatorToken         = inParams->delegatorToken;
     opParams.isInAppBrowserRequest  = inParams->isInAppBrowserRequest;
 #endif
-    opParams.useAAAAFallback        = inParams->useAAAAFallback;
+    opParams.useAAAAFallback   = inParams->useAAAAFallback;
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-    opParams.logPrivacyLevel        = inParams->logPrivacyLevel;
+    opParams.logPrivacyLevel   = inParams->logPrivacyLevel;
 #endif
 
     err = QueryRecordOpStart(&inRequest->op, &opParams, inResultHandler, inResultContext);
@@ -445,6 +448,33 @@ mDNSlocal void QueryRecordOpFree(QueryRecordOp *operation)
     mDNSPlatformMemFree(operation);
 }
 
+mDNSlocal void QueryRecordOpEventHandler(DNSQuestion *const inQuestion, const mDNSQuestionEvent event)
+{
+    QueryRecordOp *const op = (QueryRecordOp *)inQuestion->QuestionContext;
+    switch (event)
+    {
+        case mDNSQuestionEvent_NoMoreExpiredRecords:
+            if ((inQuestion->ExpRecordPolicy == mDNSExpiredRecordPolicy_UseCached) && op->gotExpiredCNAME)
+            {
+                // If an expired CNAME record was encountered, then rewind back to the original QNAME.
+                QueryRecordOpStopQuestion(inQuestion);
+                LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_INFO,
+                    "[R%u->Q%u] Restarting question that got expired CNAMEs -- current name: " PRI_DM_NAME
+                    ", original name: " PRI_DM_NAME ", type: " PUB_DNS_TYPE,
+                    op->reqID, mDNSVal16(inQuestion->TargetQID), DM_NAME_PARAM(&inQuestion->qname), DM_NAME_PARAM(op->qname),
+                    DNS_TYPE_PARAM(inQuestion->qtype));
+                op->gotExpiredCNAME = mDNSfalse;
+                AssignDomainName(&inQuestion->qname, op->qname);
+                inQuestion->ExpRecordPolicy = mDNSExpiredRecordPolicy_Immortalize;
+            #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
+                mDNSPlatformMemCopy(inQuestion->ResolverUUID, op->resolverUUID, UUID_SIZE);
+            #endif
+                QueryRecordOpStartQuestion(op, inQuestion);
+            }
+            break;
+    }
+}
+
 #define VALID_MSAD_SRV_TRANSPORT(T) \
     (SameDomainLabel((T)->c, (const mDNSu8 *)"\x4_tcp") || SameDomainLabel((T)->c, (const mDNSu8 *)"\x4_udp"))
 #define VALID_MSAD_SRV(Q) ((Q)->qtype == kDNSType_SRV && VALID_MSAD_SRV_TRANSPORT(SecondLabel(&(Q)->qname)))
@@ -477,48 +507,50 @@ mDNSlocal mStatus QueryRecordOpStart(QueryRecordOp *inOp, const QueryRecordOpPar
     inOp->failoverMode         = inParams->failoverMode;
     inOp->prohibitEncryptedDNS = inParams->prohibitEncryptedDNS;
     inOp->qtype                = inParams->qtype;
+    if (!inOp->prohibitEncryptedDNS && inParams->resolverUUID)
+    {
+        mDNSPlatformMemCopy(inOp->resolverUUID, inParams->resolverUUID, UUID_SIZE);
+    }
 #endif
-
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+    mdns_replace(&inOp->peerToken, inParams->peerToken);
+    mdns_replace(&inOp->delegatorToken, inParams->delegatorToken);
+#endif
     // Set up DNSQuestion.
-
     if (EnableAllowExpired && (inParams->flags & kDNSServiceFlagsAllowExpiredAnswers))
     {
-        q->allowExpired = AllowExpired_AllowExpiredAnswers;
+        q->ExpRecordPolicy     = mDNSExpiredRecordPolicy_UseCached;
     }
     else
     {
-        q->allowExpired = AllowExpired_None;
+        q->ExpRecordPolicy     = mDNSExpiredRecordPolicy_DoNotUse;
     }
-    q->ServiceID = inParams->serviceID;
+    q->ServiceID                  = inParams->serviceID;
 #if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
-    q->inAppBrowserRequest = inParams->isInAppBrowserRequest;
-    if (inParams->peerAuditToken)
-    {
-        q->peerAuditToken = *inParams->peerAuditToken;
-    }
-    if (inParams->delegatorAuditToken)
-    {
-        q->delegateAuditToken = *inParams->delegatorAuditToken;
-    }
+    q->inAppBrowserRequest        = inParams->isInAppBrowserRequest;
+    q->PeerToken                  = inOp->peerToken;
+    q->DelegatorToken             = inOp->delegatorToken;
 #endif
-    q->InterfaceID          = inParams->interfaceID;
-    q->flags                = inParams->flags;
+    q->InterfaceID                = inParams->interfaceID;
+    q->flags                      = inParams->flags;
     AssignDomainName(&q->qname, inParams->qname);
-    q->qtype                = inParams->qtype;
-    q->qclass               = inParams->qclass;
-    q->LongLived            = (inParams->flags & kDNSServiceFlagsLongLivedQuery)            ? mDNStrue : mDNSfalse;
-    q->ForceMCast           = (inParams->flags & kDNSServiceFlagsForceMulticast)            ? mDNStrue : mDNSfalse;
-    q->ReturnIntermed       = (inParams->flags & kDNSServiceFlagsReturnIntermediates)       ? mDNStrue : mDNSfalse;
-    q->SuppressUnusable     = (inParams->flags & kDNSServiceFlagsSuppressUnusable)          ? mDNStrue : mDNSfalse;
-    q->TimeoutQuestion      = (inParams->flags & kDNSServiceFlagsTimeout)                   ? mDNStrue : mDNSfalse;
-    q->UseBackgroundTraffic = (inParams->flags & kDNSServiceFlagsBackgroundTrafficClass)    ? mDNStrue : mDNSfalse;
+    q->qtype                      = inParams->qtype;
+    q->qclass                     = inParams->qclass;
+    q->LongLived                  = (inParams->flags & kDNSServiceFlagsLongLivedQuery)         ? mDNStrue : mDNSfalse;
+    q->ForceMCast                 = (inParams->flags & kDNSServiceFlagsForceMulticast)         ? mDNStrue : mDNSfalse;
+    q->ReturnIntermed             = (inParams->flags & kDNSServiceFlagsReturnIntermediates)    ? mDNStrue : mDNSfalse;
+    q->SuppressUnusable           = (inParams->flags & kDNSServiceFlagsSuppressUnusable)       ? mDNStrue : mDNSfalse;
+    q->TimeoutQuestion            = (inParams->flags & kDNSServiceFlagsTimeout)                ? mDNStrue : mDNSfalse;
+    q->UseBackgroundTraffic       = (inParams->flags & kDNSServiceFlagsBackgroundTrafficClass) ? mDNStrue : mDNSfalse;
 #if MDNSRESPONDER_SUPPORTS(APPLE, DNSSECv2)
-    q->enableDNSSEC         = dns_service_flags_enables_dnssec(inParams->flags);
+    q->enableDNSSEC               = dns_service_flags_enables_dnssec(inParams->flags);
 #endif
-    q->AppendSearchDomains  = inParams->appendSearchDomains;
+    q->AppendSearchDomains        = inParams->appendSearchDomains;
+    q->PersistWhenRecordsUnusable = (inParams->qtype == kDNSType_A) && inParams->persistWhenARecordsUnusable;
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-    q->RequireEncryption    = inParams->needEncryption;
-    q->CustomID             = inParams->customID;
+    q->RequireEncryption          = inParams->needEncryption;
+    q->CustomID                   = inParams->customID;
+    q->ProhibitEncryptedDNS       = inOp->prohibitEncryptedDNS;
     if (inOp->failoverMode)
     {
         q->IsFailover = mDNStrue;
@@ -528,14 +560,7 @@ mDNSlocal mStatus QueryRecordOpStart(QueryRecordOp *inOp, const QueryRecordOpPar
             q->ForcePathEval = mDNStrue;
         }
     }
-    if (inOp->prohibitEncryptedDNS)
-    {
-        q->ProhibitEncryptedDNS = mDNStrue;
-    }
-    else if (inParams->resolverUUID && !q->ProhibitEncryptedDNS)
-    {
-        mDNSPlatformMemCopy(q->ResolverUUID, inParams->resolverUUID, UUID_SIZE);
-    }
+    mDNSPlatformMemCopy(q->ResolverUUID, inOp->resolverUUID, UUID_SIZE);
 #endif
     q->InitialCacheMiss     = mDNSfalse;
 
@@ -552,6 +577,7 @@ mDNSlocal mStatus QueryRecordOpStart(QueryRecordOp *inOp, const QueryRecordOpPar
     q->request_id       = inParams->requestID;
     q->QuestionCallback = QueryRecordOpCallback;
     q->ResetHandler     = QueryRecordOpResetHandler;
+    q->EventHandler     = QueryRecordOpEventHandler;
 
     // For single label queries that are not fully qualified, look at /etc/hosts, cache and try search domains before trying
     // them on the wire as a single label query. - Mohan
@@ -641,6 +667,10 @@ mDNSlocal void QueryRecordOpStop(QueryRecordOp *op)
         op->q2 = mDNSNULL;
     }
 #endif
+#if MDNSRESPONDER_SUPPORTS(APPLE, AUDIT_TOKEN)
+    mdns_forget(&op->peerToken);
+    mdns_forget(&op->delegatorToken);
+#endif
 }
 
 mDNSlocal mDNSBool QueryRecordOpIsMulticast(const QueryRecordOp *op)
@@ -692,7 +722,23 @@ mDNSlocal void QueryRecordOpCallback(mDNS *m, DNSQuestion *inQuestion, const Res
         goto exit;
     }
 #endif
-
+    // The mDNSExpiredRecordPolicy_UseCached policy unconditionally provides us with CNAMEs. So if the client
+    // doesn't want intermediate results, which includes CNAMEs, then don't provide them with CNAMEs unless the
+    // client request was specifically for CNAME records.
+    if (inQuestion->ExpRecordPolicy == mDNSExpiredRecordPolicy_UseCached)
+    {
+        if ((inAddRecord == QC_add) && (inAnswer->rrtype == kDNSType_CNAME))
+        {
+            if (inAnswer->mortality == Mortality_Ghost)
+            {
+                op->gotExpiredCNAME = mDNStrue;
+            }
+            if (!(inQuestion->ReturnIntermed || (inQuestion->qtype == kDNSType_CNAME)))
+            {
+                goto exit;
+            }
+        }
+    }
     if (inAddRecord == QC_suppressed)
     {
         LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG,
@@ -816,7 +862,11 @@ mDNSlocal void QueryRecordOpCallback(mDNS *m, DNSQuestion *inQuestion, const Res
 #if MDNSRESPONDER_SUPPORTS(APPLE, WEB_CONTENT_FILTER)
     const uid_t euid = inQuestion->euid;
 #endif
-    if (op->resultHandler) op->resultHandler(m, inQuestion, inAnswer, inAddRecord, resultErr, op->resultContext);
+    if (op->resultHandler)
+    {
+        const mDNSBool expired = (inAddRecord == QC_add) && (op->gotExpiredCNAME || (inAnswer->mortality == Mortality_Ghost));
+        op->resultHandler(m, inQuestion, inAnswer, expired, inAddRecord, resultErr, op->resultContext);
+    }
     if (m->CurrentQuestion == inQuestion)
     {
         if (resultErr == kDNSServiceErr_Timeout) QueryRecordOpStopQuestion(inQuestion);

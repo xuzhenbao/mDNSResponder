@@ -1357,7 +1357,8 @@ static OSStatus	ServiceSpecificRun( int argc, LPTSTR argv[] )
 		{
 			if (ret == kDNSStopEvent)
 			{
-				break;
+				err = ServiceSpecificStop();
+				check( !err );
 			}
 		}
 #endif
@@ -1434,10 +1435,6 @@ static OSStatus	ServiceSpecificStop( void )
 {
 	OSStatus    err;
 	BOOL        ok;
-
-#ifdef WIN32_CENTENNIAL
-	DNSServiceStop();
-#endif
 
 	ok = SetEvent(gStopEvent);
 	err = translate_errno( ok, (OSStatus) GetLastError(), kUnknownErr );

@@ -1,6 +1,6 @@
 /* adv-ctl-common.h
  *
- * Copyright (c) 2019-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,12 @@
 #define kDNSSDAdvertisingProxyAddPrefix                    18
 #define kDNSSDAdvertisingProxyRemovePrefix                 19
 #define kDNSSDAdvertisingProxyStartDroppingPushConnections 20
+#define kDNSSDAdvertisingProxyAddNAT64Prefix               21
+#define kDNSSDAdvertisingProxyRemoveNAT64Prefix            22
+#define kDNSSDAdvertisingProxyStartBreakingTimeValidation  23
+#define kDNSSDAdvertisingProxySetVariable                  24
+#define kDNSSDAdvertisingProxyBlockAnycastService          25
+#define kDNSSDAdvertisingProxyUnblockAnycastService        26
 
 #endif /* XPC_CLIENT_ADVERTISING_PROXY_H */
 

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@
 #include	<lm.h>
 #include	<winioctl.h>
 #include	<ntddndis.h>        // This defines the IOCTL constants.
+#include	<sysinfoapi.h>
 
 #include	"mDNSEmbeddedAPI.h"
 #include	"GenLinkedList.h"

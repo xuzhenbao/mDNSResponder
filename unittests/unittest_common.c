@@ -37,7 +37,7 @@ mDNSexport mStatus init_mdns_environment(mDNSBool enableLogging)
 // This function sets up the minimum environement to run a unit test. It
 // initializes logging and timenow.  This is the call to use if your
 // unit test does not use interfaces.
-mDNSexport mStatus init_mdns_storage()
+mDNSexport mStatus init_mdns_storage(void)
 {
 	mDNS *m = &mDNSStorage;
 
@@ -82,7 +82,7 @@ mDNSexport mStatus start_client_request(request_state* req, const uint8_t *msgbu
 	init_client_request(req, msgbuf, msgsz, op);
 
 	mStatus result = handle_client_request_ut((void*)req);
-	DNSQuestion* q = &req->u.queryrecord.op.q;
+	DNSQuestion* q = &req->queryrecord->op.q;
 	q->LocalSocket = socket;
 	return result;
 }
@@ -94,7 +94,7 @@ mDNSexport void receive_response(const request_state* req, DNSMessage *msg, size
 	mDNSAddr srcaddr;
 	mDNSIPPort srcport, dstport;
 	const mDNSu8 * end;
-	DNSQuestion *q = (DNSQuestion *)&req->u.queryrecord.op.q;
+	DNSQuestion *q = (DNSQuestion *)&req->queryrecord->op.q;
 	UInt8* data = (UInt8*)msg;
 
 	// Used same values for DNS server as specified during init of unit test

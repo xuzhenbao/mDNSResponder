@@ -24,7 +24,10 @@
 CU_ASSUME_NONNULL_BEGIN
 
 void
-nat64_startup(dispatch_queue_t queue);
+nat64_start_translation(dispatch_queue_t queue);
+
+void
+nat64_stop_translation(void);
 
 void
 nat64_set_ula_prefix(const struct in6_addr *prefix);
@@ -34,6 +37,12 @@ nat64_get_ipv6_prefix(void);
 
 bool
 nat64_is_active(void);
+
+void
+nat64_pass_all_pf_rule_delete(void);
+
+void
+nat64_pass_all_pf_rule_set(const char *interface);
 
 CU_ASSUME_NONNULL_END
 

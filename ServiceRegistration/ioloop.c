@@ -1,6 +1,6 @@
 /* ioloop.c
  *
- * Copyright (c) 2018-2022 Apple, Inc. All rights reserved.
+ * Copyright (c) 2018-2023 Apple, Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,8 @@
 #ifndef EXCLUDE_TLS
 #include "srp-tls.h"
 #endif
+
+#ifndef IOLOOP_MACOS
 
 typedef struct async_event {
     struct async_event *next;
@@ -107,14 +109,14 @@ void
 ioloop_message_retain_(message_t *message, const char *file, int line)
 {
     (void)file; (void)line;
-    RETAIN(message);
+    RETAIN(message, message);
 }
 
 void
 ioloop_message_release_(message_t *message, const char *file, int line)
 {
     (void)file; (void)line;
-    RELEASE(message, message_finalize);
+    RELEASE(message, message);
 }
 
 void
@@ -135,7 +137,7 @@ add_io(io_t *io)
     if (*iop == NULL) {
         *iop = io;
         io->next = NULL;
-        RETAIN_HERE(io);
+        RETAIN_HERE(io, io);
     }
 }
 
@@ -214,6 +216,13 @@ add_remove_wakeup(wakeup_t *wakeup, bool remove)
     for (p_wakeups = &wakeups; *p_wakeups != NULL && *p_wakeups != wakeup; p_wakeups = &((*p_wakeups)->next))
         ;
     if (remove) {
+        void *wakeup_context = wakeup->context;
+        finalize_callback_t finalize = wakeup->finalize;
+        wakeup->context = NULL;
+        if (wakeup->finalize != NULL) {
+            wakeup->finalize = NULL;
+            wakeup_finalize(wakeup_context);
+        }
         if (*p_wakeups != NULL) {
             *p_wakeups = wakeup->next;
             wakeup->next = NULL;
@@ -231,9 +240,6 @@ wakeup_finalize(void *context)
 {
     wakeup_t *wakeup = context;
     add_remove_wakeup(wakeup, true);
-    if (wakeup->finalize != NULL) {
-        wakeup->finalize(wakeup->context);
-    }
     free(wakeup);
 }
 
@@ -241,14 +247,14 @@ void
 ioloop_wakeup_retain_(wakeup_t *wakeup, const char *file, int line)
 {
     (void)file; (void)line;
-    RETAIN(wakeup);
+    RETAIN(wakeup, wakeup);
 }
 
 void
 ioloop_wakeup_release_(wakeup_t *wakeup, const char *file, int line)
 {
     (void)file; (void)line;
-    RELEASE(wakeup, wakeup_finalize);
+    RELEASE(wakeup, wakeup);
 }
 
 wakeup_t *
@@ -256,7 +262,7 @@ ioloop_wakeup_create_(const char *file, int line)
 {
     wakeup_t *ret = calloc(1, sizeof(*ret));
     if (ret) {
-        RETAIN(ret);
+        RETAIN(ret, wakeup);
     }
     return ret;
 }
@@ -273,6 +279,7 @@ ioloop_add_wake_event(wakeup_t *wakeup, void *context, wakeup_callback_t callbac
         return false;
     }
     INFO("%p %p %d", wakeup, context, milliseconds);
+    add_remove_wakeup(wakeup, true);
     add_remove_wakeup(wakeup, false);
     wakeup->wakeup_time = ioloop_timenow() + milliseconds;
     wakeup->finalize = finalize;
@@ -284,11 +291,6 @@ ioloop_add_wake_event(wakeup_t *wakeup, void *context, wakeup_callback_t callbac
 void
 ioloop_cancel_wake_event(wakeup_t *wakeup)
 {
-    if (wakeup->finalize) {
-        wakeup->finalize(wakeup->context);
-        wakeup->finalize = NULL;
-        wakeup->context = NULL;
-    }
     add_remove_wakeup(wakeup, true);
     wakeup->wakeup_time = 0;
 }
@@ -363,7 +365,14 @@ start_over:
             if (wakeup->wakeup_time <= ioloop_now) {
                 *p_wakeup = wakeup->next;
                 wakeup->wakeup_time = 0;
-                wakeup->wakeup(wakeup->context);
+                void *wakeup_context = wakeup->context;
+                finalize_callback_t wakeup_finalize = wakeup->finalize;
+                wakeup->finalize = NULL;
+                wakeup->context = NULL;
+                wakeup->wakeup(wakeup_context);
+                if (wakeup_finalize != NULL && wakeup_context != NULL) {
+                    wakeup_finalize(wakeup_context);
+                }
                 ++nev;
 
                 // In case either wakeup has been freed, or a new wakeup has been added, we need to start
@@ -397,7 +406,7 @@ start_over:
         // If the I/O is dead, finalize or free it.
         if (io->fd == -1) {
             *iop = io->next;
-            RELEASE_HERE(io, ioloop_io_finalize);
+            RELEASE_HERE(io, io);
             continue;
         }
 
@@ -447,7 +456,7 @@ start_over:
                 subproc->callback(subproc->context, status, NULL);
                 if (!WIFSTOPPED(status)) {
                     subproc->finished = true;
-                    RELEASE_HERE(subproc, subproc_finalize);
+                    RELEASE_HERE(subproc, subproc);
                     break;
                 }
             }
@@ -543,13 +552,14 @@ ioloop(void)
     ERROR("ioloop returned %d.", nev);
     return -1;
 }
+#endif // !defined(IOLOOP_MACOS)
 
-static void
-udp_read_callback(io_t *io, void *context)
+void
+ioloop_udp_read_callback(io_t *io, void *context)
 {
-    comm_t *connection = (comm_t *)io;
+    comm_t *connection = (comm_t *)context;
     addr_t src;
-    int rv;
+    ssize_t rv;
     struct msghdr msg;
     struct iovec bufp;
     uint8_t msgbuf[DNS_MAX_UDP_PAYLOAD];
@@ -567,18 +577,22 @@ udp_read_callback(io_t *io, void *context)
     msg.msg_control = cmsgbuf;
     msg.msg_controllen = sizeof cmsgbuf;
 
-    rv = recvmsg(connection->io.fd, &msg, 0);
+    rv = recvmsg(io->fd, &msg, 0);
     if (rv < 0) {
-        ERROR("udp_read_callback: %s", strerror(errno));
+        ERROR("%s", strerror(errno));
         return;
     }
     message = ioloop_message_create(rv);
     if (!message) {
-        ERROR("udp_read_callback: out of memory");
+        ERROR("out of memory");
         return;
     }
     memcpy(&message->src, &src, sizeof src);
-    message->length = rv;
+    if (rv > UINT16_MAX) {
+        ERROR("message is surprisingly large: %zd", rv);
+        return;
+    }
+    message->length = (uint16_t)rv;
     memcpy(&message->wire, msgbuf, rv);
 
     // For UDP, we use the interface index as part of the validation strategy, so go get
@@ -590,13 +604,21 @@ udp_read_callback(io_t *io, void *context)
             memcpy(&pktinfo, CMSG_DATA(cmh), sizeof pktinfo);
             message->ifindex = pktinfo.ipi6_ifindex;
 
-            /* Get the destination address, for use when replying. */
+            /* Get address to which the message was sent, for use when replying. */
             message->local.sin6.sin6_family = AF_INET6;
-            message->local.sin6.sin6_port = 0;
+            message->local.sin6.sin6_port = htons(connection->listen_port);
             message->local.sin6.sin6_addr = pktinfo.ipi6_addr;
 #ifndef NOT_HAVE_SA_LEN
             message->local.sin6.sin6_len = sizeof message->local;
 #endif
+            SEGMENTED_IPv6_ADDR_GEN_SRP(&src.sin6.sin6_addr, src_addr_buf);
+            SEGMENTED_IPv6_ADDR_GEN_SRP(&message->local.sin6.sin6_addr, dest_addr_buf);
+                INFO("received %zd byte UDP message on index %d to " PRI_SEGMENTED_IPv6_ADDR_SRP "#%d from "
+                     PRI_SEGMENTED_IPv6_ADDR_SRP "#%d", rv, message->ifindex,
+                     SEGMENTED_IPv6_ADDR_PARAM_SRP(&message->local.sin6.sin6_addr,  dest_addr_buf),
+                     ntohs(message->local.sin6.sin6_port),
+                     SEGMENTED_IPv6_ADDR_PARAM_SRP(&src.sin6.sin6_addr, src_addr_buf),
+                     ntohs(src.sin6.sin6_port));
         } else if (cmh->cmsg_level == IPPROTO_IP && cmh->cmsg_type == IP_PKTINFO) {
             struct in_pktinfo pktinfo;
 
@@ -604,17 +626,25 @@ udp_read_callback(io_t *io, void *context)
             message->ifindex = pktinfo.ipi_ifindex;
 
             message->local.sin.sin_family = AF_INET;
-            message->local.sin.sin_port = 0;
             message->local.sin.sin_addr = pktinfo.ipi_addr;
 #ifndef NOT_HAVE_SA_LEN
             message->local.sin.sin_len = sizeof message->local;
 #endif
+            message->local.sin.sin_port = htons(connection->listen_port);
+            IPv4_ADDR_GEN_SRP(&src.sin.sin_addr.s_addr, src_addr_buf);
+            IPv4_ADDR_GEN_SRP(&message->local.sin.sin_addr.s_addr, dest_addr_buf);
+            INFO("received %zd byte UDP message on index %d to " PRI_IPv4_ADDR_SRP "#%d from " PRI_IPv4_ADDR_SRP "#%d", rv,
+                 message->ifindex, IPv4_ADDR_PARAM_SRP(&message->local.sin.sin_addr.s_addr, dest_addr_buf),
+                 ntohs(message->local.sin.sin_port),
+                 IPv4_ADDR_PARAM_SRP(&src.sin.sin_addr.s_addr, src_addr_buf),
+                 ntohs(src.sin.sin_port));
         }
     }
     connection->datagram_callback(connection, message, connection->context);
-    RELEASE_HERE(message, message_finalize);
+    ioloop_message_release(message);
 }
 
+#ifndef IOLOOP_MACOS
 static void
 tcp_read_callback(io_t *io, void *context)
 {
@@ -698,7 +728,7 @@ tcp_read_callback(io_t *io, void *context)
             connection->message_cur = 0;
             connection->datagram_callback(connection, connection->message, connection->context);
             // The callback may retain the message; we need to make way for the next one.
-            RELEASE_HERE(connection->message, message_finalize);
+            ioloop_message_release(connection->message);
             connection->message = NULL;
             connection->message_length = connection->message_length_len = 0;
         }
@@ -774,14 +804,16 @@ tcp_send_response(comm_t *comm, message_t *responding_to, struct iovec *iov, int
     }
     return true;
 }
+#endif // !IOLOOP_MACOS
 
-static bool
-udp_send_message(comm_t *comm, addr_t *source, addr_t *dest, int ifindex, struct iovec *iov, int iov_len)
+#if !defined(IOLOOP_MACOS) || !UDP_LISTENER_USES_CONNECTION_GROUPS
+bool
+ioloop_udp_send_message(comm_t *comm, addr_t *source, addr_t *dest, int ifindex, struct iovec *iov, int iov_len)
 {
     struct msghdr mh;
     uint8_t cmsg_buf[128];
     struct cmsghdr *cmsg;
-    int status;
+    ssize_t status;
 
     memset(&mh, 0, sizeof mh);
     mh.msg_iov = iov;
@@ -805,6 +837,9 @@ udp_send_message(comm_t *comm, addr_t *source, addr_t *dest, int ifindex, struct
             memset(inp, 0, sizeof *inp);
             inp->ipi_ifindex = ifindex;
             if (source) {
+                IPv4_ADDR_GEN_SRP(&source->sin.sin_addr.s_addr, ipv4_addr_buf);
+                INFO("sending UDP response from " PRI_IPv4_ADDR_SRP "#%d",
+                     IPv4_ADDR_PARAM_SRP(&source->sin.sin_addr.s_addr, ipv4_addr_buf), ntohs(source->sin.sin_port));
                 inp->ipi_spec_dst = source->sin.sin_addr;
                 inp->ipi_addr = source->sin.sin_addr;
             }
@@ -819,21 +854,42 @@ udp_send_message(comm_t *comm, addr_t *source, addr_t *dest, int ifindex, struct
             memset(inp, 0, sizeof *inp);
             inp->ipi6_ifindex = ifindex;
             if (source) {
+                SEGMENTED_IPv6_ADDR_GEN_SRP(&source->sin6.sin6_addr.s6_addr, ipv6_addr_buf);
+                INFO("sending UDP response from " PRI_SEGMENTED_IPv6_ADDR_SRP "#%d",
+                     SEGMENTED_IPv6_ADDR_PARAM_SRP(&source->sin6.sin6_addr.s6_addr, ipv6_addr_buf),
+                     ntohs(source->sin6.sin6_port));
                 inp->ipi6_addr = source->sin6.sin6_addr;
             }
         } else {
-            ERROR("udp_send_response: unknown family %d", source->sa.sa_family);
+            ERROR("unknown family %d", source->sa.sa_family);
             abort();
         }
     }
+    size_t len = 0;
+    for (int i = 0; i < iov_len; i++) {
+        len += iov[i].iov_len;
+    }
+    if (dest->sa.sa_family == AF_INET) {
+        IPv4_ADDR_GEN_SRP(&dest->sin.sin_addr.s_addr, ipv4_addr_buf);
+            INFO("sending %zd byte UDP response to " PRI_IPv4_ADDR_SRP "#%d", len,
+                 IPv4_ADDR_PARAM_SRP(&dest->sin.sin_addr.s_addr, ipv4_addr_buf),
+                 ntohs(dest->sin.sin_port));
+    } else {
+        SEGMENTED_IPv6_ADDR_GEN_SRP(&dest->sin6.sin6_addr.s6_addr, ipv6_addr_buf);
+        INFO("sending %zd byte UDP response to " PRI_SEGMENTED_IPv6_ADDR_SRP "#%d", len,
+             SEGMENTED_IPv6_ADDR_PARAM_SRP(&dest->sin6.sin6_addr.s6_addr, ipv6_addr_buf),
+             ntohs(dest->sin6.sin6_port));
+    }
     status = sendmsg(comm->io.fd, &mh, 0);
     if (status < 0) {
-        ERROR("udp_send_message: %s", strerror(errno));
+        ERROR("%s", strerror(errno));
         return false;
     }
     return true;
 }
+#endif // !defined(IOLOOP_MACOS) || !UDP_LISTENER_USES_CONNECTION_GROUPS
 
+#ifndef IOLOOP_MACOS
 static bool
 udp_send_response(comm_t *comm, message_t *responding_to, struct iovec *iov, int iov_len)
 {
@@ -843,7 +899,7 @@ udp_send_response(comm_t *comm, message_t *responding_to, struct iovec *iov, int
 bool
 ioloop_send_multicast(comm_t *comm, int ifindex, struct iovec *iov, int iov_len)
 {
-    return udp_send_message(comm, NULL, &comm->multicast, ifindex, iov, iov_len);
+    return udp_send_message(comm, &comm->multicast, ifindex, iov, iov_len);
 }
 
 static bool
@@ -936,7 +992,7 @@ comm_finalize(io_t *io)
         comm->finalize(comm->context);
     }
     if (comm->message != NULL) {
-        RELEASE_HERE(comm->message, message_finalize);
+        RELEASE_HERE(comm->message, message);
     }
     io_finalize(&comm->io);
 }
@@ -945,14 +1001,14 @@ void
 ioloop_comm_retain_(comm_t *comm, const char *file, int line)
 {
     (void)file; (void)line;
-    RETAIN(&comm->io);
+    RETAIN(&comm->io, comm);
 }
 
 void
 ioloop_comm_release_(comm_t *comm, const char *file, int line)
 {
     (void)file; (void)line;
-    RELEASE(&comm->io, comm_finalize);
+    RELEASE(&comm->io, comm);
 }
 
 void
@@ -987,13 +1043,13 @@ ioloop_comm_disconnect_callback_set(comm_t *comm, disconnect_callback_t callback
 void
 ioloop_listener_retain_(comm_t *listener, const char *file, int line)
 {
-    RETAIN(&listener->io);
+    RETAIN(&listener->io, comm);
 }
 
 void
 ioloop_listener_release_(comm_t *listener, const char *file, int line)
 {
-    RELEASE(&listener->io, comm_finalize);
+    RELEASE(&listener->io, comm);
 }
 
 void
@@ -1075,11 +1131,11 @@ listener_ready_callback(io_t *io, void *context)
 }
 
 comm_t *
-ioloop_listener_create(bool stream, bool tls, uint16_t *avoid_ports, int num_avoid_ports,
+ioloop_listener_create(bool stream, bool tls, uint16_t *UNUSED avoid_ports, int UNUSED num_avoid_ports,
                        const addr_t *ip_address, const char *multicast, const char *name,
-                       datagram_callback_t datagram_callback, connect_callback_t connected, cancel_callback_t cancel,
-                       ready_callback_t ready, finalize_callback_t finalize, tls_config_callback_t tls_config,
-                       void *context)
+                       datagram_callback_t datagram_callback, connect_callback_t connected,
+                       cancel_callback_t UNUSED cancel, ready_callback_t ready, finalize_callback_t finalize,
+                       tls_config_callback_t UNUSED tls_config, void *context)
 {
     comm_t *listener;
     socklen_t sl;
@@ -1095,10 +1151,10 @@ ioloop_listener_create(bool stream, bool tls, uint16_t *avoid_ports, int num_avo
     if (listener == NULL) {
         return NULL;
     }
-    RETAIN_HERE(&listener->io);
+    RETAIN_HERE(&listener->io, comm);
     listener->name = strdup(name);
     if (!listener->name) {
-        RELEASE_HERE(&listener->io, comm_finalize);
+        RELEASE_HERE(&listener->io, comm);
         return NULL;
     }
     listener->io.fd = socket(real_family, stream ? SOCK_STREAM : SOCK_DGRAM, stream ? IPPROTO_TCP : IPPROTO_UDP);
@@ -1232,7 +1288,7 @@ ioloop_listener_create(bool stream, bool tls, uint16_t *avoid_ports, int num_avo
     out:
         close(listener->io.fd);
         listener->io.fd = -1;
-        RELEASE_HERE(&listener->io, comm_finalize);
+        RELEASE_HERE(&listener->io, comm);
         return NULL;
     }
 
@@ -1292,6 +1348,7 @@ ioloop_listener_create(bool stream, bool tls, uint16_t *avoid_ports, int num_avo
     listener->context = context;
     listener->ready = ready;
     listener->io.ready = listener_ready_callback;
+    listener->io.context = listener;
     listener->is_listener = true;
     return listener;
 }
@@ -1368,13 +1425,13 @@ ioloop_connection_create(addr_t *remote_address, bool tls, bool stream, bool sta
         ERROR("No memory for connection structure.");
         return NULL;
     }
-    RETAIN_HERE(&connection->io);
+    RETAIN_HERE(&connection->io, comm);
     if (inet_ntop(remote_address->sa.sa_family, (remote_address->sa.sa_family == AF_INET
                                                  ? (void *)&remote_address->sin.sin_addr
                                                  : (void *)&remote_address->sin6.sin6_addr), buf,
                   INET6_ADDRSTRLEN) == NULL) {
         ERROR("inet_ntop failed to convert remote address: %s", strerror(errno));
-        RELEASE_HERE(&connection->io, comm_finalize);
+        RELEASE_HERE(&connection->io, comm);
         return NULL;
     }
     s = buf + strlen(buf);
@@ -1383,20 +1440,20 @@ ioloop_connection_create(addr_t *remote_address, bool tls, bool stream, bool sta
                               : remote_address->sin6.sin6_port));
     connection->name = strdup(buf);
     if (!connection->name) {
-        RELEASE_HERE(&connection->io, comm_finalize);
+        RELEASE_HERE(&connection->io, comm);
         return NULL;
     }
     connection->io.fd = socket(remote_address->sa.sa_family,
                                  stream ? SOCK_STREAM : SOCK_DGRAM, stream ? IPPROTO_TCP : IPPROTO_UDP);
     if (connection->io.fd < 0) {
         ERROR("Can't get socket: %s", strerror(errno));
-        RELEASE_HERE(&connection->io, comm_finalize);
+        RELEASE_HERE(&connection->io, comm);
         return NULL;
     }
     connection->address = *remote_address;
     if (fcntl(connection->io.fd, F_SETFL, O_NONBLOCK) < 0) {
         ERROR("connect_to_host: %s: Can't set O_NONBLOCK: %s", connection->name, strerror(errno));
-        RELEASE_HERE(&connection->io, comm_finalize);
+        RELEASE_HERE(&connection->io, comm);
         return NULL;
     }
     // If a stable address has been requested, request a public address in source address selection.
@@ -1435,7 +1492,7 @@ ioloop_connection_create(addr_t *remote_address, bool tls, bool stream, bool sta
     if (connect(connection->io.fd, &connection->address.sa, sl) < 0) {
         if (errno != EINPROGRESS && errno != EAGAIN) {
             ERROR("Can't connect to %s: %s", connection->name, strerror(errno));
-            RELEASE_HERE(&connection->io, comm_finalize);
+            RELEASE_HERE(&connection->io, comm);
             return NULL;
         }
     }
@@ -1449,7 +1506,7 @@ ioloop_connection_create(addr_t *remote_address, bool tls, bool stream, bool sta
         connection->tls_context = (tls_context_t *)-1;
 #else
         ERROR("connect_to_host: tls requested when excluded.");
-        RELEASE_HERE(&connection->io, comm_finalize);
+        RELEASE_HERE(&connection->io, comm);
         return NULL;
 #endif
     }
@@ -1498,13 +1555,13 @@ subproc_output_finalize(void *context)
     if (subproc->output_fd) {
         subproc->output_fd = NULL;
     }
-    RELEASE_HERE(subproc, subproc_finalize);
+    RELEASE_HERE(subproc, subproc);
 }
 
 void
 ioloop_subproc_release_(subproc_t *subproc, const char *file, int line)
 {
-    RELEASE(subproc, subproc_finalize);
+    RELEASE(subproc, subproc);
 }
 
 // Invoke the specified executable with the specified arguments.   Call callback when it exits.
@@ -1533,29 +1590,29 @@ ioloop_subproc(const char *exepath, char **argv, int argc, subproc_callback_t ca
         callback(NULL, 0, "out of memory");
         return NULL;
     }
-    RETAIN_HERE(subproc);
+    RETAIN_HERE(subproc, subproc);
     if (output_callback != NULL) {
         rv = pipe(subproc->pipe_fds);
         if (rv < 0) {
             callback(NULL, 0, "unable to create pipe.");
-            RELEASE_HERE(subproc, subproc_finalize);
+            RELEASE_HERE(subproc, subproc);
             return NULL;
         }
         subproc->output_fd = ioloop_file_descriptor_create(subproc->pipe_fds[0], subproc, subproc_output_finalize);
         if (subproc->output_fd == NULL) {
             // subproc->output_fd holds a reference to subproc.
-            RETAIN_HERE(subproc);
+            RETAIN_HERE(subproc, subproc);
             callback(NULL, 0, "out of memory.");
             close(subproc->pipe_fds[0]);
             close(subproc->pipe_fds[1]);
-            RELEASE_HERE(subproc, subproc_finalize);
+            RELEASE_HERE(subproc, subproc);
             return NULL;
         }
     }
 
     subproc->argv[0] = strdup(exepath);
     if (subproc->argv[0] == NULL) {
-        RELEASE_HERE(subproc, subproc_finalize);
+        RELEASE_HERE(subproc, subproc);
         callback(NULL, 0, "out of memory");
         return NULL;
     }
@@ -1563,7 +1620,7 @@ ioloop_subproc(const char *exepath, char **argv, int argc, subproc_callback_t ca
     for (i = 0; i < argc; i++) {
         subproc->argv[i + 1] = strdup(argv[i]);
         if (subproc->argv[i + 1] == NULL) {
-            RELEASE_HERE(subproc, subproc_finalize);
+            RELEASE_HERE(subproc, subproc);
             callback(NULL, 0, "out of memory");
             return NULL;
         }
@@ -1586,14 +1643,14 @@ ioloop_subproc(const char *exepath, char **argv, int argc, subproc_callback_t ca
         int err = rv < 0 ? errno : rv;
         ERROR("posix_spawn failed for %s: %s", subproc->argv[0], strerror(err));
         callback(subproc, 0, strerror(err));
-        RELEASE_HERE(subproc, subproc_finalize);
+        RELEASE_HERE(subproc, subproc);
         return NULL;
     }
     subproc->callback = callback;
     subproc->context = context;
     subproc->next = subprocesses;
     subprocesses = subproc;
-    RETAIN_HERE(subproc);
+    RETAIN_HERE(subproc, subproc);
 
     // Now that we have a viable subprocess, add the reader callback.
     if (output_callback != NULL && subproc->output_fd != NULL) {
@@ -1607,12 +1664,12 @@ void
 ioloop_subproc_run_sync(subproc_t *subproc)
 {
     int nev;
-    RETAIN_HERE(subproc);
+    RETAIN_HERE(subproc, subproc);
     do {
         nev = ioloop_events(0);
         INFO("%d events", nev);
         if (subproc->finished) {
-            RELEASE_HERE(subproc, subproc_finalize);
+            RELEASE_HERE(subproc, subproc);
             return;
         }
     } while (nev >= 0);
@@ -1654,7 +1711,7 @@ dnssd_txn_io_finalize(void *context)
 {
     dnssd_txn_t *txn = context;
     txn->io = NULL;
-    RELEASE_HERE(txn, dnssd_txn_finalize);
+    RELEASE_HERE(txn, dnssd_txn);
 }
 
 void
@@ -1668,7 +1725,7 @@ ioloop_dnssd_txn_cancel(dnssd_txn_t *txn)
     }
     if (txn->io != NULL) {
         txn->io->fd = -1;
-        RELEASE_HERE(txn->io, dnssd_txn_io_finalize);
+        RELEASE_HERE(txn->io, file_descriptor);
     }
 }
 
@@ -1676,14 +1733,30 @@ void
 ioloop_dnssd_txn_retain_(dnssd_txn_t *dnssd_txn, const char *file, int line)
 {
     (void)file; (void)line;
-    RETAIN(dnssd_txn);
+    RETAIN(dnssd_txn, dnssd_txn);
 }
 
 void
 ioloop_dnssd_txn_release_(dnssd_txn_t *dnssd_txn, const char *file, int line)
 {
     (void)file; (void)line;
-    RELEASE(dnssd_txn, dnssd_txn_finalize);
+    RELEASE(dnssd_txn, dnssd_txn);
+}
+
+dnssd_txn_t *
+ioloop_dnssd_txn_add_subordinate_(DNSServiceRef ref, void *context,
+                                  dnssd_txn_finalize_callback_t callback, dnssd_txn_failure_callback_t failure_callback,
+                                  const char *file, int line)
+{
+    dnssd_txn_t *txn = calloc(1, sizeof(*txn));
+    if (txn != NULL) {
+        RETAIN(txn, dnssd_txn);
+        txn->sdref = ref;
+        txn->finalize_callback = callback;
+        txn->failure_callback = failure_callback;
+        txn->context = context;
+    }
+    return txn;
 }
 
 dnssd_txn_t *
@@ -1691,20 +1764,15 @@ ioloop_dnssd_txn_add_(DNSServiceRef ref, void *context,
                       dnssd_txn_finalize_callback_t callback, dnssd_txn_failure_callback_t failure_callback,
                       const char *file, int line)
 {
-    dnssd_txn_t *txn = calloc(1, sizeof(*txn));
+    dnssd_txn_t *txn = ioloop_dnssd_txn_add_subordinate_(ref, context, callback, failure_callback, file, line);
     if (txn != NULL) {
-        RETAIN(txn);
-        txn->sdref = ref;
         txn->io = ioloop_file_descriptor_create(DNSServiceRefSockFD(txn->sdref), txn, dnssd_txn_io_finalize);
         if (txn->io == NULL) {
-            RELEASE_HERE(txn, dnssd_txn_finalize);
+            RELEASE_HERE(txn, dnssd_txn);
             return NULL;
         }
         // io holds a reference to txn
-        RETAIN_HERE(txn);
-        txn->finalize_callback = callback;
-        txn->failure_callback = failure_callback;
-        txn->context = context;
+        RETAIN_HERE(txn, dnssd_txn);
         ioloop_add_reader(txn->io, dnssd_txn_callback);
     }
     return txn;
@@ -1746,14 +1814,14 @@ void
 ioloop_file_descriptor_retain_(io_t *file_descriptor, const char *file, int line)
 {
     (void)file; (void)line;
-    RETAIN(file_descriptor);
+    RETAIN(file_descriptor, file_descriptor);
 }
 
 void
 ioloop_file_descriptor_release_(io_t *file_descriptor, const char *file, int line)
 {
     (void)file; (void)line;
-    RELEASE(file_descriptor, file_descriptor_finalize);
+    RELEASE(file_descriptor, file_descriptor);
 }
 
 io_t *
@@ -1766,7 +1834,7 @@ ioloop_file_descriptor_create_(int fd, void *context, finalize_callback_t finali
         ret->context = context;
         ret->finalize = finalize;
         ret->io_finalize = file_descriptor_finalize;
-        RETAIN(ret);
+        RETAIN(ret, file_descriptor);
     }
     return ret;
 }
@@ -1789,6 +1857,18 @@ ioloop_run_async(async_callback_t callback, void *context)
 
     *epp = event;
 }
+
+const struct sockaddr *
+connection_get_local_address(comm_t *connection)
+{
+    message_t *message = connection->message;
+    if (message == NULL) {
+        ERROR("message is NULL.")
+        return NULL;
+    }
+    return &message->local.sa;
+}
+#endif // !defined(IOLOOP_MACOS)
 
 // Local Variables:
 // mode: C

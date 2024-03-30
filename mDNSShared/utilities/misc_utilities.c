@@ -20,8 +20,8 @@
 #include "misc_utilities.h"
 
 #include <string.h>						// For memset().
-#include "mdns_strict.h"
 #include "DebugServices.h"				// For check_compile_time_code().
+#include "mdns_strict.h"
 
 //======================================================================================================================
 // MARK: - Functions

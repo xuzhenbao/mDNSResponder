@@ -47,8 +47,8 @@
 // MARK: - Functions
 
 // We can only initialize dnssd-proxy in srp-mdns-proxy if we combined it with srp-mdns-proxy.
-#if (SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY)
-bool init_dnssd_proxy(void);
+#if (SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY) && !defined(RA_TESTER)
+bool init_dnssd_proxy(srp_server_t *NONNULL server_state);
 bool delete_served_domain_by_interface_name(const char *const NONNULL interface_name);
 #endif // #if (SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY)
 

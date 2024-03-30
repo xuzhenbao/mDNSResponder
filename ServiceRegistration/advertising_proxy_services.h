@@ -1,6 +1,6 @@
 /* advertising_proxy_services.h
  *
- * Copyright (c) 2020-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ typedef struct advertising_proxy_host_address {
 typedef struct advertising_proxy_instance {
     RCHAR *NULLABLE instance_name;
     RCHAR *NULLABLE service_type;
+    RCHAR *NULLABLE reg_type;
     uint16_t port;
     RUCHAR *NULLABLE txt_data;
     uint16_t txt_len;
@@ -95,6 +96,29 @@ typedef void (*advertising_proxy_reply)
     advertising_proxy_conn_ref NULLABLE conn_ref,
     void *                     NULLABLE data,
     advertising_proxy_error_type        errCode
+);
+
+/* advertising_proxy_context_reply: Callback from all DNSSD Advertising proxy library functions
+ *
+ * advertising_proxy_context_reply() parameters:
+ *
+ * conn_ref:                   The advertising_proxy_conn_ref initialized by the library function.  Call advertising_proxy_
+ *
+ * context:                    context passed to advertising proxy call
+ *
+ * response:                   Any data returned by the advertising proxy in response to the request.
+ *
+ * errCode:                    Will be kDNSSDAdvertisingProxy_NoError on success, otherwise will indicate the
+ *                             failure that occurred.
+ *
+ */
+
+typedef void (*advertising_proxy_context_reply)
+(
+    advertising_proxy_conn_ref  NULLABLE conn_ref,
+    void *                      NULLABLE context;
+    void *                      NULLABLE response,
+    advertising_proxy_error_type         errCode
 );
 
 
@@ -264,6 +288,8 @@ advertising_proxy_error_type advertising_proxy_regenerate_ula
  *                            If the call succeeds it will be initialized to a non-NULL value.
  *                            The same conn_ref can be used for more than one call.
  *
+ * high:                      If true, advertise the prefix as high priority.
+ *
  * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL)
  *
  * callback:                  Callback function for the client that indicates success or failure.
@@ -281,6 +307,7 @@ DNS_SERVICES_EXPORT
 advertising_proxy_error_type advertising_proxy_advertise_prefix
 (
     advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    bool                                         high,
     run_context_t                        NONNULL clientq,
     advertising_proxy_reply             NULLABLE callback
 );
@@ -348,6 +375,79 @@ advertising_proxy_error_type advertising_proxy_add_prefix
  *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning).
  *
  */
+
+/* advertising_proxy_add_nat64_prefix
+ *
+ * For testing, add nat64 prefix
+ *
+ * advertising_proxy_add_nat64_prefix() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL).
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * prefix_buf:                Prefix to be added.
+ *
+ * buf_len:                   Length of the prefixbuf.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that the service advertising
+ *                            was stopped successfully. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning).
+ *
+ */
+
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_add_nat64_prefix
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_reply             NULLABLE callback,
+    const uint8_t                       *NONNULL prefix_buf,
+    size_t                                       buf_len
+);
+
+/* advertising_proxy_remove_nat64_prefix
+ *
+ * For testing, remove nat64 prefix
+ *
+ * advertising_proxy_remove_nat64_prefix() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL).
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * prefix_buf:                Prefix to be removed.
+ *
+ * buf_len:                   Length of the prefixbuf.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that the service advertising
+ *                            was stopped successfully. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning).
+ *
+ */
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_remove_nat64_prefix
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_reply             NULLABLE callback,
+    const uint8_t                       *NONNULL prefix_buf,
+    size_t                                       buf_len
+);
 
 DNS_SERVICES_EXPORT
 advertising_proxy_error_type advertising_proxy_remove_prefix
@@ -516,6 +616,37 @@ advertising_proxy_error_type advertising_proxy_undrop_srpl_connection
     advertising_proxy_reply             NULLABLE callback
 );
 
+/* advertising_proxy_unblock_anycast_service
+ *
+ * For testing, unblock_anycast_service
+ *
+ * advertising_proxy_unblock_anycast_service() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that anycast service advertisements
+ *                            were successfully unblocked. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning)
+ *
+ */
+
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_unblock_anycast_service
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_reply             NULLABLE callback
+);
+
 /* advertising_proxy_drop_srpl_advertisement
  *
  * For testing, drop all srpl advertisements
@@ -607,6 +738,111 @@ advertising_proxy_error_type advertising_proxy_start_dropping_push_connections
     advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
     run_context_t                        NONNULL clientq,
     advertising_proxy_reply             NULLABLE callback
+);
+
+/* advertising_proxy_block_anycast service
+ *
+ * For testing, block anycast service
+ *
+ * advertising_proxy_block_anycast_service() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that anycast service advertisements
+ *                            were successfully blocked. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning)
+ *
+ */
+
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_block_anycast_service
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_reply             NULLABLE callback
+);
+
+/* advertising_proxy_start_breaking_time_validation
+ *
+ * For testing, start breaking SIG(0) validation on replicated host messages. This tests that we correctly
+ * handle such failures in the SRP replication protocol.
+ *
+ * advertising_proxy_start_dropping_push_connections() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that srp replication connections
+ *                            were successfully dropped. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning)
+ *
+ */
+
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_start_breaking_time_validation
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_reply             NULLABLE callback
+);
+
+/* advertising_proxy_set-variable
+ *
+ * Set the specified variable to the specified value on the advertising proxy
+ *
+ * advertising_proxy_set_variable() Parameters:
+ *
+ * conn_ref:                  A pointer to advertising_proxy_conn_ref that is initialized to NULL.
+ *                            If the call succeeds it will be initialized to a non-NULL value.
+ *                            The same conn_ref can be used for more than one call.
+ *
+ * clientq:                   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ *
+ * callback:                  Callback function for the client that indicates success or failure.
+ *                            Callback is not called until either the command has failed, or has completed.
+ *
+ * context:                   Context to return in callback
+ *
+ * variable:                  Name of variable to set
+ *
+ * value:                     Value to set. Value is a string which will be interpreted by the advertising proxy,
+ *                            and can be a quoted string ("\"foo\""), "NULL", a number ("100"), or a boolean
+ *                            ("true" or "false") depending on the variable's type.
+ *
+ * return value:              Returns kDNSSDAdvertisingProxy_NoError when no error otherwise returns an
+ *                            error code indicating the error that occurred. Note: A return value of
+ *                            kDNSSDAdvertisingProxy_NoError does not mean that srp replication connections
+ *                            were successfully dropped. The callback may asynchronously return an
+ *                            error (such as kDNSSDAdvertisingProxy_DaemonNotRunning)
+ *
+ */
+
+DNS_SERVICES_EXPORT
+advertising_proxy_error_type advertising_proxy_set_variable
+(
+    advertising_proxy_conn_ref NONNULL *NULLABLE conn_ref,
+    run_context_t                        NONNULL clientq,
+    advertising_proxy_context_reply     NULLABLE callback,
+    void *                              NULLABLE context,
+    const char *                         NONNULL name,
+    const char *                         NONNULL value
 );
 
 /* advertising_proxy_ref_dealloc()

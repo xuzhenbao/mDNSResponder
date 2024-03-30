@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@
 uid_t mDNSResponderUID;
 gid_t mDNSResponderGID;
 
-void helper_exit()
+void helper_exit(void)
 {
     os_log_info(log_handle,"mDNSResponderHelper exiting");
     exit(0);
@@ -271,6 +271,7 @@ static void ShowNameConflictNotification(CFMutableArrayRef header, CFStringRef s
 
     CFDictionarySetValue(dictionary, kCFUserNotificationAlertHeaderKey, header);
     CFDictionarySetValue(dictionary, kCFUserNotificationAlertMessageKey, subtext);
+    CFDictionarySetValue(dictionary, kCFUserNotificationDefaultButtonTitleKey, CFSTR("OK"));
 
     CFURLRef urlRef = CFURLCreateWithFileSystemPath(NULL, CFSTR("/System/Library/CoreServices/mDNSResponder.bundle"), kCFURLPOSIXPathStyle, true);
     if (urlRef) { CFDictionarySetValue(dictionary, kCFUserNotificationLocalizationURLKey, urlRef); CFRelease(urlRef); }
@@ -562,11 +563,15 @@ static enum DNSKeyFormat getDNSKeyFormat(SecKeychainItemRef item, SecKeychainAtt
     int i = 0;
     
     *attributesp = NULL;
+
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     if (noErr != (status = SecKeychainItemCopyAttributesAndData(item, &attributeInfo, NULL, &attributes, NULL, NULL)))
     {
         os_log_info(log_handle,"getDNSKeyFormat: SecKeychainItemCopyAttributesAndData %d - skipping", status);
         goto skip;
     }
+    mdns_clang_ignore_warning_end();
+
     if (attributeInfo.count != attributes->count)
         malformed = TRUE;
     for (i = 0; !malformed && i < (int)attributeInfo.count; ++i)
@@ -579,9 +584,9 @@ static enum DNSKeyFormat getDNSKeyFormat(SecKeychainItemRef item, SecKeychainAtt
     }
     
     os_log_info(log_handle,"getDNSKeyFormat: entry (\"%.*s\", \"%.*s\", \"%.*s\")",
-                   (int)attributes->attr[0].length, attributes->attr[0].data,
-                   (int)attributes->attr[1].length, attributes->attr[1].data,
-                   (int)attributes->attr[2].length, attributes->attr[2].data);
+                   (int)attributes->attr[0].length, (const char *)attributes->attr[0].data,
+                   (int)attributes->attr[1].length, (const char *)attributes->attr[1].data,
+                   (int)attributes->attr[2].length, (const char *)attributes->attr[2].data);
 
     if (attributes->attr[1].length >= MAX_ESCAPED_DOMAIN_NAME +
         sizeof(dnsprefix)-1)
@@ -613,7 +618,10 @@ static enum DNSKeyFormat getDNSKeyFormat(SecKeychainItemRef item, SecKeychainAtt
     return format;
     
 skip:
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     SecKeychainItemFreeAttributesAndData(attributes, NULL);
+    mdns_clang_ignore_warning_end();
+
     return formatNotDNSKey;
 }
 
@@ -664,15 +672,20 @@ static CFPropertyListRef copyKeychainItemInfo(SecKeychainItemRef item, SecKeycha
     CFRelease(data);
     
     // Insert the Key attribute (kmDNSKcKey)
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     if (noErr != (status = SecKeychainItemCopyAttributesAndData(item, NULL, NULL, NULL, &keylen, &keyp)))
     {
         os_log(log_handle, "copyKeychainItemInfo: could not retrieve key for \"%.*s\": %d",
-              (int)attributes->attr[1].length, attributes->attr[1].data, status);
+              (int)attributes->attr[1].length, (const char *)attributes->attr[1].data, status);
         goto error;
     }
+    mdns_clang_ignore_warning_end();
     
     data = CFDataCreate(kCFAllocatorDefault, keyp, keylen);
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     SecKeychainItemFreeAttributesAndData(NULL, keyp);
+    mdns_clang_ignore_warning_end();
+
     if (NULL == data)
     {
         os_log(log_handle, "copyKeychainItemInfo: CFDataCreate for keyp failed");
@@ -724,18 +737,22 @@ void KeychainGetSecrets(__unused unsigned int *numsecrets,__unused unsigned long
         *err = kHelperErr_ApiErr;
         goto fin;
     }
+
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     if (noErr != SecKeychainCopyDefault(&skc))
     {
         *err = kHelperErr_ApiErr;
         goto fin;
     }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    mdns_clang_ignore_warning_end();
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     if (noErr != SecKeychainSearchCreateFromAttributes(skc, kSecGenericPasswordItemClass, NULL, &search))
     {
         *err = kHelperErr_ApiErr;
         goto fin;
     }
+    mdns_clang_ignore_warning_end();
+    mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
     for (status = SecKeychainSearchCopyNext(search, &item); noErr == status; status = SecKeychainSearchCopyNext(search, &item))
     {
         if (formatNotDNSKey != (format = getDNSKeyFormat(item, &attributes)) &&
@@ -747,7 +764,8 @@ void KeychainGetSecrets(__unused unsigned int *numsecrets,__unused unsigned long
         SecKeychainItemFreeAttributesAndData(attributes, NULL);
         CFRelease(item);
     }
-#pragma clang diagnostic pop
+    mdns_clang_ignore_warning_end();
+
     if (errSecItemNotFound != status)
          os_log(log_handle, "KeychainGetSecrets: SecKeychainSearchCopyNext failed: %d", status);
     

@@ -10,6 +10,7 @@
 #define __TestTB__CaptureFile__
 
 #include <iostream>
+#include <pcap/pcap.h>
 #include "bjtypes.h"
 #include "bjsocket.h"
 #include "Frame.h"
@@ -27,7 +28,7 @@ public:
 
 
 
-    __uint32_t GetDeltaTime();
+    time_t GetDeltaTime();
 
     __uint32_t GetBufferLen(BJ_UINT8* pStart);
 
@@ -38,18 +39,16 @@ private:
     bool Init();
     bool Clear();
 
-    FILE* m_hFile;
-    BJ_UINT8* m_pFrameHeader;
+    pcap_t* m_hPCap;
     BJ_UINT8* m_pFrameData;
-    BJ_UINT8* m_pFileHeader;
     __uint32_t  m_nCaptureLen;
     __uint32_t  m_nWireLen;
-    __uint32_t  m_TimeSec;
+    time_t m_TimeSec;
 
-    __uint32_t m_nFirstFrameTime;
+    time_t m_nFirstFrameTime;
 
     Frame::BJ_DATALINKTYPE m_datalinkType;
-
+    bool m_bFormatIsPCapNG;
 };
 
 #endif /* defined(__TestTB__CaptureFile__) */

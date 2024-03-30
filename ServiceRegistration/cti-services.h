@@ -1,6 +1,6 @@
 /* cti-services.h
  *
- * Copyright (c) 2020 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,11 +35,26 @@ typedef void *run_context_t;
 
 #include "cti-common.h"
 
+typedef enum _offmesh_route_origin {
+    offmesh_route_origin_user,
+    offmesh_route_origin_ncp,
+} offmesh_route_origin_t;
+
+typedef enum _offmesh_route_preference {
+    offmesh_route_preference_low = -1,
+    offmesh_route_preference_medium,
+    offmesh_route_preference_high,
+} offmesh_route_preference_t;
+
 typedef struct _cti_service {
     uint64_t enterprise_number;
     uint16_t service_type;
     uint16_t service_version;
+    uint16_t rloc16;
+    uint16_t service_id;
+    uint8_t *NONNULL service;
     uint8_t *NONNULL server;
+    size_t service_length;
     size_t server_length;
     int ref_count;
     int flags;      // E.g., kCTIFlag_NCP
@@ -56,14 +71,94 @@ typedef struct _cti_prefix {
     int prefix_length;
     int metric;
     int flags;
+    int rloc;
+    bool stable;
+    bool ncp;
     int ref_count;
 } cti_prefix_t;
+
+// Bits in the prefix flags
+#define kCTIPriorityShift      14
+#define kCTIPreferredShift     13
+#define kCTISLAACShift         12
+#define kCTIDHCPShift          11
+#define kCTIConfigureShift     10
+#define kCTIDefaultRouteShift  9
+#define kCTIOnMeshShift        8
+#define kCTIDNSShift           7
+#define kCTIDPShift            6
+
+// Priority values
+#define kCTIPriorityMedium    0
+#define kCTIPriorityHigh      1
+#define kCTIPriorityReserved  2
+#define kCTIPriorityLow       3
+
+// Macros to fetch values from the prefix flags
+#define CTI_PREFIX_FLAGS_PRIORITY(flags)       (((flags) >> kCTIPriorityShift) & 3)
+#define CTI_PREFIX_FLAGS_PREFERRED(flags)      (((flags) >> kCTIPreferredShift) & 1)
+#define CTI_PREFIX_FLAGS_SLAAC(flags)          (((flags) >> kCTISLAACShift) & 1)
+#define CTI_PREFIX_FLAGS_DHCP(flags)           (((flags) >> kCTIDHCPShift) & 1)
+#define CTI_PREFIX_FLAGS_CONFIGURE(flags)      (((flags) >> kCTIConfigureShift) & 1)
+#define CTI_PREFIX_FLAGS_DEFAULT_ROUTE(flags)  (((flags) >> kCTIDefaultRouteShift) & 1)
+#define CTI_PREFIX_FLAGS_ON_MESH(flags)        (((flags) >> kCTIOnMeshShift) & 1)
+#define CTI_PREFIX_FLAGS_DNS(flags)            (((flags) >> kCTIDNSShift) & 1)
+#define CTI_PREFIX_DLAGS_DP(flags)             (((flags) >> kCTIDPShift) & 1)
+
+// Macros to set values in the prefix flags
+#define CTI_PREFIX_FLAGS_PRIORITY_SET(flags, value)       ((flags) = \
+                                                            (((flags) & ~(3 << kCTIPriorityShift)) | \
+                                                             (((value) & 3) << kCTIPriorityShift)))
+#define CTI_PREFIX_FLAGS_PREFERRED_SET(flags, value)      ((flags) = \
+                                                            (((flags) & ~(1 << kCTIPreferredShift)) | \
+                                                             (((value) & 1) << kCTIPreferredShift)))
+#define CTI_PREFIX_FLAGS_SLAAC_SET(flags, value)          ((flags) = \
+                                                            (((flags) & ~(1 << kCTISLAACShift)) | \
+                                                             (((value) & 1) << kCTISLAACShift)))
+#define CTI_PREFIX_FLAGS_DHCP_SET(flags, value)           ((flags) = \
+                                                            (((flags) & ~(1 << kCTIDHCPShift)) | \
+                                                             (((value) & 1) << kCTIDHCPShift)))
+#define CTI_PREFIX_FLAGS_CONFIGURE_SET(flags, value)      ((flags) = \
+                                                            (((flags) & ~(1 << kCTIConfigureShift)) | \
+                                                             (((value) & 1) << kCTIConfigureShift)))
+#define CTI_PREFIX_FLAGS_DEFAULT_ROUTE_SET(flags, value)  ((flags) = \
+                                                            (((flags) & ~(1 << kCTIDefaultRouteShift)) | \
+                                                             (((value) & 1) << kCTIDefaultRouteShift)))
+#define CTI_PREFIX_FLAGS_ON_MESH_SET(flags, value)        ((flags) = \
+                                                            (((flags) & ~(1 << kCTIOnMeshShift)) | \
+                                                             (((value) & 1) << kCTIOnMeshShift)))
+#define CTI_PREFIX_FLAGS_DNS_SET(flags, value)            ((flags) = \
+                                                            (((flags) & ~(1 << kCTIDNSShift)) | \
+                                                             (((value) & 1) << kCTIDNSShift)))
+#define CTI_PREFIX_DLAGS_DP_SET(flags, value)             ((flags) = \
+                                                            (((flags) & ~(1 << kCTIDPShift)) | \
+                                                             (((value) & 1) << kCTIDPShift)))
 
 typedef struct _cti_prefix_vec {
     size_t num;
     int ref_count;
     cti_prefix_t *NULLABLE *NONNULL prefixes;
 } cti_prefix_vec_t;
+
+typedef struct _cti_route {
+    struct in6_addr prefix;
+    int prefix_length;
+    offmesh_route_origin_t origin;
+    bool nat64;
+    bool stable;
+    offmesh_route_preference_t preference;
+    int rloc;
+    bool next_hop_is_host;
+    int ref_count;
+} cti_route_t;
+
+typedef struct _cti_route_vec {
+    size_t num;
+    int ref_count;
+    cti_route_t *NULLABLE *NONNULL routes;
+} cti_route_vec_t;
+
+typedef struct srp_server_state srp_server_t;
 
 /* cti_reply:
  *
@@ -82,18 +177,17 @@ typedef struct _cti_prefix_vec {
 typedef void
 (*cti_reply_t)(void *NULLABLE context, cti_status_t status);
 
-/* cti_tunnel_reply: Callback for cti_get_tunnel_name()
+/* cti_string_property_reply: Callback for get calls that fetch a string property
  *
- * Called exactly once in response to a cti_get_tunnel_name() call, either with an error or with
- * the name of the tunnel that wpantund is using as the Thread network interface.   The invoking
- * program is responsible for releasing the connection state either during or after the callback.
+ * Called exactly once in response to a cti_get_tunnel_name() or cti_get_on_link_prefix() call, either with an error or
+ * with a string containing the response.
  *
  * cti_reply parameters:
  *
  * context:       The context that was passed to the cti service call to which this is a callback.
  *
- * tunnel_name:   If error is kCTIStatus_NoError, this dictionary contains either the response to
- * 			      a request, or else the content of a CTI event if this is an event callback.
+ * tunnel_name:   If error is kCTIStatus_NoError, a string containing the name of the Thread
+ * 			      interface.
  *
  * status:	      Will be kCTIStatus_NoError on success, otherwise will indicate the
  * 			      failure that occurred.
@@ -101,8 +195,8 @@ typedef void
  */
 
 typedef void
-(*cti_tunnel_reply_t)(void *NULLABLE context, const char *NONNULL tunnel_name,
-                      cti_status_t status);
+(*cti_string_property_reply_t)(void *NULLABLE context, const char *NONNULL string,
+                               cti_status_t status);
 
 /* cti_get_tunnel_name
  *
@@ -113,9 +207,9 @@ typedef void
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
  *
- * client_queueq:  Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating the
  *                 error that occurred. Note: A return value of kCTIStatus_NoError does not mean that the
@@ -123,11 +217,64 @@ typedef void
  *
  */
 
-#define cti_get_tunnel_name(context, callback, client_queue) \
-    cti_get_tunnel_name_(context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_tunnel_name(server, context, callback, client_queue) \
+    cti_get_tunnel_name_(server, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_tunnel_name_(void *NULLABLE context, cti_tunnel_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                     const char *NONNULL file, int line);
+cti_get_tunnel_name_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_string_property_reply_t NONNULL callback,
+                     run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+
+/* cti_get_mesh_local_prefix
+ *
+ * Get the mesh_local IPv6 prefix that is in use on the Thread mesh. The prefix is passed to the reply callback if the
+ * request succeeds; otherwise an error is either returned immediately or returned to the callback.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating the
+ *                 error that occurred. Note: A return value of kCTIStatus_NoError does not mean that the
+ *                 request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_get_mesh_local_prefix(server, ref, context, callback, client_queue) \
+    cti_get_mesh_local_prefix_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_get_mesh_local_prefix_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref,
+                           void *NULLABLE context, cti_string_property_reply_t NONNULL callback,
+                           run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+
+/* cti_get_mesh_local_address
+ *
+ * Get the mesh_local IPv6 address that is in use on this device on the Thread mesh. The address is passed to the reply
+ * callback if the request succeeds; otherwise an error is either returned immediately or returned to the callback.
+ *
+ * ref:            A pointer to a reference to the connection is stored through ref if ref is not NULL.
+ *                 When events are no longer needed, call cti_discontinue_events() on the returned pointer.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating the
+ *                 error that occurred. Note: A return value of kCTIStatus_NoError does not mean that the
+ *                 request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_get_mesh_local_address(server, ref, context, callback, client_queue) \
+    cti_get_mesh_local_address_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_get_mesh_local_address_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref,
+                            void *NULLABLE context, cti_string_property_reply_t NONNULL callback,
+                            run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
 
 /*
  * cti_service_vec_create
@@ -182,12 +329,13 @@ cti_service_vec_release_(cti_service_vec_t *NONNULL services, const char *NONNUL
  */
 
 cti_service_t *NULLABLE
-cti_service_create_(uint64_t enterprise_number, uint16_t service_type, uint16_t service_version,
-                    uint8_t *NONNULL server, size_t server_length, int flags,
-                    const char *NONNULL file, int line);
-#define cti_service_create(enterprise_number, service_type, service_version, server, server_length, flags) \
-    cti_service_create_(enterprise_number, service_type, service_version, server, server_length, flags, \
-                        __FILE__, __LINE__)
+cti_service_create_(uint64_t enterprise_number, uint16_t rloc16, uint16_t service_type, uint16_t service_version,
+                    uint8_t *NONNULL service, size_t service_length, uint8_t *NONNULL server, size_t server_length,
+                    uint16_t service_id, int flags, const char *NONNULL file, int line);
+#define cti_service_create(enterprise_number, rloc16, service_type, service_version, service, service_length, \
+                           server, server_length, service_id, flags) \
+    cti_service_create_(enterprise_number, rloc16, service_type, service_version, service, service_length, \
+                        server, server_length, service_id, flags, __FILE__, __LINE__)
 
 /*
  * cti_service_vec_release
@@ -250,8 +398,6 @@ typedef void
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
  *
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
  *                 If the get_services call fails, response will be NULL and status
  *                 will indicate what went wrong.  No further callbacks can be expected
@@ -259,17 +405,19 @@ typedef void
  *                 once immediately with the current service list, and then again whenever
  *                 the service list is updated.
  *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
  *                 that the request succeeded, merely that it was successfully started.
  *
  */
 
-#define cti_get_service_list(ref, context, callback, client_queue) \
-    cti_get_service_list_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_service_list(server, ref, context, callback, client_queue) \
+    cti_get_service_list_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_service_list_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context, cti_service_reply_t NONNULL callback,
-                      run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+cti_get_service_list_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+                      cti_service_reply_t NONNULL callback, run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
 
 /*
  * cti_service_vec_create
@@ -324,10 +472,10 @@ cti_prefix_vec_release_(cti_prefix_vec_t *NONNULL prefixes, const char *NONNULL 
  */
 
 cti_prefix_t *NULLABLE
-cti_prefix_create_(struct in6_addr *NONNULL prefix, int prefix_length, int metric, int flags,
+cti_prefix_create_(struct in6_addr *NONNULL prefix, int prefix_length, int metric, int flags, int rloc, bool stable, bool ncp,
                    const char *NONNULL file, int line);
-#define cti_prefix_create(prefix, prefix_length, metric, flags) \
-    cti_prefix_create_(prefix, prefix_length, metric, flags, __FILE__, __LINE__)
+#define cti_prefix_create(prefix, prefix_length, metric, flags, rloc, stable, ncp) \
+    cti_prefix_create_(prefix, prefix_length, metric, flags, rloc, stable, ncp, __FILE__, __LINE__)
 
 /*
  * cti_prefix_vec_release
@@ -388,9 +536,9 @@ typedef void
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
  *
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -398,11 +546,11 @@ typedef void
  *
  */
 
-#define cti_get_prefix_list(ref, context, callback, client_queue) \
-    cti_get_prefix_list_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_prefix_list(server, ref, context, callback, client_queue) \
+    cti_get_prefix_list_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_prefix_list_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context, cti_prefix_reply_t NONNULL callback,
-                     run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+cti_get_prefix_list_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+                     cti_prefix_reply_t NONNULL callback, run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
 
 /* cti_state_reply: Callback from cti_get_state()
  *
@@ -444,21 +592,21 @@ typedef void
  *
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
  *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
  *                 that the request succeeded, merely that it was successfully started.
- *
  */
 
-#define cti_get_state(ref, context, callback, client_queue) \
-    cti_get_state_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_state(server, ref, context, callback, client_queue) \
+    cti_get_state_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_state_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context, cti_state_reply_t NONNULL callback,
-               run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+cti_get_state_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+               cti_state_reply_t NONNULL callback, run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
 
 /* cti_uint64_property_reply: Callback from cti_get_partition_id() or cti_get_xpanid()
  *
@@ -500,9 +648,9 @@ typedef void
  *
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -510,10 +658,10 @@ typedef void
  *
  */
 
-#define cti_get_partition_id(ref, context, callback, client_queue) \
-    cti_get_partition_id_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_partition_id(server, ref, context, callback, client_queue) \
+    cti_get_partition_id_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_partition_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+cti_get_partition_id_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
                       cti_uint64_property_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                       const char *NONNULL file, int line);
 
@@ -532,9 +680,9 @@ cti_get_partition_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE co
  *
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -542,10 +690,10 @@ cti_get_partition_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE co
  *
  */
 
-#define cti_get_extended_pan_id(ref, context, callback, client_queue) \
-    cti_get_extended_pan_id_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_extended_pan_id(server, ref, context, callback, client_queue) \
+    cti_get_extended_pan_id_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_extended_pan_id_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+cti_get_extended_pan_id_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
                          cti_uint64_property_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                          const char *NONNULL file, int line);
 
@@ -589,9 +737,9 @@ typedef void
  *
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -599,10 +747,10 @@ typedef void
  *
  */
 
-#define cti_get_network_node_type(ref, context, callback, client_queue) \
-    cti_get_network_node_type_(ref, context, callback, client_queue, __FILE__, __LINE__)
+#define cti_get_network_node_type(server, ref, context, callback, client_queue) \
+    cti_get_network_node_type_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_get_network_node_type_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
+cti_get_network_node_type_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref, void *NULLABLE context,
                            cti_network_node_type_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                            const char *NONNULL file, int line);
 
@@ -616,9 +764,9 @@ cti_get_network_node_type_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLAB
  * context:           An anonymous pointer that will be passed along to the callback when
  *                    an event occurs.
  *
- * client_queue:      Queue the client wants to schedule the callback on (Note: Must not be NULL)
- *
  * callback:          CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:      Queue the client wants to schedule the callback on
  *
  * enterprise_number: Contains the enterprise number of the service.
  *
@@ -640,14 +788,14 @@ cti_get_network_node_type_(cti_connection_t NULLABLE *NULLABLE ref, void *NULLAB
  *
  */
 
-#define cti_add_service(context, callback, client_queue, \
+#define cti_add_service(server, context, callback, client_queue, \
                         enterprise_number, service_data, service_data_length, server_data, server_data_length) \
-    cti_add_service_(context, callback, client_queue, enterprise_number, \
+    cti_add_service_(server, context, callback, client_queue, enterprise_number, \
                      service_data, service_data_length, server_data, server_data_length, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_add_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                 uint32_t enterprise_number, const uint8_t *NONNULL service_data, size_t service_data_length,
-                 const uint8_t *NONNULL server_data, size_t server_data_length,
+cti_add_service_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback,
+                 run_context_t NULLABLE client_queue, uint32_t enterprise_number, const uint8_t *NONNULL service_data,
+                 size_t service_data_length, const uint8_t *NULLABLE server_data, size_t server_data_length,
                  const char *NONNULL file, int line);
 
 /* cti_remove_service
@@ -660,7 +808,9 @@ cti_add_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_conte
  * context:           An anonymous pointer that will be passed along to the callback when
  *                    an event occurs.
  *
- * client_queue:      Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ * callback:          callback function for the client that indicates success or failure.
+ *
+ * client_queue:      Queue the client wants to schedule the callback on
  *
  * enterprise_number: Contains the enterprise number of the service.
  *
@@ -670,20 +820,18 @@ cti_add_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_conte
  *
  * service_data_len:  The length of the service data in bytes.
  *
- * callback:          callback function for the client that indicates success or failure.
- *
  * return value:      Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                    the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
  *                    that the request succeeded, merely that it was successfully started.
  */
 
-#define cti_remove_service(context, callback, client_queue, \
+#define cti_remove_service(server, context, callback, client_queue, \
                            enterprise_number, service_data, service_data_length) \
-    cti_remove_service_(context, callback, client_queue,            \
+    cti_remove_service_(server, context, callback, client_queue,            \
                         enterprise_number, service_data, service_data_length, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_remove_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                    uint32_t enterprise_number, const uint8_t *NONNULL service_data,
+cti_remove_service_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback,
+                    run_context_t NULLABLE client_queue, uint32_t enterprise_number, const uint8_t *NONNULL service_data,
                     size_t service_data_length, const char *NONNULL file, int line);
 
 /* cti_add_prefix
@@ -695,13 +843,14 @@ cti_remove_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_co
  *
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * prefix:         A pointer to a struct in6_addr.  Must not be reatained by the callback.
  *
  * prefix_len:     The length of the prefix in bits.
- *
- * callback:       CallBack function for the client that indicates success or failure.
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -709,14 +858,14 @@ cti_remove_service_(void *NULLABLE context, cti_reply_t NONNULL callback, run_co
  *
  */
 
-#define cti_add_prefix(context, callback, client_queue, \
-                       prefix, prefix_length, on_mesh, preferred, slaac, stable) \
-    cti_add_prefix_(context, callback, client_queue, prefix, prefix_length, \
-                    on_mesh, preferred, slaac, stable, __FILE__, __LINE__)
+#define cti_add_prefix(server, context, callback, client_queue, \
+                       prefix, prefix_length, on_mesh, preferred, slaac, stable, priority) \
+    cti_add_prefix_(server, context, callback, client_queue, prefix, prefix_length, \
+                    on_mesh, preferred, slaac, stable, priority, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_add_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
+cti_add_prefix_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
                 struct in6_addr *NONNULL prefix, int prefix_length, bool on_mesh, bool preferred, bool slaac,
-                bool stable, const char *NONNULL file, int line);
+                bool stable, int priority, const char *NONNULL file, int line);
 
 /* cti_remove_prefix
  *
@@ -728,13 +877,13 @@ cti_add_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_contex
  * context:        An anonymous pointer that will be passed along to the callback when
  *                 an event occurs.
  *
- * client_queue:   Queue the client wants to schedule the callback on (Note: Must not be NULL)
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
  *
  * prefix:         A pointer to a struct in6_addr.  Must not be reatained by the callback.
  *
  * prefix_len:     The length of the prefix in bits.
- *
- * callback:       CallBack function for the client that indicates success or failure.
  *
  * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
  *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
@@ -742,11 +891,332 @@ cti_add_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_contex
  *
  */
 
-#define cti_remove_prefix(context, callback, client_queue, prefix, prefix_length) \
-    cti_remove_prefix_(context, callback, client_queue, prefix, prefix_length, __FILE__, __LINE__)
+#define cti_remove_prefix(server, context, callback, client_queue, prefix, prefix_length) \
+    cti_remove_prefix_(server, context, callback, client_queue, prefix, prefix_length, __FILE__, __LINE__)
 DNS_SERVICES_EXPORT cti_status_t
-cti_remove_prefix_(void *NULLABLE context, cti_reply_t NONNULL callback, run_context_t NULLABLE client_queue,
-                   struct in6_addr *NONNULL prefix, int prefix_length, const char *NONNULL file, int line);
+cti_remove_prefix_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback,
+                   run_context_t NULLABLE client_queue, struct in6_addr *NONNULL prefix, int prefix_length,
+                   const char *NONNULL file, int line);
+
+/* cti_add_route
+ *
+ * Requests wpantund to add the specified route on the thread network.
+ * A return value of kCTIStatus_NoError means that the caller can expect the reply callback to be
+ * called with a success or fail status exactly one time.  Any other error means that the request could not
+ * be sent, and the callback will never be called.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * prefix:         A pointer to a struct in6_addr.
+ *
+ * prefix_len:     The length of the prefix in bits.
+ *
+ * priority:       Route priority (>0 for high, 0 for medium, <0 for low).
+ *
+ * domain_id:      Domain id for the route (default is zero).
+ *
+ * stable:         True if the route is part of stable network data.
+ *
+ * nat64:          True if this is NAT64 prefix.
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
+ *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
+ *                 that the request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_add_route(server, context, callback, client_queue, \
+                       prefix, prefix_length, priority, domain_id, stable, nat64) \
+    cti_add_route_(server, context, callback, client_queue, prefix, prefix_length, \
+                    priority, domain_id, stable, nat64, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_add_route_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback,
+               run_context_t NULLABLE client_queue, struct in6_addr *NONNULL prefix, int prefix_length,
+               int priority, int domain_id, bool stable, bool nat64, const char *NONNULL file, int line);
+
+/* cti_remove_route
+ *
+ * Requests wpantund to remove the specified route on the thread network.
+ * A return value of kCTIStatus_NoError means that the caller can expect the reply callback to be called with a success
+ * or fail status exactly one time.  Any other error means that the request could not be sent, and the callback will
+ * never be called.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * prefix:         A pointer to a struct in6_addr.
+ *
+ * prefix_len:     The length of the prefix in bits.
+ *
+ * domain_id:      Domain id for the route (default is zero).
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
+ *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
+ *                 that the request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_remove_route(server, context, callback, client_queue, prefix, prefix_length, domain_id) \
+    cti_remove_route_(server, context, callback, client_queue, prefix, prefix_length, domain_id, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_remove_route_(srp_server_t *NULLABLE server, void *NULLABLE context, cti_reply_t NONNULL callback,
+                  run_context_t NULLABLE client_queue, struct in6_addr *NONNULL prefix, int prefix_length,
+                  int domain_id, const char *NONNULL file, int line);
+
+/*
+ * cti_route_vec_create
+ *
+ * creates a route array vector of specified length
+ *
+ * num_routes:    Number of route slots available in the route vector.
+ *
+ * return value:  NULL, if the call failed; otherwise a prefix vector capable of containing the
+ *                requested number of routes.
+ */
+cti_route_vec_t *NULLABLE
+cti_route_vec_create_(size_t num_routes, const char *NONNULL file, int line);
+#define cti_route_vec_create(num_routes) cti_route_vec_create_(num_routes, __FILE__, __LINE__)
+
+/*
+ * cti_route_vec_release
+ *
+ * decrements the reference count on the provided route vector and, if it reaches zero, finalizes the route vector,
+ * which calls cti_route_release on each route in the vector, potentially also finalizing them.
+ *
+ * num_routes:     Number of route slots available in the route vector.
+ *
+ * return value:   NULL, if the call failed; otherwise a route vector capable of containing the
+ *                 requested number of routes.
+ */
+
+void
+cti_route_vec_release_(cti_route_vec_t *NONNULL routes, const char *NONNULL file, int line);
+#define cti_route_vec_release(routes) cti_route_vec_release_(routes, __FILE__, __LINE__)
+
+/*
+ * cti_route_create
+ *
+ * Creates a cti_route_t containing the specified information. The route is retained, and will be
+ * freed using free() when the route object is finalized. Caller must not retain or free these values, and
+ * they must be allocated on the malloc heap.
+ *
+ * prefix:            A pointer to a struct in6_addr.
+ *
+ * prefix_len:        The length of the prefix in bits.
+ *
+ * origin:            User or ncp.
+ *
+ * nat64:             True if this is NAT64 prefix.
+ *
+ * stable:            True if the route is part of stable network data.
+ *
+ * preference:        Route priority.
+ *
+ * rloc:              Routing locator.
+ *
+ * next_hop_is_host:  True if next hop is host.
+ *
+ * return value:      NULL, if the call failed; otherwise a route object containing the specified state.
+ */
+
+cti_route_t *NULLABLE
+cti_route_create_(struct in6_addr *NONNULL prefix, int prefix_length, offmesh_route_origin_t origin,
+                  bool nat64, bool stable, offmesh_route_preference_t preference, int rloc,
+                  bool next_hop_is_host, const char *NONNULL file, int line);
+#define cti_route_create(prefix, prefix_length, origin, nat64, stable, preference, rloc, next_hop_is_host) \
+    cti_route_create_(prefix, prefix_length, origin, nat64, stable, preference, rloc, next_hop_is_host, __FILE__, __LINE__)
+
+/*
+ * cti_route_release
+ *
+ * Decrements the reference count on the provided route vector and, if it reaches zero, finalizes the route vector,
+ * which calls cti_route_release on each route in the vector, potentially also finalizing them.
+ *
+ * routes:           The route vector to release.
+ *
+ * return value:     NULL, if the call failed; otherwise a route vector capable of containing the requested number of
+ *                   routes.
+ */
+
+void
+cti_route_release_(cti_route_t *NONNULL route, const char *NONNULL file, int line);
+#define cti_route_release(routes) cti_route_release(route, __FILE__, __LINE__)
+
+/* cti_offmesh_route_reply: Callback from cti_get_offmesh_route_list()
+ *
+ * Called when an error occurs during processing of the cti_get_offmesh_route_list call, or when a route
+ * is added or removed.
+ *
+ * In the case of an error, the callback will not be called again, and the caller is responsible for
+ * releasing the connection state and restarting if needed.
+ *
+ * The callback will be called once for each offmesh route present on the Thread network at the time
+ * cti_get_offmesh_prefix_list() is first called, and then again whenever a route is added or removed.
+ *
+ * cti_offmesh_route_reply parameters:
+ *
+ * context:           The context that was passed to the cti_get_offmesh_route_list call to which this is a callback.
+ *
+ * route_vec:         If status is kCTIStatus_NoError, a vector containing all of the routes that were reported in
+ *                    this event.
+ *
+ * status:	          Will be kCTIStatus_NoError if the offmesh route list request is successful, or
+ *                    will indicate the failure that occurred.
+ *
+ */
+
+typedef void
+(*cti_offmesh_route_reply_t)(void *NULLABLE context, cti_route_vec_t *NULLABLE routes, cti_status_t status);
+
+/* cti_get_offmesh_route_list
+ *
+ * Requests wpantund to immediately send the current list of off-mesh routes configured in the Thread
+ * network data.  Whenever the route list is updated, the callback will be called again with the new
+ * information.  A return value of kCTIStatus_NoError means that the caller can expect the reply callback to be
+ * called at least once.  Any other error means that the request could not be sent, and the callback will
+ * never be called.
+ *
+ * ref:            A pointer to a reference to the connection is stored through ref if ref is not NULL.
+ *                 When events are no longer needed, call cti_discontinue_events() on the returned pointer.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
+ *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
+ *                 that the request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_get_offmesh_route_list(server, ref, context, callback, client_queue) \
+    cti_get_offmesh_route_list_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_get_offmesh_route_list_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref,
+                            void *NULLABLE context, cti_offmesh_route_reply_t NONNULL callback,
+                            run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+
+/* cti_onmesh_prefix_reply: Callback from cti_get_onmesh_prefix_list()
+ *
+ * Called when an error occurs during processing of the cti_get_onmesh_prefix_list call, or when a route
+ * is added or removed.
+ *
+ * In the case of an error, the callback will not be called again, and the caller is responsible for
+ * releasing the connection state and restarting if needed.
+ *
+ * The callback will be called once for each offmesh route present on the Thread network at the time
+ * cti_get_offmesh_prefix_list() is first called, and then again whenever a route is added or removed.
+ *
+ * cti_onmesh_prefix_reply parameters:
+ *
+ * context:           The context that was passed to the cti_get_onmesh_prefix_list call to which this is a callback.
+ *
+ * prefix_vec:        If status is kCTIStatus_NoError, a vector containing all of the prefixes that were reported in
+ *                    this event.
+ *
+ * status:	          Will be kCTIStatus_NoError if the onmesh prefix list request is successful, or
+ *                    will indicate the failure that occurred.
+ *
+ */
+
+typedef void
+(*cti_onmesh_prefix_reply_t)(void *NULLABLE context, cti_prefix_vec_t *NULLABLE routes, cti_status_t status);
+
+/* cti_get_onmesh_prefix_list
+ *
+ * Requests wpantund to immediately send the current list of on-mesh prefixes configured in the Thread
+ * network data.  Whenever the prefix list is updated, the callback will be called again with the new
+ * information.  A return value of kCTIStatus_NoError means that the caller can expect the reply callback to be
+ * called at least once.  Any other error means that the request could not be sent, and the callback will
+ * never be called.
+ *
+ * ref:            A pointer to a reference to the connection is stored through ref if ref is not NULL.
+ *                 When events are no longer needed, call cti_discontinue_events() on the returned pointer.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ *
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
+ *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
+ *                 that the request succeeded, merely that it was successfully started.
+ *
+ */
+
+#define cti_get_onmesh_prefix_list(server, ref, context, callback, client_queue) \
+    cti_get_onmesh_prefix_list_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
+DNS_SERVICES_EXPORT cti_status_t
+cti_get_onmesh_prefix_list_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref,
+                            void *NULLABLE context, cti_onmesh_prefix_reply_t NONNULL callback,
+                            run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
+
+/* cti_rloc16_reply: Callback from cti_get_rloc16()
+ *
+ * Called when an error occurs during processing of the cti_get_rloc16 call, or when rloc16
+ * is updated.
+ *
+ * In the case of an error, the callback will not be called again, and the caller is responsible for
+ * releasing the connection state and restarting if needed.
+ *
+ * The callback will be called initially to report the current value for the property, and subsequently
+ * whenever the property changes.
+ *
+ * cti_rloc16_reply parameters:
+ *
+ * context:           The context that was passed to the cti call to which this is a callback.
+ *
+ * rloc16:            The rloc16 value(only valid if status is kCTIStatus_NoError).
+ *
+ * status:            Will be kCTIStatus_NoError if the rloc16 request is successful, or will indicate the failure
+ *                    that occurred.
+ *
+ */
+typedef void
+(*cti_rloc16_reply_t)(void *NULLABLE context, uint16_t rloc16, cti_status_t status);
+
+/* cti_get_rloc16
+ *
+ * Requests wpantund to immediately send the rloc16 of the local device. Whenever the RLOC16
+ * changes, the callback will be called again with the new RLOC16.  A return value of
+ * kCTIStatus_NoError means that the caller can expect the reply callback to be called at least once.  Any
+ * other error means that the request could not be sent, and the callback will never be called.
+ *
+ * ref:            A pointer to a reference to the connection is stored through ref if ref is not NULL.
+ *                 When events are no longer needed, call cti_discontinue_events() on the returned pointer.
+ *
+ * context:        An anonymous pointer that will be passed along to the callback when
+ *                 an event occurs.
+ * callback:       CallBack function for the client that indicates success or failure.
+ *
+ * client_queue:   Queue the client wants to schedule the callback on
+ *
+ * return value:   Returns kCTIStatus_NoError when no error otherwise returns an error code indicating
+ *                 the error that occurred. Note: A return value of kCTIStatus_NoError does not mean
+ *                 that the request succeeded, merely that it was successfully started.
+ *
+ */
+#define cti_get_rloc16(server, ref, context, callback, client_queue) \
+    cti_get_rloc16_(server, ref, context, callback, client_queue, __FILE__, __LINE__)
+
+DNS_SERVICES_EXPORT cti_status_t
+cti_get_rloc16_(srp_server_t *NULLABLE server, cti_connection_t NULLABLE *NULLABLE ref,
+                void *NULLABLE context, cti_rloc16_reply_t NONNULL callback,
+                run_context_t NULLABLE client_queue, const char *NONNULL file, int line);
 
 /* cti_events_discontinue
  *
@@ -758,12 +1228,15 @@ cti_events_discontinue(cti_connection_t NONNULL ref);
 
 typedef union cti_callback {
     cti_reply_t NULLABLE reply;
-    cti_tunnel_reply_t NONNULL tunnel_reply;
+    cti_string_property_reply_t NONNULL string_property_reply;
     cti_service_reply_t NONNULL service_reply;
     cti_prefix_reply_t NONNULL prefix_reply;
     cti_state_reply_t NONNULL state_reply;
     cti_uint64_property_reply_t NONNULL uint64_property_reply;
     cti_network_node_type_reply_t NONNULL network_node_type_reply;
+    cti_offmesh_route_reply_t NONNULL offmesh_route_reply;
+    cti_onmesh_prefix_reply_t NONNULL onmesh_prefix_reply;
+    cti_rloc16_reply_t NONNULL rloc16_reply;
 } cti_callback_t;
 
 #endif /* __CTI_SERVICES_H__ */

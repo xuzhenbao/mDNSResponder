@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-file-style: "bsd"; c-basic-offset: 4; fill-column: 108; indent-tabs-mode: nil; -*-
  *
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -168,7 +168,10 @@ struct NetworkInterfaceInfoOSX_struct
     int BPF_mcfd;                               // Socket for our IPv6 ND group membership
     u_int BPF_len;
     uint32_t ift_subfamily;                     // The interface's subfamily type from the SIOCGIFTYPE ioctl().
+    uint32_t if_functional_type;                // The interface's functional type from the SIOCGIFFUNCTIONALTYPE
+                                                // ioctl().
     mDNSBool isAWDL;                            // True if this interface has the IFEF_AWDL flag set.
+    mDNSBool isPrivacyRisk;                     // True if this interface is a privacy risk.
 #ifdef MDNSRESPONDER_USES_LIB_DISPATCH_AS_PRIMARY_EVENT_LOOP_MECHANISM
     dispatch_source_t BPF_source;
 #else

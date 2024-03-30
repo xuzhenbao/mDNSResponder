@@ -1,6 +1,6 @@
 /* srp-mdns-proxy.h
  *
- * Copyright (c) 2019-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@
 #include <stddef.h> // For ptrdiff_t
 #include "ioloop-common.h" // for service_connection_t
 
+#define PLATFORM_ADVERTISE_INTERFACE kDNSServiceInterfaceIndexAny
+
 typedef struct adv_instance adv_instance_t;
 typedef struct adv_record_registration adv_record_t;
 typedef struct adv_host adv_host_t;
@@ -36,27 +38,57 @@ typedef struct route_state route_state_t;
 typedef struct srp_wanted_state srp_wanted_state_t; // private
 typedef struct srp_xpc_client srp_xpc_client_t;     // private
 typedef struct srpl_domain srpl_domain_t;           // private
+typedef struct service_tracker service_tracker_t;
+typedef struct thread_tracker thread_tracker_t;
+typedef struct node_type_tracker node_type_tracker_t;
+typedef struct service_publisher service_publisher_t;
+typedef struct dns_host_description dns_host_description_t;
+typedef struct service_instance service_instance_t;
+typedef struct service service_t;
+typedef struct delete delete_t;
+typedef struct _cti_connection_t *cti_connection_t;
+typedef struct dnssd_proxy_advertisements dnssd_proxy_advertisements_t;
+typedef struct dnssd_client dnssd_client_t;
+typedef struct probe_state probe_state_t;
 
 // Server internal state
 struct srp_server_state {
     char *NULLABLE name;
     adv_host_t *NULLABLE hosts;
     dnssd_txn_t *NULLABLE shared_registration_txn;
-    dnssd_txn_t *NULLABLE srpl_advertise_txn;
     srpl_domain_t *NULLABLE srpl_domains;
+#if STUB_ROUTER
     route_state_t *NULLABLE route_state;
+#endif
+#if THREAD_DEVICE
+    service_tracker_t *NULLABLE service_tracker;
+    service_publisher_t *NULLABLE service_publisher;
+    thread_tracker_t *NULLABLE thread_tracker;
+    node_type_tracker_t *NULLABLE node_type_tracker;
+#endif
+    dnssd_proxy_advertisements_t *NULLABLE dnssd_proxy_advertisements;
+    dnssd_client_t *NULLABLE dnssd_client;
     io_t *NULLABLE adv_ctl_listener;
-    wakeup_t *NULLABLE srpl_register_wakeup;
     wakeup_t *NULLABLE srpl_browse_wakeup;
-    uint64_t server_id; // SRP replication server ID
+    wakeup_t *NULLABLE object_allocation_stats_dump_wakeup;
     struct in6_addr ula_prefix;
+    uint64_t xpanid;
     int advertise_interface;
-
 
     uint32_t max_lease_time;
     uint32_t min_lease_time; // thirty seconds
+    uint32_t key_max_lease_time;
+    uint32_t key_min_lease_time; // thirty seconds
 
+    uint16_t rloc16;
+
+    bool have_rloc16;
+    bool have_mesh_local_address;
     bool srp_replication_enabled;
+    bool break_srpl_time;
+    bool stub_router_enabled;
+    bool srp_unicast_service_blocked;
+    bool srp_anycast_service_blocked;
 #if SRP_FEATURE_NAT64
     bool srp_nat64_enabled;
 #endif
@@ -78,6 +110,7 @@ struct adv_instance {
     int64_t lease_expiry;                // Time when lease expires, relative to ioloop_timenow().
     bool removed;                        // True if this instance is being kept around for replication.
     bool update_pending;                 // True if we got a conflict while updating and are waiting to try again
+    bool anycast;                        // True if service registration is through anycast service.
 };
 
 // A record registration
@@ -98,7 +131,6 @@ struct adv_host {
     srp_server_t *NULLABLE server_state;   // Server state to which this host belongs.
     wakeup_t *NONNULL retry_wakeup;        // Wakeup for retry when we run into a temporary failure
     wakeup_t *NONNULL lease_wakeup;        // Wakeup at least expiry time
-    service_connection_t *NULLABLE conn;   // Connection handler to mDNSResponder that shares DNSServiceRef with others.
     adv_host_t *NULLABLE next;             // Hosts are maintained in a linked list.
     adv_update_t *NULLABLE update;         // Update to this host, if one is being done
     char *NONNULL name;                    // Name of host (without domain)
@@ -137,10 +169,6 @@ struct adv_update {
     int ref_count;
 
     adv_host_t *NULLABLE host;              // Host being updated
-
-    // Ordinarily NULL, but may be non-NULL if we lost the server during an update and had
-    // to construct an update to re-add the host.
-    adv_update_t *NULLABLE next;
 
     // Connection state, if applicable, of the client request that produced this update.
     client_update_t *NULLABLE client;
@@ -184,6 +212,10 @@ struct adv_update {
     // case, we do not want to extend the lease--just get the host registration right.
     int64_t lease_expiry;
 
+    // The time when we started doing the update. If we get a retransmission, we can compare the current
+    // to this time to see if we ought to try again.
+    time_t start_time;
+
     // True if we are registering the key to hold the hostname.
     bool registering_key;
 };
@@ -222,12 +254,13 @@ void srp_adv_host_release_(adv_host_t *NONNULL host, const char *NONNULL file, i
 #define srp_adv_host_retain(host) srp_adv_host_retain_(host, __FILE__, __LINE__)
 void srp_adv_host_retain_(adv_host_t *NONNULL host, const char *NONNULL file, int line);
 #define srp_adv_host_copy(server_state, name) srp_adv_host_copy_(server_state, name, __FILE__, __LINE__)
-adv_host_t *NULLABLE srp_adv_host_copy_(srp_server_t *NONNULL server_state, dns_name_t *NONNULL name, const char *NONNULL file, int line);
-bool srp_adv_host_is_homekit_accessory(srp_server_t *NONNULL server_state, addr_t *NONNULL address);
+adv_host_t *NULLABLE srp_adv_host_copy_(srp_server_t *NONNULL server_state, dns_name_t *NONNULL name,
+                                        const char *NONNULL file, int line);
 int srp_current_valid_host_count(srp_server_t *NONNULL server_state);
 int srp_hosts_to_array(srp_server_t *NONNULL server_state, adv_host_t *NONNULL *NULLABLE host_array, int max_hosts);
 bool srp_adv_host_valid(adv_host_t *NONNULL host);
-srp_server_t *NULLABLE server_state_create(const char *NONNULL name, int interface_index, int max_lease_time, int min_lease_time);
+srp_server_t *NULLABLE server_state_create(const char *NONNULL name, int interface_index, int max_lease_time,
+                                           int min_lease_time, int key_max_lease_time, int key_min_lease_time);
 #endif // __SRP_MDNS_PROXY_H__
 
 // Local Variables:

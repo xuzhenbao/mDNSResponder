@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@
 #include <stdio.h>
 #include <mdns/private.h>
 #include "mDNSEmbeddedAPI.h"
-#include "mdns_strict.h"
 #include "uds_daemon.h"
 #include "bsd_queue.h"			// For SLIST.
 #include "discover_resolver.h"
@@ -69,18 +68,13 @@
 	#endif // #ifndef require_action
 #endif
 
+#include "mdns_strict.h"
+
 //======================================================================================================================
 // MARK: - Macros
 
-// Retain and release macros that are used to do reference counting for the discover_resolver_t object.
-#define DISCOVER_RESOLVER_RETAIN(OBJ)															\
-	do {																						\
-		(OBJ)->ref_count++;																		\
-		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "discover_resolver_t retained "	\
-			"- ref count after retaining: %u.", (OBJ)->ref_count); 								\
-	} while (false)
-
-#define DISCOVER_RESOLVER_RELEASE(OBJ)															\
+// Release macros that are used to do reference counting for the discover_resolver_t object.
+#define discover_resolver_release(OBJ)															\
 	do {																						\
 		(OBJ)->ref_count--;																		\
 		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "discover_resolver_t released "	\
@@ -89,6 +83,14 @@
 			_MDNS_STRICT_DISPOSE_TEMPLATE((OBJ), (OBJ)->finalizer);								\
 		}																						\
 	} while (false)
+
+#define discover_resolver_forget(PTR)			\
+	do {										\
+		if (*(PTR)) {							\
+			discover_resolver_release(*(PTR));	\
+			*(PTR) = mDNSNULL;					\
+		}										\
+	} while (mDNSfalse)
 
 //======================================================================================================================
 // MARK: - Structures
@@ -109,6 +111,8 @@ struct discover_resolver_name {
 	DNSQuestion ipv6_question; // used to query for IPv6 address of the resolver name
 
 	resolver_address_t * NULLABLE addresses; // linked list of all addresses for the resolver name
+	mDNSs32 next_update_time;				// If non-zero, it indicates the next time when we should update the DNS
+											// service that has been previously registered
 	discover_resolver_name_t * NULLABLE next;
 };
 
@@ -123,12 +127,16 @@ struct discover_resolver_context {
 typedef struct discover_resolver discover_resolver_t;
 typedef void (* discover_resolver_finalizer_t)(discover_resolver_t * NULLABLE discover_resolver);
 struct discover_resolver {
-	domainname domain; // The domain that is used to discover the local DNS resolver.
-	discover_resolver_context_t * NULLABLE context;
-	// The finalizer that will be called to invalidate any ongoing activity and free the memory associated with this
-	// object, when the reference count becomes 0.
-	discover_resolver_finalizer_t NONNULL finalizer;
-	uint32_t ref_count;
+	domainname						domain;			// The domain that is used to discover the local DNS resolver.
+	mDNSs32							next_stop_time;	// If non-zero, indicate when the object should be released.
+	mDNSu32							ref_count;		// The reference count. If it is zero, the object will be finalized.
+	mDNSu32							use_count;		// The use count that indicates how many clients need this resolver
+													// discovery.
+
+	discover_resolver_context_t *	context;		// The context.
+	discover_resolver_finalizer_t	finalizer;		// The finalizer that will be called to invalidate any ongoing
+													// activity and free the memory associated with this object, when
+													// the reference count becomes 0.
 };
 
 // The single-linked node type that contains discover_resolver_t.
@@ -170,6 +178,18 @@ discover_resolver_start(discover_resolver_context_t * NULLABLE context, const do
 
 void
 discover_resolver_stop(discover_resolver_context_t * NULLABLE context);
+
+static mDNSs32
+_discover_resolver_get_next_dns_service_update_time(void);
+
+static void
+_discover_resolver_update_dns_service(void);
+
+static mDNSs32
+_discover_resolver_get_next_unused_resolver_discovery_stop_time(void);
+
+static void
+_discover_resolver_stop_unused_resolver_discovery(void);
 
 //======================================================================================================================
 // MARK: - Functions
@@ -508,9 +528,16 @@ resolver_discovery_add(const domainname * const NONNULL domain_to_discover, cons
 		break;
 	}
 
-	// Retain the existing one if exists.
+	// Increase the use count if it exists.
 	if (discover_resolver_to_retain != NULL) {
-		DISCOVER_RESOLVER_RETAIN(discover_resolver_to_retain);
+		discover_resolver_to_retain->use_count++;
+
+		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "Use the ongoing resolver discovery -- "
+			"domain: " PRI_DM_NAME ", use count: %u", DM_NAME_PARAM(&discover_resolver_to_retain->domain),
+			discover_resolver_to_retain->use_count);
+
+		// Clears the stop time in case we are waiting for stopping it.
+		discover_resolver_to_retain->next_stop_time = 0;
 		discover_resolver_to_retain = NULL;
 		succeeded = true;
 		goto exit;
@@ -533,12 +560,16 @@ resolver_discovery_add(const domainname * const NONNULL domain_to_discover, cons
 	np = discover_resolver_slist_add_front(g_discover_resolvers, discover_resolver_to_retain);
 	require_action(np != NULL, exit, succeeded = false);
 
+	discover_resolver_to_retain->use_count = 1;
+
+	LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Start new resolver discovery -- "
+		"domain: " PRI_DM_NAME ", use count: %u", DM_NAME_PARAM(&discover_resolver_to_retain->domain),
+		discover_resolver_to_retain->use_count);
+
 	discover_resolver_to_retain = NULL;
 
 exit:
-	if (discover_resolver_to_retain != NULL) {
-		DISCOVER_RESOLVER_RELEASE(discover_resolver_to_retain);
-	}
+	discover_resolver_forget(&discover_resolver_to_retain);
 
 	return succeeded;
 }
@@ -549,30 +580,43 @@ bool
 resolver_discovery_remove(const domainname * const NONNULL domain_to_discover, const bool grab_mdns_lock)
 {
 	bool succeeded = false;
-	discover_resolver_node_t * np, * np_temp;
+	discover_resolver_node_t *np, *np_temp;
+	mDNS *const m = &mDNSStorage;
 
 	require_action(g_discover_resolvers != NULL, exit, LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT,
 		"Trying to stop a domain resolver discovery that does not exist - domain: " PRI_DM_NAME ".",
 		DM_NAME_PARAM(domain_to_discover)));
 
 	SLIST_FOREACH_SAFE(np, g_discover_resolvers, __entries, np_temp) {
-		if (!SameDomainName(&np->discover_resolver->domain, domain_to_discover)) {
+
+		discover_resolver_t *const discover_resolver = np->discover_resolver;
+		if (!SameDomainName(&discover_resolver->domain, domain_to_discover)) {
 			continue;
 		}
 
-		if (grab_mdns_lock) {
-			mDNS_Lock(&mDNSStorage);
-		}
-		DISCOVER_RESOLVER_RELEASE(np->discover_resolver);
-		if (grab_mdns_lock) {
-			mDNS_Unlock(&mDNSStorage);
-		}
+		discover_resolver->use_count--;
 
-		// If np->discover_resolver is finalized by DISCOVER_RESOLVER_RELEASE() above, np->discover_resolver will be
-		// set to NULL. If so, delete this node from the list.
-		if (np->discover_resolver == NULL) {
-			SLIST_REMOVE(g_discover_resolvers, np, discover_resolver_node, __entries);
-			mdns_free(np);
+		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "One less resolver discovery use count -- "
+			"domain: " PRI_DM_NAME ", use count: %u", DM_NAME_PARAM(&discover_resolver->domain),
+			discover_resolver->use_count);
+
+		if (discover_resolver->use_count == 0) {
+			const mDNSs32 gracePeriodInSeconds = 5;
+			const mDNSs32 gracePeriodPlatformTime = gracePeriodInSeconds * mDNSPlatformOneSecond;
+
+			if (grab_mdns_lock) {
+				mDNS_Lock(&mDNSStorage);
+			}
+
+			discover_resolver->next_stop_time = NonZeroTime(m->timenow + gracePeriodPlatformTime);
+
+			if (grab_mdns_lock) {
+				mDNS_Unlock(&mDNSStorage);
+			}
+
+			LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEBUG, "Planning to stop the resolver discovery -- "
+				"domain: " PRI_DM_NAME ", grace period: %ds", DM_NAME_PARAM(&discover_resolver->domain),
+				gracePeriodInSeconds);
 		}
 
 		succeeded = true;
@@ -586,6 +630,37 @@ resolver_discovery_remove(const domainname * const NONNULL domain_to_discover, c
 
 exit:
 	return succeeded;
+}
+
+//======================================================================================================================
+
+mDNSs32
+resolver_discovery_get_next_scheduled_event(void)
+{
+	mDNSs32 next_event = 0;
+
+	// See if we need to update the registered native DNS service.
+	const mDNSs32 next_update_time = _discover_resolver_get_next_dns_service_update_time();
+	if ((next_update_time != 0) && ((next_event == 0) || (next_update_time - next_event < 0))) {
+		next_event = next_update_time;
+	}
+
+	// See if we need to deregister the native DNS service that has not been used for a while.
+	const mDNSs32 next_stop_time = _discover_resolver_get_next_unused_resolver_discovery_stop_time();
+	if ((next_stop_time != 0) && ((next_event == 0) || (next_stop_time - next_event < 0))) {
+		next_event = next_stop_time;
+	}
+
+	return next_event;
+}
+
+//======================================================================================================================
+
+void
+resolver_discovery_perform_periodic_tasks(void)
+{
+	_discover_resolver_update_dns_service();
+	_discover_resolver_stop_unused_resolver_discovery();
 }
 
 //======================================================================================================================
@@ -642,9 +717,6 @@ discover_resolver_finalize(discover_resolver_t * const NULLABLE discover_resolve
 	if (discover_resolver == NULL) {
 		return;
 	}
-
-	LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Stopping the resolver discovery for domain - "
-		"domain: " PRI_DM_NAME, DM_NAME_PARAM(&discover_resolver->domain));
 
 	if (discover_resolver->context != NULL) {
 		discover_resolver_stop(discover_resolver->context);
@@ -720,16 +792,26 @@ discover_resolver_setup_question(DNSQuestion * const NONNULL q, mDNSInterfaceID 
 
 //======================================================================================================================
 
-static bool
-native_dns_service_register(const domainname * const NONNULL resolver_domain,
-	const resolver_address_t * const NONNULL addrs, const uint32_t interface_index,
-	const bool reinit_dns_service_definition, discover_resolver_name_t * const NONNULL out_resolver_name)
+static void
+_schedule_dns_service_update(discover_resolver_name_t * const resolver_name)
 {
-	(void)resolver_domain;
-	(void)addrs;
-	(void)interface_index;
-	(void)reinit_dns_service_definition;
-	(void)out_resolver_name;
+	mDNS * const m = &mDNSStorage;
+	mDNS_Lock(m);
+	const mDNSs32 time_now = m->timenow;
+	mDNS_Unlock(m);
+
+	// Wait for 0.005s before updating the DNS service.
+	const mDNSs32 update_pending_time = mDNSPlatformOneSecond / 200;
+	resolver_name->next_update_time = NonZeroTime(time_now + update_pending_time);
+}
+
+//======================================================================================================================
+
+static bool
+_native_dns_service_register(const domainname * const domain, discover_resolver_name_t * const resolver_name)
+{
+	(void)domain;
+	(void)resolver_name;
 	return false;
 }
 
@@ -748,34 +830,40 @@ static void
 discover_resolver_addr_query_callback(mDNS * const NONNULL m, DNSQuestion * const NONNULL q,
 	const ResourceRecord * const NONNULL answer, const QC_result change_event)
 {
-	bool succeeded;
-	bool new_address_created = false;
 	discover_resolver_context_t * context = q->QuestionContext;
 	discover_resolver_name_t * resolver_name = NULL;
 	const void * const addr_data = answer->rdata->u.data;
 	const mDNSAddr_Type addr_type = answer->rrtype == kDNSType_A ? mDNSAddrType_IPv4 : mDNSAddrType_IPv6;
-	const domainname * const browsing_domain = &context->ns_question.qname;
+
 	mDNS_Lock(m);
-	const char * const if_name = InterfaceNameForID(m, q->InterfaceID);
-	const uint32_t if_index = mDNSPlatformInterfaceIndexfromInterfaceID(m, q->InterfaceID, mDNSfalse);
+	char if_name[64]; // The same size as the ((NetworkInterfaceInfo *)0)->ifname).
+	check_compile_time_code(sizeof(if_name) == sizeof(((NetworkInterfaceInfo *)0)->ifname));
+
+	const char * const if_name_ptr = InterfaceNameForID(m, answer->InterfaceID);
+	if (if_name_ptr) {
+		mDNSPlatformStrLCopy(if_name, if_name_ptr, sizeof(if_name));
+	} else {
+		mDNS_snprintf(if_name, sizeof(if_name), "<ID: %u>", IIDPrintable(answer->InterfaceID));
+	}
 	mDNS_Unlock(m);
+
 	const char * action = NULL;
 	mDNSAddr addr_changed;
 
-	require_action(change_event == QC_add ||change_event == QC_rmv, exit, succeeded = false);
-	require_action(answer->rrtype == kDNSType_A || answer->rrtype == kDNSType_AAAA, exit, succeeded = false);
-	require_action(q->InterfaceID == answer->InterfaceID, exit, succeeded = false);
+	mdns_require_quiet(change_event == QC_add ||change_event == QC_rmv, exit);
+	mdns_require_quiet(answer->rrtype == kDNSType_A || answer->rrtype == kDNSType_AAAA, exit);
+	mdns_require_quiet(q->InterfaceID == answer->InterfaceID, exit);
 
 	// Find the corresponding discover_resolver_name_t that starts this address query.
 	resolver_name = discover_resolver_name_find(&q->qname, q->InterfaceID, context->resolver_names);
-	require_action(resolver_name, exit, succeeded = false);
+	mdns_require_quiet(resolver_name, exit);
 
 	// Try to find if there is existing address in the list.
 	resolver_address_t * resolver_addr = resolver_addresses_find(addr_data, addr_type, resolver_name->addresses);
 
 	if (change_event == QC_add) {
 		// Should have no duplicate addresses for the QC_add event.
-		require_action(resolver_addr == NULL, exit, succeeded = false);
+		mdns_require_quiet(resolver_addr == NULL, exit);
 
 		if (resolver_name->addresses == NULL) {
 			action = "newly added";
@@ -785,36 +873,22 @@ discover_resolver_addr_query_callback(mDNS * const NONNULL m, DNSQuestion * cons
 
 		// Add the address into list.
 		resolver_addr = resolver_addresses_add(addr_data, addr_type, &resolver_name->addresses);
-		require_action(resolver_addr != NULL, exit, succeeded = false);
-		new_address_created = true;
+		mdns_require_quiet(resolver_addr != NULL, exit);
 		memcpy(&addr_changed, &resolver_addr->addr, sizeof(addr_changed));
-
-		// Add new DNS configuration.
-		succeeded = native_dns_service_register(browsing_domain, resolver_addr, if_index, false, resolver_name);
-		require(succeeded, exit);
 
 	} else {
 		// Should be the added address in the list and should not be removed twice.
-		require_action(resolver_addr != NULL, exit, succeeded = false);
+		mdns_require_quiet(resolver_addr != NULL, exit);
 		// Should already have configured resolver.
 
 		memcpy(&addr_changed, &resolver_addr->addr, sizeof(addr_changed));
 
 		// Remove the address from the list.
-		succeeded = resolver_addresses_remove(addr_data, addr_type, &resolver_name->addresses);
-		require(succeeded, exit);
-
-		if (resolver_name->addresses != NULL) {
-			succeeded = native_dns_service_register(browsing_domain, resolver_name->addresses, if_index, true,
-													resolver_name);
-			require(succeeded, exit);
-			action = "removed from the existing one";
-		} else {
-			succeeded = native_dns_service_deregister(resolver_name);
-			require(succeeded, exit);
-			action = "removed entirely";
-		}
+		resolver_addresses_remove(addr_data, addr_type, &resolver_name->addresses);
 	}
+
+	// Schedule new DNS configuration update.
+	_schedule_dns_service_update(resolver_name);
 
 	LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "[Q%u] Resolver " PUB_S " - "
 		"browsing domain: " PRI_DM_NAME ", resolver name: " PRI_DM_NAME ", address: " PRI_IP_ADDR
@@ -822,11 +896,6 @@ discover_resolver_addr_query_callback(mDNS * const NONNULL m, DNSQuestion * cons
 		DM_NAME_PARAM(&context->ns_question.qname), DM_NAME_PARAM(&q->qname), &addr_changed, if_name);
 
 exit:
-	if (!succeeded) {
-		if (new_address_created) {
-			resolver_addresses_remove(addr_data, addr_type, &resolver_name->addresses);
-		}
-	}
 	return;
 }
 
@@ -1022,6 +1091,135 @@ discover_resolver_stop(discover_resolver_context_t * const NULLABLE context)
 		return;
 	}
 	discover_resolver_stop_ns_query(context);
+}
+
+//======================================================================================================================
+
+static mDNSs32
+_discover_resolver_get_next_dns_service_update_time(void)
+{
+	mDNSs32 next_time = 0;
+	mdns_require_quiet(g_discover_resolvers, exit);
+
+	discover_resolver_node_t *np, *np_temp;
+	SLIST_FOREACH_SAFE(np, g_discover_resolvers, __entries, np_temp) {
+		const discover_resolver_t *const discover_resolver = np->discover_resolver;
+
+		if (discover_resolver == mDNSNULL || discover_resolver->context == mDNSNULL ||
+			discover_resolver->context->resolver_names == mDNSNULL) {
+			continue;
+		}
+
+		const discover_resolver_name_t * const resolver_name = discover_resolver->context->resolver_names;
+		const mDNSs32 next_update_time = resolver_name->next_update_time;
+		if (next_update_time == 0) {
+			continue;
+		}
+
+		if ((next_time == 0) || ((next_update_time - next_time) < 0)) {
+			next_time = next_update_time;
+		}
+	}
+
+exit:
+	return next_time;
+}
+
+//======================================================================================================================
+
+static void
+_discover_resolver_update_dns_service(void)
+{
+	const mDNSs32 time_now = mDNSStorage.timenow;
+	mdns_require_return(g_discover_resolvers);
+
+	discover_resolver_node_t *np, *np_temp;
+	SLIST_FOREACH_SAFE(np, g_discover_resolvers, __entries, np_temp) {
+		discover_resolver_t *const discover_resolver = np->discover_resolver;
+
+		if (discover_resolver == mDNSNULL || discover_resolver->context == mDNSNULL ||
+			discover_resolver->context->resolver_names == mDNSNULL) {
+			continue;
+		}
+
+		discover_resolver_name_t * const resolver_name = discover_resolver->context->resolver_names;
+		const mDNSs32 next_update_time = resolver_name->next_update_time;
+		if ((next_update_time == 0) || ((next_update_time - time_now) > 0)) {
+			continue;
+		}
+
+		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Updating discovered local resolver - name: "
+			PRI_DM_NAME, DM_NAME_PARAM(&discover_resolver->domain));
+
+		const mDNSBool updated = _native_dns_service_register(&discover_resolver->domain, resolver_name);
+		if (!updated) {
+			LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_FAULT,
+				"Failed to update the DNS service for the locally-discovered resolver - domain: " PRI_DM_NAME,
+				DM_NAME_PARAM(&resolver_name->resolver_name));
+		}
+
+		resolver_name->next_update_time = 0;
+	}
+}
+
+//======================================================================================================================
+
+static mDNSs32
+_discover_resolver_get_next_unused_resolver_discovery_stop_time(void)
+{
+	mDNSs32 next_time = 0;
+	mdns_require_quiet(g_discover_resolvers, exit);
+
+	// Find the next stop time that is closest to us.
+	discover_resolver_node_t *np, *np_temp;
+	SLIST_FOREACH_SAFE(np, g_discover_resolvers, __entries, np_temp) {
+		const discover_resolver_t *const discover_resolver = np->discover_resolver;
+		if (discover_resolver->use_count != 0) {
+			continue;
+		}
+
+		const mDNSs32 next_stop_time = discover_resolver->next_stop_time;
+		if (next_stop_time == 0) {
+			continue;
+		}
+
+		if ((next_time == 0) || (next_time - next_stop_time > 0)) {
+			next_time = next_stop_time;
+		}
+	}
+
+exit:
+	return next_time;
+}
+
+//======================================================================================================================
+
+static void
+_discover_resolver_stop_unused_resolver_discovery(void)
+{
+	const mDNSs32 time_now = mDNSStorage.timenow;
+	mdns_require_return(g_discover_resolvers);
+
+	discover_resolver_node_t *np, *np_temp;
+	SLIST_FOREACH_SAFE(np, g_discover_resolvers, __entries, np_temp) {
+		if (np->discover_resolver->use_count != 0) {
+			continue;
+		}
+
+		const mDNSs32 next_stop_time = np->discover_resolver->next_stop_time;
+		if ((next_stop_time == 0) || (time_now - next_stop_time < 0)) {
+			continue;
+		}
+
+		// Now (next_stop_time <= time_now) indicates that we have passed the next_stop_time.
+		// Therefore, it is time to cancel the resolver discovery.
+		LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_DEFAULT, "Stopping the resolver discovery -- "
+			"domain: " PRI_DM_NAME, DM_NAME_PARAM(&np->discover_resolver->domain));
+
+		discover_resolver_forget(&np->discover_resolver);
+		SLIST_REMOVE(g_discover_resolvers, np, discover_resolver_node, __entries);
+		mdns_free(np);
+	}
 }
 
 #else // MDNSRESPONDER_SUPPORTS(COMMON, LOCAL_DNS_RESOLVER_DISCOVERY)

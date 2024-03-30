@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -328,6 +328,7 @@ _mrcs_session_handle_dns_proxy_start(const mrcs_session_t me, const xpc_object_t
 	proxy = _mrcs_create_dns_proxy_from_params_dictionary(params, &err);
 	require_noerr_quiet(err, exit);
 
+	mrcs_dns_proxy_set_euid(proxy, xpc_connection_get_euid(me->connection));
 	err = _mrcs_server_dns_proxy_start(proxy);
 	require_noerr_quiet(err, exit);
 

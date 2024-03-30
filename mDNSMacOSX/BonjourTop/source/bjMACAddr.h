@@ -33,8 +33,8 @@ public:
 
     void CopyVendor(BJMACAddr& src) { memset(addr,0,sizeof(addr)); memcpy(addr,src.addr,4);}; // 3 is standar vendor But 4 is better with apple products
 
-    char* GetString() {sprintf(buffer,"%02X:%02X:%02X:%02X:%02X:%02X", addr[0],addr[1],addr[2],addr[3],addr[4],addr[5]); return buffer;};
-    char* GetStringVendor() {sprintf(buffer,"%02X:%02X:%02X", addr[0],addr[1],addr[2]); return buffer;};
+    char* GetString() {snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X", addr[0],addr[1],addr[2],addr[3],addr[4],addr[5]); return buffer;};
+    char* GetStringVendor() {snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X", addr[0],addr[1],addr[2]); return buffer;};
     BJ_COMPARE Compare(BJMACAddr* compareAddr)
     {
         int result = memcmp(addr, compareAddr->addr, sizeof(addr));

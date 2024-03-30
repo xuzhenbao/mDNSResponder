@@ -324,7 +324,8 @@ dnssd_svcb_copy_doh_uri(const uint8_t *buffer, size_t buffer_size)
 	__block char *doh_uri = NULL;
 	(void)_dnssd_svcb_extract_values(buffer, buffer_size, dnssd_svcb_key_doh_uri, ^bool(const void *value, size_t value_size) {
 		if (value != NULL && value_size > 0) {
-			asprintf(&doh_uri, "%.*s", (int)value_size, value);
+			const char * const value_str = value;
+			asprintf(&doh_uri, "%.*s", (int)value_size, value_str);
 		}
 		return false;
 	});
@@ -337,7 +338,8 @@ dnssd_svcb_copy_doh_path(const uint8_t *buffer, size_t buffer_size)
 	__block char *doh_path = NULL;
 	(void)_dnssd_svcb_extract_values(buffer, buffer_size, dnssd_svcb_key_doh_path, ^bool(const void *value, size_t value_size) {
 		if (value != NULL && value_size > 0) {
-			asprintf(&doh_path, "%.*s", (int)value_size, value);
+			const char * const value_str = value;
+			asprintf(&doh_path, "%.*s", (int)value_size, value_str);
 		}
 		return false;
 	});

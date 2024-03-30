@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2019-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,10 +39,10 @@ extern mDNSBool Querier_ResourceRecordIsAnswer(const ResourceRecord *rr, mdns_qu
 extern mDNSBool Querier_SameNameCacheRecordIsAnswer(const CacheRecord *cr, mdns_querier_t querier);
 extern void Querier_HandleStoppedDNSQuestion(DNSQuestion *q);
 extern void Querier_RegisterDoHURI(const char *doh_uri, const char *domain);
-extern mdns_querier_t Querier_HandlePreCNAMERestart(DNSQuestion *q);
-extern void Querier_HandlePostCNAMERestart(DNSQuestion *q, mdns_querier_t querier);
-extern void Querier_PrepareQuestionForUnwindRestart(DNSQuestion *q);
+extern mdns_client_t Querier_HandlePreCNAMERestart(DNSQuestion *q);
+extern void Querier_HandlePostCNAMERestart(DNSQuestion *q, mdns_client_t client);
 extern void Querier_HandleSleep(void);
 extern void Querier_HandleWake(void);
+extern void Querier_HandleMDNSQuestion(DNSQuestion *const q);
 
 #endif  // __QUERIER_SUPPORT_H__

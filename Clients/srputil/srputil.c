@@ -1,6 +1,6 @@
 /* srputil.c
  *
- * Copyright (c) 2020-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,7 @@ void *main_queue = NULL;
 #include "dns-msg.h"
 #include "ioloop.h"
 #include "advertising_proxy_services.h"
+#include "route-tracker.h"
 
 
 static void
@@ -122,6 +123,26 @@ remove_prefix_callback(advertising_proxy_conn_ref cref, void *result, advertisin
 }
 
 static void
+add_nat64_prefix_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
+{
+    INFO("add nat64 prefix: cref %p  response %p   err %d.", cref, result, err);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        exit(1);
+    }
+    exit(0);
+}
+
+static void
+remove_nat64_prefix_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
+{
+    INFO("remove nat64 prefix: cref %p  response %p   err %d.", cref, result, err);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        exit(1);
+    }
+    exit(0);
+}
+
+static void
 stop_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
 {
     INFO("stopped: cref %p  response %p   err %d.", cref, result, err);
@@ -175,17 +196,19 @@ services_callback(advertising_proxy_conn_ref cref, void *result, advertising_pro
         i = 0;
     }
     for (; i < host->num_instances; i++) {
-        const char *instance_name, *service_type;
+        const char *instance_name, *service_type, *reg_type;
         char port[6]; // uint16_t as ascii
 
         if (i == -1 || host->instances[i].instance_name == NULL) {
             instance_name = "<no instances>";
             service_type = "";
             port[0] = 0;
+            reg_type = "";
         } else {
             instance_name = host->instances[i].instance_name;
             service_type = host->instances[i].service_type;
             snprintf(port, sizeof(port), "%u", host->instances[i].port);
+            reg_type = host->instances[i].reg_type;
         }
 
         if (host->num_addresses > 0) {
@@ -224,10 +247,10 @@ services_callback(advertising_proxy_conn_ref cref, void *result, advertising_pro
         for (int j = 1; j < 6; j++) {
             ula = ula << 8 | (((uint8_t *)&host->server_id)[j]);
         }
-        printf("\"%s\" \"%s\" %s %s %s %" PRIu64 ":%" PRIu64 ":%" PRIu64 ".%" PRIu64 " \"%s\" %s %" PRIx64 "\n",
+        printf("\"%s\" \"%s\" %s %s %s %" PRIu64 ":%" PRIu64 ":%" PRIu64 ".%" PRIu64 " \"%s\" \"%s\" %s %" PRIx64 "\n",
                host->regname, instance_name, service_type, port,
-               address == NULL ? "" : address, hours, minutes, seconds, lease, host->hostname, host->removed ? "invalid" : "valid",
-               ula);
+               address == NULL ? "" : address, hours, minutes, seconds, lease, host->hostname,
+               reg_type, host->removed ? "invalid" : "valid", ula);
         if (addrbuf != NULL) {
             free(addrbuf);
         }
@@ -306,6 +329,58 @@ start_dropping_push_connections_callback(advertising_proxy_conn_ref cref, void *
         exit(1);
     }
     exit(0);
+}
+
+static void
+start_breaking_time_validation_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
+{
+    INFO("start_breaking_time_validation: cref %p  response %p   err %d.", cref, result, err);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        exit(1);
+    }
+    exit(0);
+}
+
+static void
+block_anycast_service_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
+{
+    INFO("block_anycast_service: cref %p  response %p   err %d.", cref, result, err);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        exit(1);
+    }
+    exit(0);
+}
+
+static void
+unblock_anycast_service_callback(advertising_proxy_conn_ref cref, void *result, advertising_proxy_error_type err)
+{
+    INFO("unblock_anycast_service: cref %p  response %p   err %d.", cref, result, err);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        exit(1);
+    }
+    exit(0);
+}
+
+typedef struct variable variable_t;
+struct variable {
+    variable_t *next;
+    const char *name, *value;
+};
+
+static void
+set_variable_callback(advertising_proxy_conn_ref cref, void *context, void *result, advertising_proxy_error_type err)
+{
+    variable_t *variable = context;
+    INFO("set_variable: cref %p  response %p   err %d, variable name %s, value %s.",
+         cref, result, err, variable->name, variable->value);
+    if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+        if (variable->next == NULL) {
+            exit(1);
+        }
+    }
+    if (variable->next == NULL) {
+        exit(0);
+    }
 }
 
 static comm_t *tcp_connection;
@@ -397,17 +472,24 @@ usage(void)
     fprintf(stderr, "        block                     -- block the SRP listener\n");
     fprintf(stderr, "        unblock                   -- unblock the SRP listener\n");
     fprintf(stderr, "        regenerate-ula            -- generate a new ULA and restart the network\n");
+    fprintf(stderr, "        adv-prefix-high           -- advertise high-priority prefix to thread network\n");
     fprintf(stderr, "        adv-prefix                -- advertise prefix to thread network\n");
     fprintf(stderr, "        stop                      -- stop advertising as SRP server\n");
     fprintf(stderr, "        get-ula                   -- fetch the current ULA prefix configured on the SRP server\n");
     fprintf(stderr, "        disable-srpl              -- disable SRP replication\n");
     fprintf(stderr, "        add-prefix <ipv6 prefix>     -- add an OMR prefix\n");
     fprintf(stderr, "        remove-prefix <ipv6 prefix>  -- remove an OMR prefix\n");
+    fprintf(stderr, "        add-nat64-prefix <nat64 ipv6 prefix>     -- add an nat64 prefix\n");
+    fprintf(stderr, "        remove-nat64-prefix <nat64 ipv6 prefix>  -- remove an nat64 prefix\n");
     fprintf(stderr, "        drop-srpl-connection      -- drop existing srp replication connections\n");
     fprintf(stderr, "        undrop-srpl-connection    -- restart srp replication connections that were dropped \n");
     fprintf(stderr, "        drop-srpl-advertisement   -- stop advertising srpl service (but keep it around)\n");
     fprintf(stderr, "        undrop-srpl-advertisement -- resume advertising srpl service\n");
     fprintf(stderr, "        start-dropping-push       -- start repeatedly dropping any active push connections after 90 seconds\n");
+    fprintf(stderr, "        start-breaking-time       -- start breaking time validation on replicated SRP registrations\n");
+    fprintf(stderr, "        set [variable] [value]    -- set the value of variable to value (e.g. set min-lease-time 100)\n");
+    fprintf(stderr, "        block-anycast-service      -- block advertising anycast service\n");
+    fprintf(stderr, "        unblock-anycast-service    -- unblock advertising anycast service\n");
 #ifdef NOTYET
     fprintf(stderr, "        flush                     -- flush all entries from the SRP proxy (for testing only)\n");
 #endif
@@ -420,6 +502,7 @@ bool block = false;
 bool unblock = false;
 bool regenerate_ula = false;
 bool adv_prefix = false;
+bool adv_prefix_high = false;
 bool stop_proxy = false;
 bool dump_stdin = false;
 bool get_ula = false;
@@ -432,11 +515,18 @@ bool undrop_srpl_advertisement;
 bool start_dropping_push_connections;
 bool add_thread_prefix = false;
 bool remove_thread_prefix = false;
+bool add_nat64_prefix = false;
+bool remove_nat64_prefix = false;
+bool start_breaking_time_validation = false;
+bool test_route_tracker = false;
+bool block_anycast_service = false;
+bool unblock_anycast_service = false;
 uint8_t prefix_buf[16];
 #ifdef NOTYET
 bool watch = false;
 bool get = false;
 #endif
+variable_t *variables;
 
 static void
 start_activities(void *context)
@@ -465,7 +555,7 @@ start_activities(void *context)
         err = advertising_proxy_regenerate_ula(&cref, main_queue, regenerate_callback);
     }
     if (err == kDNSSDAdvertisingProxyStatus_NoError && adv_prefix) {
-        err = advertising_proxy_advertise_prefix(&cref, main_queue, prefix_advertise_callback);
+        err = advertising_proxy_advertise_prefix(&cref, adv_prefix_high, main_queue, prefix_advertise_callback);
     }
     if (err == kDNSSDAdvertisingProxyStatus_NoError && stop_proxy) {
         err = advertising_proxy_stop(&cref, main_queue, stop_callback);
@@ -482,6 +572,12 @@ start_activities(void *context)
     if (err == kDNSSDAdvertisingProxyStatus_NoError && remove_thread_prefix) {
         err = advertising_proxy_remove_prefix(&cref, main_queue, remove_prefix_callback, prefix_buf, sizeof(prefix_buf));
     }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && add_nat64_prefix) {
+        err = advertising_proxy_add_nat64_prefix(&cref, main_queue, add_nat64_prefix_callback, prefix_buf, sizeof(prefix_buf));
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && remove_nat64_prefix) {
+        err = advertising_proxy_remove_nat64_prefix(&cref, main_queue, remove_nat64_prefix_callback, prefix_buf, sizeof(prefix_buf));
+    }
     if (err == kDNSSDAdvertisingProxyStatus_NoError && drop_srpl_connection) {
         err = advertising_proxy_drop_srpl_connection(&cref, main_queue, drop_srpl_connection_callback);
     }
@@ -496,6 +592,26 @@ start_activities(void *context)
     }
     if (err == kDNSSDAdvertisingProxyStatus_NoError && start_dropping_push_connections) {
         err = advertising_proxy_start_dropping_push_connections(&cref, main_queue, start_dropping_push_connections_callback);
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && start_breaking_time_validation) {
+        err = advertising_proxy_start_breaking_time_validation(&cref, main_queue, start_breaking_time_validation_callback);
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && block_anycast_service) {
+        err = advertising_proxy_block_anycast_service(&cref, main_queue, block_anycast_service_callback);
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && unblock_anycast_service) {
+        err = advertising_proxy_unblock_anycast_service(&cref, main_queue, unblock_anycast_service_callback);
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && test_route_tracker) {
+        route_tracker_test_start(1000);
+    }
+    if (err == kDNSSDAdvertisingProxyStatus_NoError && variables != NULL) {
+        for (variable_t *variable = variables; variable != NULL; variable = variable->next) {
+            err = advertising_proxy_set_variable(&cref, main_queue, set_variable_callback, variable, variable->name, variable->value);
+            if (err != kDNSSDAdvertisingProxyStatus_NoError) {
+                break;
+            }
+        }
     }
     if (err != kDNSSDAdvertisingProxyStatus_NoError) {
         exit(1);
@@ -562,6 +678,10 @@ main(int argc, char **argv)
         } else if (!strcmp(argv[i], "adv-prefix")) {
             adv_prefix = true;
             something = true;
+        } else if (!strcmp(argv[i], "adv-prefix-high")) {
+            adv_prefix = true;
+            adv_prefix_high = true;
+            something = true;
         } else if (!strcmp(argv[i], "stop")) {
             stop_proxy = true;
             something = true;
@@ -590,6 +710,22 @@ main(int argc, char **argv)
                 something = true;
                 i++;
             }
+        } else if (!strcmp(argv[i], "add-nat64-prefix")) {
+            if (inet_pton(AF_INET6, argv[i + 1], prefix_buf) < 1) {
+                fprintf(stderr, "Wrong ipv6 prefix.\n");
+            } else {
+                add_nat64_prefix = true;
+                something = true;
+                i++;
+            }
+        } else if (!strcmp(argv[i], "remove-nat64-prefix")) {
+            if (inet_pton(AF_INET6, argv[i + 1], prefix_buf) < 1) {
+                fprintf(stderr, "Wrong ipv6 prefix.\n");
+            } else {
+                remove_nat64_prefix = true;
+                something = true;
+                i++;
+            }
         } else if (!strcmp(argv[i], "drop-srpl-connection")) {
             drop_srpl_connection = true;
             something = true;
@@ -604,6 +740,33 @@ main(int argc, char **argv)
             something = true;
         } else if (!strcmp(argv[i], "start-dropping-push")) {
             start_dropping_push_connections = true;
+            something = true;
+        } else if (!strcmp(argv[i], "start-breaking-time")) {
+            start_breaking_time_validation = true;
+            something = true;
+        } else if (!strcmp(argv[i], "block-anycast-service")) {
+            block_anycast_service = true;
+            something = true;
+        } else if (!strcmp(argv[i], "unblock-anycast-service")) {
+            unblock_anycast_service = true;
+            something = true;
+        } else if (!strcmp(argv[i], "test-route-tracker")) {
+            test_route_tracker = true;
+            something = true;
+        } else if (!strcmp(argv[i], "set")) {
+            if (i + 2 >= argc) {
+                usage();
+            }
+            variable_t *variable = calloc(1, sizeof(*variable));
+            if (variable == NULL) {
+                fprintf(stderr, "no memory for variable %s", argv[i + 1]);
+                exit(1);
+            }
+            variable->name = argv[i + 1];
+            variable->value = argv[i + 2];
+            variable->next = variables;
+            variables = variable;
+            i += 2;
             something = true;
 #ifdef NOTYET
 		} else if (!strcmp(argv[i], "watch")) {

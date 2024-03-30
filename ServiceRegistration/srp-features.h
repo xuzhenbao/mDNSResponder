@@ -24,7 +24,8 @@
 // SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY: controls whether to initialize dnssd-proxy in srp-mdns-proxy.
 #if defined(BUILD_SRP_MDNS_PROXY) && (BUILD_SRP_MDNS_PROXY == 1)
 // We can only have combined srp-dnssd-proxy if we are building srp-mdns-proxy
-#  define SRP_FEATURE_COMBINED_SRP_DNSSD_PROXY 1
+#  define SRP_FEATURE_PUBLISH_SPECIFIC_ROUTES 0
+#  define SRP_FEATURE_DNSSD_PROXY_SHARED_CONNECTION 0
 #    define SRP_FEATURE_DYNAMIC_CONFIGURATION 1
 #else
 #  ifndef SRP_FEATURE_REPLICATION
@@ -53,6 +54,8 @@
 #if !defined(SRP_FEATURE_NAT64)
     #define SRP_FEATURE_NAT64 0
 #endif
+
+    #define SRP_ANALYTICS 0
 
 // At present we never want this, but we're keeping the code around.
 #define SRP_ALLOWS_MDNS_CONFLICTS 0

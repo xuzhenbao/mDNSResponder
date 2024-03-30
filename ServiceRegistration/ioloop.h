@@ -34,13 +34,19 @@
 #define NSEC_PER_MSEC    1000000ull
 #endif
 
+#ifndef MSEC_PER_SEC
 #define MSEC_PER_SEC (NSEC_PER_SEC / NSEC_PER_MSEC)
+#endif
 
 #ifndef IN_LINKLOCAL
 #define IN_LINKLOCAL(x) (((uint32_t)(x) & 0xffff0000) == 0xA9FE0000) // 169.254.*
 #endif
 #ifndef IN_LOOPBACK
 #define IN_LOOPBACK(x) (((uint32_t)(x) & 0xff000000) == 0x7f000000) // 127.*
+#endif
+
+#ifndef UDP_LISTENER_USES_CONNECTION_GROUPS
+#define UDP_LISTENER_USES_CONNECTION_GROUPS 0
 #endif
 
 #ifndef __DSO_H
@@ -70,13 +76,14 @@ union addr {
 
 struct message {
     int ref_count;
-#ifndef IOLOOP_MACOS
+#if !defined(IOLOOP_MACOS) || !UDP_LISTENER_USES_CONNECTION_GROUPS
     addr_t src;
     addr_t local;
 #endif
     int ifindex;
     uint16_t length;
-    time_t received_time; // Only for SRP Replication, zero otherwise.
+    time_t received_time;      // Only for SRP Replication, zero otherwise.
+    uint32_t lease, key_lease; // For SRP replication, leases agreed to by original registrar
     dns_wire_t wire;
 };
 
@@ -129,6 +136,7 @@ struct io {
     io_callback_t NULLABLE write_callback;
     finalize_callback_t NULLABLE finalize;
     finalize_callback_t NULLABLE io_finalize;
+    finalize_callback_t NULLABLE context_release;
     void *NULLABLE context;
     io_t *NULLABLE cancel_on_close;
     io_callback_t NULLABLE ready;
@@ -154,7 +162,12 @@ struct dso_transport {
 #ifdef IOLOOP_MACOS
     nw_connection_t NULLABLE connection;
     nw_listener_t NULLABLE listener;
+#if UDP_LISTENER_USES_CONNECTION_GROUPS
+    nw_connection_group_t NULLABLE connection_group;
+    nw_content_context_t NULLABLE content_context;
+#endif
     nw_parameters_t NULLABLE parameters;
+    comm_t *NULLABLE listener_state;
     int ref_count;
     int writes_pending;
     wakeup_t *NULLABLE idle_timer;
@@ -164,6 +177,10 @@ struct dso_transport {
     // the retransmit logic is in the application. For future, we may want to rearchitect the flow so that the write is always
     // done in a callback.
     dispatch_data_t NULLABLE pending_write;
+#if !UDP_LISTENER_USES_CONNECTION_GROUPS
+    io_t io;
+    message_t *NULLABLE message;
+#endif
 #else
     io_t io;
     message_t *NULLABLE message;
@@ -298,6 +315,8 @@ bool ioloop_send_data(comm_t *NONNULL connection, message_t *NULLABLE responding
                       struct iovec *NONNULL iov, int iov_len);
 bool ioloop_send_final_data(comm_t *NONNULL connection, message_t *NULLABLE responding_to,
                             struct iovec *NONNULL iov, int iov_len);
+void ioloop_dump_object_allocation_stats(void);
+void ioloop_strcpy(char *NONNULL dest, const char *NONNULL src, size_t lim);
 bool ioloop_map_interface_addresses(const char *NULLABLE ifname, void *NULLABLE context, interface_callback_t NULLABLE callback);
 #define ioloop_map_interface_addresses_here(here, ifname, context, callback) \
     ioloop_map_interface_addresses_here_(here, ifname, context, callback, __FILE__, __LINE__)
@@ -320,6 +339,12 @@ dnssd_txn_t *NULLABLE
 ioloop_dnssd_txn_add_(DNSServiceRef NONNULL ref, void *NULLABLE context,
                       dnssd_txn_finalize_callback_t NULLABLE callback,
                       dnssd_txn_failure_callback_t NULLABLE failure_callback, const char *NONNULL file, int line);
+#define ioloop_dnssd_txn_add_subordinate(ref, context, finalize_callback, failure_callback) \
+    ioloop_dnssd_txn_add_subordinate_(ref, context, finalize_callback, failure_callback, __FILE__, __LINE__)
+dnssd_txn_t *NULLABLE
+ioloop_dnssd_txn_add_subordinate_(DNSServiceRef NONNULL ref, void *NULLABLE context,
+                                  dnssd_txn_finalize_callback_t NULLABLE callback,
+                                  dnssd_txn_failure_callback_t NULLABLE failure_callback, const char *NONNULL file, int line);
 void ioloop_dnssd_txn_cancel(dnssd_txn_t *NONNULL txn);
 #define ioloop_dnssd_txn_retain(txn) ioloop_dnssd_txn_retain_(txn, __FILE__, __LINE__)
 void ioloop_dnssd_txn_retain_(dnssd_txn_t *NONNULL txn, const char *NONNULL file, int line);
@@ -349,6 +374,16 @@ bool srp_load_file_data(void *NULLABLE host_context, const char *NONNULL filenam
                         uint16_t *NONNULL length, uint16_t buffer_size);
 bool srp_store_file_data(void *NULLABLE host_context, const char *NONNULL filename, uint8_t *NONNULL buffer,
                          uint16_t length);
+time_t srp_time(void);
+void srp_format_time_offset(char *NONNULL buf, size_t buf_len, time_t offset);
+
+const struct sockaddr *NULLABLE connection_get_local_address(comm_t *NULLABLE connection);
+
+#if !UDP_LISTENER_USES_CONNECTION_GROUPS
+bool ioloop_udp_send_message(comm_t *NONNULL comm, addr_t *NULLABLE source, addr_t *NONNULL dest, int ifindex,
+                             struct iovec *NONNULL iov, int iov_len);
+void ioloop_udp_read_callback(io_t *NONNULL io, void *NULLABLE context);
+#endif
 
 // Local Variables:
 // mode: C

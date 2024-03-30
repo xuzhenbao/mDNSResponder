@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,10 @@
 #ifndef NULLABILITY_H
 #define NULLABILITY_H
 
+#ifdef __APPLE__
+#include <os/base.h>
+#endif
+
 //======================================================================================================================
 // MARK: - Macros
 
@@ -31,6 +35,16 @@
 		#define NONNULL
 		#define NULL_UNSPECIFIED
 		#define UNUSED				__attribute__((unused))
+	#endif
+#endif
+
+#ifndef NULLABILITY_ASSUME_NONNULL_BEGIN
+	#ifdef __APPLE__
+		#define NULLABILITY_ASSUME_NONNULL_BEGIN	OS_ASSUME_NONNULL_BEGIN
+		#define NULLABILITY_ASSUME_NONNULL_END		OS_ASSUME_NONNULL_END
+	#else
+		#define NULLABILITY_ASSUME_NONNULL_BEGIN
+		#define NULLABILITY_ASSUME_NONNULL_END
 	#endif
 #endif
 

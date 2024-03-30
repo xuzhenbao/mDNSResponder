@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004-2019, 2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2004-2019, 2022-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,36 +19,18 @@
 #include "stdlib.h"         // For strtol()
 #include "string.h"         // For strlcpy(), For strncpy(), strncasecmp()
 #include "assert.h"         // For assert()
-#include "mdns_strict.h"
 
 #if defined( WIN32 )
-#   include "CommonServices.h"
 #   include <winsock2.h>
-#   include <ws2tcpip.h>
-
-static int
-inet_pton( int family, const char * addr, void * dst )
-{
-    struct sockaddr_storage ss;
-    int sslen = sizeof( ss );
-
-    ZeroMemory( &ss, sizeof( ss ) );
-    ss.ss_family = (ADDRESS_FAMILY)family;
-
-    if ( WSAStringToAddressA( (LPSTR)addr, family, NULL, ( struct sockaddr* ) &ss, &sslen ) == 0 )
-    {
-        if ( family == AF_INET ) { memcpy( dst, &( ( struct sockaddr_in* ) &ss)->sin_addr, sizeof( IN_ADDR ) ); return 1; }
-        else if ( family == AF_INET6 ) { memcpy( dst, &( ( struct sockaddr_in6* ) &ss)->sin6_addr, sizeof( IN6_ADDR ) ); return 1; }
-        else return 0;
-    }
-    else return 0;
-}
+#   define strncasecmp _strnicmp
 #else
 #   include <arpa/inet.h>       // For inet_pton()
 #endif
 
 #include "mDNSEmbeddedAPI.h"
 #include "uDNS.h"           // For natTraversalHandleAddressReply() etc.
+
+#include "mdns_strict.h"
 
 // used to format SOAP port mapping arguments
 typedef struct Property_struct

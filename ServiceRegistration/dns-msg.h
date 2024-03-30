@@ -92,7 +92,7 @@ struct dns_label {
 typedef struct dns_rdata_txt dns_rdata_txt_t;
 struct dns_rdata_txt {
     uint8_t len;
-    char *NONNULL data;
+    uint8_t *NONNULL data;
 };
 
 typedef struct dns_rdata_unparsed dns_rdata_unparsed_t;
@@ -250,6 +250,8 @@ struct dns_message {
 #define dns_qclass_hesiod      4 // [MIT Project Athena Technical Plan] Hesiod service
 #define dns_qclass_none      254 // [RFC2136] NONE (delete, or not in use)
 #define dns_qclass_any       255 // [RFC1035] ANY (wildcard)
+
+#define dns_invalid_rr         0 // If it's zero, rr is invalid.
 
 #define dns_rrtype_a           1 // [RFC1035] a host address
 #define dns_rrtype_ns          2 // [RFC1035] an authoritative name server
@@ -431,9 +433,9 @@ void dns_edns0_option_end_(dns_towire_state_t *NONNULL txn, int line);
 void dns_sig0_signature_to_wire_(dns_towire_state_t *NONNULL txn,
                                  srp_key_t *NONNULL key, uint16_t key_tag,
                                  dns_name_pointer_t *NONNULL signer, const char *NONNULL signer_hostname,
-                                 const char *NONNULL signer_domain, int line);
-#define dns_sig0_signature_to_wire(txn, key, key_tag, signer, signer_hostname, signer_domain) \
-    dns_sig0_signature_to_wire_(txn, key, key_tag, signer, signer_hostname, signer_domain, __LINE__)
+                                 const char *NONNULL signer_domain, uint32_t timenow, int line);
+#define dns_sig0_signature_to_wire(txn, key, key_tag, signer, signer_hostname, signer_domain, timenow) \
+    dns_sig0_signature_to_wire_(txn, key, key_tag, signer, signer_hostname, signer_domain, timenow, __LINE__)
 
 int dns_send_to_server(dns_transaction_t *NONNULL txn,
                        const char *NONNULL anycast_address, uint16_t port,
@@ -490,6 +492,10 @@ dns_name_t *NULLABLE dns_pres_name_parse(const char *NONNULL pname);
 dns_name_t *NULLABLE dns_name_subdomain_of(dns_name_t *NONNULL name, dns_name_t *NONNULL domain);
 const char *NONNULL dns_rcode_name(int rcode);
 bool dns_keys_rdata_equal(dns_rr_t *NONNULL key1, dns_rr_t *NONNULL key2);
+void dns_txt_data_print(char *NONNULL txt_buf, size_t buf_size, uint16_t txt_length, uint8_t *NONNULL txt_data);
+bool dns_rrs_equal(dns_rr_t *NONNULL a, dns_rr_t *NONNULL b, bool rdata_present);
+bool dns_rr_to_wire(dns_towire_state_t *NONNULL towire, dns_rr_t *NONNULL rr, bool question);
+void dns_message_rrs_to_wire(dns_towire_state_t *NONNULL towire, dns_message_t *NONNULL message);
 
 /*!
  *  @brief

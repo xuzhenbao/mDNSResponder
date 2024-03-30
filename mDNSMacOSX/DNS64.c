@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2017-2022 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -391,10 +391,10 @@ mDNSexport void DNS64RestartQuestions(mDNS *m)
 //===========================================================================================================================
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, QUERIER)
-#define IsPositiveAAAAFromDNSService(RR, DNS_SERVICE)       \
-    (((RR)->dnsservice == (DNS_SERVICE))  &&                \
-    ((RR)->rrtype == kDNSType_AAAA) &&                      \
-    ((RR)->RecordType != kDNSRecordTypePacketNegative) &&   \
+#define IsPositiveAAAAFromDNSService(RR, DNS_SERVICE)                           \
+    ((mdns_cache_metadata_get_dns_service((RR)->metadata) == (DNS_SERVICE)) &&  \
+    ((RR)->rrtype == kDNSType_AAAA) &&                                          \
+    ((RR)->RecordType != kDNSRecordTypePacketNegative) &&                       \
     !(RR)->InterfaceID)
 #else
 #define IsPositiveAAAAFromResGroup(RR, RES_GROUP_ID)        \

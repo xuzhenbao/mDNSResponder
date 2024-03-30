@@ -138,8 +138,7 @@ cti_prefix_add_parse(cti_connection_t connection)
         if (prefix_data_length != 8) {
             status = kCTIStatus_Invalid;
         } else {
-            memset(((char *)&prefix) + 8, 0, sizeof(prefix) - 8);
-            memcpy(&prefix, prefix_data, prefix_data_length);
+            in6prefix_copy_from_data(&prefix, prefix_data, prefix_data_length);
 #ifndef POSIX_BUILD
             status = ctiAddMeshPrefix(&prefix, prefix_length, on_mesh, true, slaac, stable);
 #endif
@@ -166,8 +165,7 @@ cti_prefix_remove_parse(cti_connection_t connection)
         if (prefix_data_length != 8) {
             status = kCTIStatus_Invalid;
         } else {
-            memset(((char *)&prefix) + 8, 0, sizeof(prefix) - 8);
-            memcpy(&prefix, prefix_data, prefix_data_length);
+            in6prefix_copy_from_data(&prefix, prefix_data, prefix_data_length);
 #ifndef POSIX_BUILD
             status = ctiRemoveMeshPrefix(&prefix, prefix_length);
 #endif

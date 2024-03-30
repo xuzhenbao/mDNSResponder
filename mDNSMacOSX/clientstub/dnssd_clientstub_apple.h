@@ -42,8 +42,14 @@ get_required_tlv_length_for_defaults(xpc_object_t defaults);
 size_t
 get_required_tlv_length_for_service_attr(const DNSServiceAttribute *attr);
 
+size_t
+get_required_tlv_length_for_get_tracker_info(void);
+
 const uint8_t *
 get_validation_data_from_tlvs(const uint8_t * const ptr, const uint8_t * const limit, size_t * const length);
+
+const char *
+get_tracker_hostname_from_tlvs(const uint8_t * const ptr, const uint8_t * const limit);
 
 void
 put_tlvs_for_validation_attr(const DNSServiceAttribute * const attr, ipc_msg_hdr * const hdr, uint8_t ** const ptr,
@@ -51,3 +57,6 @@ put_tlvs_for_validation_attr(const DNSServiceAttribute * const attr, ipc_msg_hdr
 
 void
 put_tlvs_for_defaults(xpc_object_t defaults, ipc_msg_hdr *hdr, uint8_t **ptr, const uint8_t *limit);
+
+void
+put_tlv_to_get_tracker_info(ipc_msg_hdr * const hdr, uint8_t ** const ptr, const uint8_t * const limit);

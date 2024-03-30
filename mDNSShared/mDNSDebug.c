@@ -41,8 +41,8 @@ mDNSexport int mDNS_DebugMode = mDNSfalse;
 #endif
 
 #if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
-mDNSexport int gNumOfPrivateLogRedactionEnabledQueries = 0;
-mDNSexport int gPrivateLogRedactionEnabled = 0;
+mDNSexport int gNumOfSensitiveLoggingEnabledQuestions = 0;
+mDNSexport int gSensitiveLoggingEnabled = 0;
 #endif
 
 // Note, this uses mDNS_vsnprintf instead of standard "vsnprintf", because mDNS_vsnprintf knows

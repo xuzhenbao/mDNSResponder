@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,29 @@ extern "C" {
 // To expand "version" to its value before making the string, use STRINGIFY(version) instead
 #define STRINGIFY_ARGUMENT_WITHOUT_EXPANSION(s) # s
 #define STRINGIFY(s) STRINGIFY_ARGUMENT_WITHOUT_EXPANSION(s)
+
+#define ReadField16(PTR) ((mDNSu16)((((mDNSu16)((const mDNSu8 *)(PTR))[0]) << 8) | ((mDNSu16)((const mDNSu8 *)(PTR))[1])))
+#define ReadField32(PTR) \
+    ((mDNSu32)( \
+        (((mDNSu32)((const mDNSu8 *)(PTR))[0]) << 24) | \
+        (((mDNSu32)((const mDNSu8 *)(PTR))[1]) << 16) | \
+        (((mDNSu32)((const mDNSu8 *)(PTR))[2]) <<  8) | \
+         ((mDNSu32)((const mDNSu8 *)(PTR))[3])))
+
+#ifdef UINT64_MAX
+
+#define ReadField64(PTR) \
+    ((uint64_t)( \
+        (((uint64_t)((const mDNSu8 *)(PTR))[0]) << 56) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[1]) << 48) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[2]) << 40) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[3]) << 32) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[4]) << 24) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[5]) << 16) | \
+        (((uint64_t)((const mDNSu8 *)(PTR))[6]) <<  8) | \
+         ((uint64_t)((const mDNSu8 *)(PTR))[7])))
+
+#endif
 
 // ***************************************************************************
 // MARK: - DNS Protocol Constants
@@ -101,6 +124,51 @@ extern mDNSu32 mDNSRandom(mDNSu32 max);     // Returns pseudo-random result from
 extern mDNSu32 mDNS_GetNextResolverGroupID(void);
 #endif
 
+MDNS_CLOSED_ENUM(mDNSNonCryptoHash, mDNSu8,
+    mDNSNonCryptoHash_FNV1a   = 0,
+    mDNSNonCryptoHash_SDBM    = 1,
+);
+
+/*!
+ *  @brief
+ *      Calculate hash given previous calculated hash and new bytes, with given hash algorithm.
+ *
+ *  @param algorithm
+ *      The hash algorithm to use.
+ *
+ *  @param previousHash
+ *      The hash of previous bytes that has been calculated.
+ *
+ *  @param bytes
+ *      Bytes to update the hash.
+ *
+ *  @param len
+ *      The length of the bytes.
+ *
+ *  @result
+ *      The hash value of (previous bytes + new bytes).
+ */
+extern mDNSu32 mDNS_NonCryptoHashUpdateBytes(mDNSNonCryptoHash algorithm, mDNSu32 previousHash, const mDNSu8 *bytes,
+    mDNSu32 len);
+
+/*!
+ *  @brief
+ *      Calculate hash of the bytes.
+ *
+ *  @param algorithm
+ *      The hash algorithm to use.
+ *
+ *  @param bytes
+ *      Bytes to calculate the hash.
+ *
+ *  @param len
+ *      The length of the bytes.
+ *
+ *  @result
+ *      The hash value.
+ */
+extern mDNSu32 mDNS_NonCryptoHash(mDNSNonCryptoHash algorithm, const mDNSu8 *bytes, mDNSu32 len);
+
 // ***************************************************************************
 // MARK: - Domain Name Utility Functions
 
@@ -111,7 +179,19 @@ extern mDNSu32 mDNS_GetNextResolverGroupID(void);
 #define mDNSIsLowerCase(X)  ((X) >= 'a' && (X) <= 'z')
 #define mDNSIsLetter(X)     (mDNSIsUpperCase(X) || mDNSIsLowerCase(X))
 #define mDNSIsPrintASCII(X) (((X) >= 32) && ((X) <= 126))
-    
+
+/*!
+ *  @brief
+ *      Check if the string consists of all valid UTF-8 characters.
+ *
+ *  @param str
+ *      The string ending with NULL.
+ *
+ *  @result
+ *      True if the string consists of valid UTF-8 characters, otherwise, false.
+ */
+extern mDNSBool mDNSAreUTF8String(const char *str);
+
 // We believe we have adequate safeguards to protect against cache poisoning.
 // In the event that someone does find a workable cache poisoning attack, we want to limit the lifetime of the poisoned entry.
 // We set the maximum allowable TTL to one hour.
@@ -325,6 +405,17 @@ extern mDNSBool GetReverseIPv6Addr(const domainname *inQName, mDNSu8 outIPv6[16]
 extern mStatus mDNSSendDNSMessage(mDNS *const m, DNSMessage *const msg, mDNSu8 *end,
                                   mDNSInterfaceID InterfaceID, TCPSocket *tcpSrc, UDPSocket *udpSrc, const mDNSAddr *dst,
                                   mDNSIPPort dstport, DomainAuthInfo *authInfo, mDNSBool useBackgroundTrafficClass);
+
+// ***************************************************************************
+// MARK: - DNSQuestion Functions
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, LOG_PRIVACY_LEVEL)
+extern mDNSBool DNSQuestionNeedsSensitiveLogging(const DNSQuestion *q);
+#endif
+
+#if MDNSRESPONDER_SUPPORTS(APPLE, RUNTIME_MDNS_METRICS)
+extern mDNSBool DNSQuestionCollectsMDNSMetric(const DNSQuestion *q);
+#endif
 
 // ***************************************************************************
 // MARK: - RR List Management & Task Management

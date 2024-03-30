@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2016-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1869,6 +1869,7 @@ static int				gMDNSDiscoveryTest_MaxDropCount			= 0;
 static int				gMDNSDiscoveryTest_UseIPv4				= false;
 static int				gMDNSDiscoveryTest_UseIPv6				= false;
 static int				gMDNSDiscoveryTest_UseNewGAI			= false;
+static const char *		gMDNSDiscoveryTest_HeapBytesLimit		= NULL;
 static const char *		gMDNSDiscoveryTest_OutputFormat			= kOutputFormatStr_JSON;
 static int				gMDNSDiscoveryTest_OutputAppendNewline	= false;
 static const char *		gMDNSDiscoveryTest_OutputFilePath		= NULL;
@@ -1891,6 +1892,7 @@ static CLIOption		kMDNSDiscoveryTestOpts[] =
 	BooleanOption(  0 , "ipv4",           &gMDNSDiscoveryTest_UseIPv4,             "Use IPv4." ),
 	BooleanOption(  0 , "ipv6",           &gMDNSDiscoveryTest_UseIPv6,             "Use IPv6." ),
 	BooleanOption(  0 , "useNewGAI",      &gMDNSDiscoveryTest_UseNewGAI,           "Use dnssd_getaddrinfo_* instead of DNSServiceGetAddrInfo()." ),
+	StringOption(  'm', "memoryLimit",    &gMDNSDiscoveryTest_HeapBytesLimit,      "byte count", "If > 0, test fails if mDNSResponder's heap memory usage exceeds limit. (default: 0)", false ),
 	
 	CLI_OPTION_GROUP( "Results" ),
 	FormatOption(   'f', "format",        &gMDNSDiscoveryTest_OutputFormat,        "Specifies the test results output format. (default: " kOutputFormatStr_JSON ")", false ),
@@ -2421,6 +2423,7 @@ static const char *		gQuerier_Class				= "IN";
 static const char *		gQuerier_Delegator			= NULL;
 static int				gQuerier_DNSSECOK			= false;
 static int				gQuerier_CheckingDisabled	= false;
+static int				gQuerier_SensitiveLogging	= false;
 static const char *		gQuerier_ResolverType		= NULL;
 static char **			gQuerier_ServerAddrs		= NULL;
 static size_t			gQuerier_ServerAddrCount	= 0;
@@ -2444,6 +2447,7 @@ static CLIOption		kQuerierOpts[] =
 	StringOption(  0 , "delegator",        &gQuerier_Delegator,        "PID|UUID", "Delegator's PID or UUID.", false ),
 	BooleanOption( 0 , "dnssec",           &gQuerier_DNSSECOK,         "Have queries include an OPT record with the DNSSEC OK (DO) bit set." ),
 	BooleanOption( 0 , "checkingDisabled", &gQuerier_CheckingDisabled, "Set the Checking Disabled (CD) bit in queries." ),
+	BooleanOption( 0 , "sensitiveLogging", &gQuerier_SensitiveLogging, "Enable sensitive logging for the query." ),
 	StringOption(  0 , "startLeeway",      &gQuerier_StartLeewayMs,    "ms", "Start time leeway in milliseconds. Negative values mean infinite leeway.", false ),
 	
 	CLI_OPTION_GROUP( "DNS Service Options" ),
@@ -2520,7 +2524,6 @@ static const char *		gGAINew_ServiceScheme			= NULL;
 static const char *		gGAINew_AccountID				= NULL;
 static int				gGAINew_ProtocolIPv4			= false;
 static int				gGAINew_ProtocolIPv6			= false;
-static int				gGAINew_WantAuthTags			= false;
 static int				gGAINew_ShowTracker				= false;
 static int				gGAINew_UseFailover				= false;
 static int				gGAINew_ProhibitEncryptedDNS	= false;
@@ -2528,6 +2531,7 @@ static int				gGAINew_OneShot					= false;
 static int				gGAINew_TimeLimitSecs			= 0;
 static const char *		gGAINew_QoS						= NULL;
 static const char *		gGAINew_ResolverUUID			= NULL;
+static int				gGAINew_PrivateLogging			= false;
 
 #define kQoSTypeStr_Unspecified			"unspecified"
 #define kQoSTypeStr_Background			"background"
@@ -2547,11 +2551,11 @@ static CLIOption		kGetAddrInfoNewOpts[] =
 	StringOption(   0,  "serviceScheme",        &gGAINew_ServiceScheme,        "scheme", "Service scheme such as '_443._https'.", false ),
 	BooleanOption(  0 , "ipv4",                 &gGAINew_ProtocolIPv4,         "Use kDNSServiceProtocol_IPv4." ),
 	BooleanOption(  0 , "ipv6",                 &gGAINew_ProtocolIPv6,         "Use kDNSServiceProtocol_IPv6." ),
-	BooleanOption( 'a', "wantAuthTags",         &gGAINew_WantAuthTags,         "Want authentication tags." ),
 	BooleanOption( 't', "showTracker",          &gGAINew_ShowTracker,          "Display tracker hostnames." ),
 	BooleanOption(  0,  "useFailover",          &gGAINew_UseFailover,          "Use DNS service failover if necessary and applicable." ),
 	BooleanOption(  0,  "prohibitEncryptedDNS", &gGAINew_ProhibitEncryptedDNS, "Prohibit use of encrypted DNS protocols such as DoT, DoH, ODoH, etc." ),
 	StringOption(   0,  "resolverUUID",         &gGAINew_ResolverUUID,         "UUID", "UUID of libnetwork DNS resolver configuration to use.", false ),
+	BooleanOption(  0,  "privateLogging",		&gGAINew_PrivateLogging,       "Use dnssd_log_privacy_level_private logging privacy level." ),
 	
 	CLI_OPTION_GROUP( "Flags" ),
 	DNSSDFlagsOption(),
@@ -3529,18 +3533,9 @@ static void	BrowseCmd( void )
 		sdRef = useMainConnection ? context->mainRef : kBadDNSServiceRef;
 		if( context->validateResults )
 		{
-			if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-			{
-				err = DNSServiceBrowseEx( &sdRef, context->flags, context->ifIndex, context->serviceTypes[ i ],
-					context->domain, &kDNSServiceAttrValidationRequired, BrowseCallback, context );
-				require_noerr( err, exit );
-			}
-			else
-			{
-				FPrintF( stderr, "DNSServiceBrowseEx is not available on this OS." );
-				err = kUnsupportedErr;
-				goto exit;
-			}
+			err = DNSServiceBrowseEx( &sdRef, context->flags, context->ifIndex, context->serviceTypes[ i ],
+				context->domain, &kDNSServiceAttrValidationRequired, BrowseCallback, context );
+			require_noerr( err, exit );
 		}
 		else
 		{
@@ -3695,57 +3690,50 @@ static void DNSSD_API
 	resultValidated	= false;
 	if( context->validateResults )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+		const uint8_t *		dataPtr;
+		size_t				dataLen;
+		
+		dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+		bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for TXT query result\n", dataLen );
+		if( dataPtr )
 		{
-			const uint8_t *		dataPtr;
-			size_t				dataLen;
-			
-			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-			bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for TXT query result\n", dataLen );
-			if( dataPtr )
+			if( browseOnly )
 			{
-				if( browseOnly )
+				signedResult = mdns_signed_browse_result_create_from_data( dataPtr, dataLen, &err );
+				if( signedResult )
 				{
-					signedResult = mdns_signed_browse_result_create_from_data( dataPtr, dataLen, &err );
-					if( signedResult )
+					uint8_t		instanceName[ kDomainNameLengthMax ];
+					
+					err = DNSServiceConstructFullName( fullName, inName, inRegType, inDomain );
+					require_noerr( err, exit );
+					
+					err = DomainNameFromString( instanceName, fullName, NULL );
+					require_noerr( err, exit );
+					
+					if( mdns_signed_browse_result_contains( signedResult, instanceName, inInterfaceIndex ) )
 					{
-						uint8_t		instanceName[ kDomainNameLengthMax ];
-						
-						err = DNSServiceConstructFullName( fullName, inName, inRegType, inDomain );
-						require_noerr( err, exit );
-						
-						err = DomainNameFromString( instanceName, fullName, NULL );
-						require_noerr( err, exit );
-						
-						if( mdns_signed_browse_result_contains( signedResult, instanceName, inInterfaceIndex ) )
-						{
-							resultValidated = true;
-						}
-						else
-						{
-							bc_ulog( kLogLevelError, "Signed browse result doesn't contain instance %s interface %d\n",
-								fullName, inInterfaceIndex );
-						}
-						mdns_forget( &signedResult );
+						resultValidated = true;
 					}
 					else
 					{
-						bc_ulog( kLogLevelError, "mdns_signed_browse_result_create_from_data() failed: %#m\n", err );
+						bc_ulog( kLogLevelError, "Signed browse result doesn't contain instance %s interface %d\n",
+							fullName, inInterfaceIndex );
 					}
+					mdns_forget( &signedResult );
 				}
 				else
 				{
-					attr = DNSServiceAttributeCreate();
-					require( attr, exit );
-					
-					err = DNSServiceAttrSetValidationData( attr, dataPtr, dataLen );
-					require_noerr( err, exit );
+					bc_ulog( kLogLevelError, "mdns_signed_browse_result_create_from_data() failed: %#m\n", err );
 				}
 			}
-		}
-		else
-		{
-			bc_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS\n" );
+			else
+			{
+				attr = DNSServiceAttributeCreate();
+				require( attr, exit );
+				
+				err = DNSServiceAttrSetValidationData( attr, dataPtr, dataLen );
+				require_noerr( err, exit );
+			}
 		}
 	}
 	FPrintF( stdout, "%{du:time}  %{du:cbflags} %2d %-20s %-20s %s",
@@ -3779,18 +3767,9 @@ static void DNSSD_API
 		{
 			if( attr )
 			{
-				if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-				{
-					err = DNSServiceResolveEx( &sdRef, flags, inInterfaceIndex, inName, inRegType, inDomain, attr,
-						BrowseResolveCallback, context );
-					require_noerr( err, exit );
-				}
-				else
-				{
-					bc_ulog( kLogLevelError, "DNSServiceResolveEx is not available on this OS\n" );
-					err = kUnsupportedErr;
-					goto exit;
-				}
+				err = DNSServiceResolveEx( &sdRef, flags, inInterfaceIndex, inName, inRegType, inDomain, attr,
+					BrowseResolveCallback, context );
+				require_noerr( err, exit );
 			}
 			else
 			{
@@ -3803,18 +3782,9 @@ static void DNSSD_API
 		{
 			if( attr )
 			{
-				if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-				{
-					err = DNSServiceQueryRecordWithAttribute( &sdRef, flags, inInterfaceIndex, fullName,
-						kDNSServiceType_TXT, kDNSServiceClass_IN, attr, BrowseQueryRecordCallback, context );
-					require_noerr( err, exit );
-				}
-				else
-				{
-					bc_ulog( kLogLevelError, "DNSServiceQueryRecordWithAttribute is not available on this OS\n" );
-					err = kUnsupportedErr;
-					goto exit;
-				}
+				err = DNSServiceQueryRecordWithAttribute( &sdRef, flags, inInterfaceIndex, fullName,
+					kDNSServiceType_TXT, kDNSServiceClass_IN, attr, BrowseQueryRecordCallback, context );
+				require_noerr( err, exit );
 			}
 			else
 			{
@@ -3854,10 +3824,7 @@ static void DNSSD_API
 	
 exit:
 	mdns_forget( &signedResult );
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 	if( newOp ) BrowseResolveOpFree( newOp );
 	if( err ) exit( 1 );
 }
@@ -3896,39 +3863,32 @@ static void DNSSD_API
 	
 	if( context->validateResults )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+		const uint8_t *		dataPtr;
+		size_t				dataLen;
+		
+		dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+		bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for TXT query result\n", dataLen );
+		if( dataPtr )
 		{
-			const uint8_t *		dataPtr;
-			size_t				dataLen;
+			mdns_signed_browse_result_t		signedResult;
 			
-			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-			bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for TXT query result\n", dataLen );
-			if( dataPtr )
+			signedResult = mdns_signed_browse_result_create_from_data( dataPtr, dataLen, &err );
+			if( signedResult )
 			{
-				mdns_signed_browse_result_t		signedResult;
-				
-				signedResult = mdns_signed_browse_result_create_from_data( dataPtr, dataLen, &err );
-				if( signedResult )
+				if( mdns_signed_browse_result_covers_txt_rdata( signedResult, inRDataPtr, inRDataLen ) )
 				{
-					if( mdns_signed_browse_result_covers_txt_rdata( signedResult, inRDataPtr, inRDataLen ) )
-					{
-						txtValidated = true;
-					}
-					else
-					{
-						bc_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
-					}
-					mdns_forget( &signedResult );
+					txtValidated = true;
 				}
 				else
 				{
-					bc_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+					bc_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
 				}
+				mdns_forget( &signedResult );
 			}
-		}
-		else
-		{
-			bc_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS\n" );
+			else
+			{
+				bc_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+			}
 		}
 	}
 	FPrintF( stdout, "%{du:time}  %s %s TXT on interface %d\n    TXT: %#{txt}",
@@ -3972,39 +3932,32 @@ static void DNSSD_API
 	if( context->validateResults )
 	{
 		OSStatus	err;
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+		const uint8_t *		dataPtr;
+		size_t				dataLen;
+		
+		dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+		bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for resolve result\n", dataLen );
+		if( dataPtr )
 		{
-			const uint8_t *		dataPtr;
-			size_t				dataLen;
+			mdns_signed_resolve_result_t		signedResult;
 			
-			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-			bc_ulog( kLogLevelTrace, "Got %zu bytes of validation data for resolve result\n", dataLen );
-			if( dataPtr )
+			signedResult = mdns_signed_resolve_result_create_from_data( dataPtr, dataLen, &err );
+			if( signedResult )
 			{
-				mdns_signed_resolve_result_t		signedResult;
-				
-				signedResult = mdns_signed_resolve_result_create_from_data( dataPtr, dataLen, &err );
-				if( signedResult )
+				if( mdns_signed_resolve_result_covers_txt_rdata( signedResult, inTXTPtr, inTXTLen ) )
 				{
-					if( mdns_signed_resolve_result_covers_txt_rdata( signedResult, inTXTPtr, inTXTLen ) )
-					{
-						txtValidated = true;
-					}
-					else
-					{
-						bc_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
-					}
-					mdns_forget( &signedResult );
+					txtValidated = true;
 				}
 				else
 				{
-					bc_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+					bc_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
 				}
+				mdns_forget( &signedResult );
 			}
-		}
-		else
-		{
-			bc_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS\n" );
+			else
+			{
+				bc_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+			}
 		}
 	}
 	
@@ -4397,45 +4350,27 @@ static void	QueryRecordCmd( void )
 	
 	if( context->useAAAAFallback || context->useFailover )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+		attr = DNSServiceAttributeCreate();
+		require_action( attr, exit, err = kNoResourcesErr );
+		if( context->useAAAAFallback )
 		{
-			attr = DNSServiceAttributeCreate();
-			require_action( attr, exit, err = kNoResourcesErr );
-			if( context->useAAAAFallback )
-			{
-				err = DNSServiceAttributeSetAAAAPolicy( attr, kDNSServiceAAAAPolicyFallback );
-				require_noerr( err, exit );
-			}
-			if( context->useFailover )
-			{
-				err = DNSServiceAttrSetFailoverPolicy( attr, kDNSServiceFailoverPolicyAllow );
-				require_noerr( err, exit );
-			}
+			err = DNSServiceAttributeSetAAAAPolicy( attr, kDNSServiceAAAAPolicyFallback );
+			require_noerr( err, exit );
 		}
-		else
+		if( context->useFailover )
 		{
-			FPrintF( stderr, "error: DNSServiceAttributeCreate is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
+			err = DNSServiceAttrSetFailoverPolicy( attr, kDNSServiceFailoverPolicyAllow );
+			require_noerr( err, exit );
 		}
 	}
 	sdRef = useMainConnection ? context->mainRef : kBadDNSServiceRef;
 	if( attr )
 	{
 
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			err = DNSServiceQueryRecordWithAttribute( &sdRef, context->flags, context->ifIndex, context->recordName,
-				context->recordType, kDNSServiceClass_IN, attr, QueryRecordCallback, context );
-			require_noerr( err, exit );
-			_DNSServiceAttrForget( &attr );
-		}
-		else
-		{
-			FPrintF( stderr, "error: DNSServiceQueryRecordWithAttribute is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		err = DNSServiceQueryRecordWithAttribute( &sdRef, context->flags, context->ifIndex, context->recordName,
+			context->recordType, kDNSServiceClass_IN, attr, QueryRecordCallback, context );
+		require_noerr( err, exit );
+		_DNSServiceAttrForget( &attr );
 	}
 	else
 	{
@@ -4461,10 +4396,7 @@ static void	QueryRecordCmd( void )
 	dispatch_main();
 	
 exit:
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 	dispatch_source_forget( &signalSource );
 	if( context ) QueryRecordContextFree( context );
 	if( err ) exit( 1 );
@@ -4785,37 +4717,19 @@ static void	RegisterCmd( void )
 	
 	if( context->setTimestamp )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			attr = DNSServiceAttributeCreate();
-			require_action( attr, exit, err = kNoResourcesErr );
-			
-			err = DNSServiceAttributeSetTimestamp( attr, context->timestamp );
-			require_noerr( err, exit );
-		}
-		else
-		{
-			FPrintF( stderr, "error: DNSServiceAttributeCreate is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		attr = DNSServiceAttributeCreate();
+		require_action( attr, exit, err = kNoResourcesErr );
+		
+		err = DNSServiceAttributeSetTimestamp( attr, context->timestamp );
+		require_noerr( err, exit );
 	}
 	if( attr )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			err = DNSServiceRegisterWithAttribute( &context->opRef, context->flags, context->ifIndex, context->name,
-				context->type, context->domain, NULL, htons( context->port ), (uint16_t) context->txtLen, context->txtPtr,
-				attr, RegisterCallback, context );
-			require_noerr( err, exit );
-			_DNSServiceAttrForget( &attr );
-		}
-		else
-		{
-			FPrintF( stderr, "error: DNSServiceRegisterWithAttribute is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		err = DNSServiceRegisterWithAttribute( &context->opRef, context->flags, context->ifIndex, context->name,
+			context->type, context->domain, NULL, htons( context->port ), (uint16_t) context->txtLen, context->txtPtr,
+			attr, RegisterCallback, context );
+		require_noerr( err, exit );
+		_DNSServiceAttrForget( &attr );
 	}
 	else
 	{
@@ -4831,10 +4745,7 @@ static void	RegisterCmd( void )
 	dispatch_main();
 	
 exit:
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 	dispatch_source_forget( &signalSource );
 	if( context ) RegisterContextFree( context );
 	if( err ) exit( 1 );
@@ -5182,37 +5093,19 @@ static void	RegisterRecordCmd( void )
 	// Only call DNSServiceAttributeSetTimestamp when the option is set.
 	if( context->setTimestamp )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			attr = DNSServiceAttributeCreate();
-			require_action( attr, exit, err = kNoResourcesErr );
-			
-			err = DNSServiceAttributeSetTimestamp( attr, context->timestamp );
-			require_noerr( err, exit );
-		}
-		else
-		{
-			FPrintF( stderr, "error: DNSServiceAttributeCreate is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		attr = DNSServiceAttributeCreate();
+		require_action( attr, exit, err = kNoResourcesErr );
+		
+		err = DNSServiceAttributeSetTimestamp( attr, context->timestamp );
+		require_noerr( err, exit );
 	}
 	if( attr )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			err = DNSServiceRegisterRecordWithAttribute( context->conRef, &context->recordRef, context->flags,
-				context->ifIndex, context->recordName, context->recordType, kDNSServiceClass_IN,
-				(uint16_t) context->dataLen, context->dataPtr, context->ttl, attr, RegisterRecordCallback, context );
-			require_noerr( err, exit );
-			_DNSServiceAttrForget( &attr );
-		}
-		else
-		{
-			FPrintF( stderr, "error: DNSServiceRegisterRecordWithAttribute is not available on this OS.\n" );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		err = DNSServiceRegisterRecordWithAttribute( context->conRef, &context->recordRef, context->flags,
+			context->ifIndex, context->recordName, context->recordType, kDNSServiceClass_IN,
+			(uint16_t) context->dataLen, context->dataPtr, context->ttl, attr, RegisterRecordCallback, context );
+		require_noerr( err, exit );
+		_DNSServiceAttrForget( &attr );
 	}
 	else
 	{
@@ -5229,10 +5122,7 @@ static void	RegisterRecordCmd( void )
 	dispatch_main();
 	
 exit:
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 	dispatch_source_forget( &signalSource );
 	if( context ) RegisterRecordContextFree( context );
 	if( err ) exit( 1 );
@@ -9199,6 +9089,11 @@ static nw_listener_t
 		
 		sec_protocol_options_set_local_identity( tlsOptions, inIdentity );
 		sec_protocol_options_append_tls_ciphersuite_group( tlsOptions, tls_ciphersuite_group_default );
+		if( inUseHTTPS )
+		{
+			sec_protocol_options_add_tls_application_protocol( tlsOptions, "h2" );
+		}
+
 		sec_release( tlsOptions );
 		tlsWasConfigured = true;
 	};
@@ -9209,10 +9104,9 @@ static nw_listener_t
 	if( inUseHTTPS )
 	{
 		nw_parameters_set_attach_protocol_listener( params, true );
-		options = nw_http_create_options();
+		options = nw_http2_create_options();
 		require_action( options, exit, err = kNoResourcesErr );
 		
-		nw_http_options_add_version( options, nw_http_version_2 );
 		stack = nw_parameters_copy_default_protocol_stack( params );
 		require_action( stack, exit, err = kNoResourcesErr );
 		
@@ -16268,6 +16162,9 @@ typedef struct
 	dispatch_source_t		queryTimer;				// Used to time out the "about" TXT record query.
 	NanoTime64				startTime;				// When the test started.
 	NanoTime64				endTime;				// When the test ended.
+	uint64_t				heapByteLimit;			// If > 0, limit for mDNSResponder's heap memory usage in bytes. [1]
+	uint64_t				heapByteCount;			// mDNSResponder's heap memory usage in bytes. [1]
+	char *					memgraphPath;			// Path to mDNSResponder's initial memgraph file. [1]
 	pid_t					replierPID;				// PID of mDNS replier.
 	uint32_t				ifIndex;				// Index of interface to run the replier on.
 	unsigned int			instanceCount;			// Desired number of service instances.
@@ -16293,6 +16190,13 @@ typedef struct
 	char					tag[ 4 + 1 ];			// Tag that the replier is to use in its service types.
 	
 }	MDNSDiscoveryTestContext;
+
+// Notes:
+// 1. If a non-zero heap memory limit is specified, then mDNSResponder's memgraph will be captured with the leaks
+//    command before the test starts any client requests. Then, right before all of the test's client requests are
+//    stopped, the heap command will be used to determine the difference in mDNSResponder's heap memory usage at
+//    that point relative to the memgraph. If the difference exceeds the specified limit, then the test will be
+//    considered a failure.
 
 static void		_MDNSDiscoveryTestFirstQueryTimeout( void *inContext );
 static void DNSSD_API
@@ -16378,6 +16282,20 @@ static void	MDNSDiscoveryTestCmd( void )
 	err = OutputFormatFromArgString( gMDNSDiscoveryTest_OutputFormat, &context->outputFormat );
 	require_noerr_quiet( err, exit );
 	
+	if( gMDNSDiscoveryTest_HeapBytesLimit )
+	{
+		context->heapByteLimit = _StringToUInt64( gMDNSDiscoveryTest_HeapBytesLimit, &err );
+		if( err )
+		{
+			FPrintF( stderr, "error: Invalid heap bytes limit '%s'. Valid range is [0, %llu].\n",
+				gMDNSDiscoveryTest_HeapBytesLimit, UINT64_MAX );
+		}
+		if( context->heapByteLimit > 0 )
+		{
+			err = CheckRootUser();
+			require_noerr_quiet( err, exit );
+		}
+	}
 	if( gMDNSDiscoveryTest_FlushCache )
 	{
 		err = CheckRootUser();
@@ -16417,6 +16335,24 @@ static void	MDNSDiscoveryTestCmd( void )
 	err = _SpawnCommand( &context->replierPID, NULL, NULL, "%s", context->replierCommand );
 	require_noerr_quiet( err, exit );
 	
+	if( context->heapByteLimit > 0 )
+	{
+		uuid_t uuid;
+		uuid_generate_random( uuid );
+		uuid_string_t uuidStr;
+		uuid_unparse_upper( uuid, uuidStr );
+		ASPrintF( &context->memgraphPath, "/tmp/mDNSResponder-%s.memgraph", uuidStr );
+		require_action( context->memgraphPath, exit, err = kNoMemoryErr );
+		
+		err = systemf( NULL, "/usr/bin/leaks mDNSResponder --outputGraph=%s 2>&1", context->memgraphPath );
+		require_noerr( err, exit );
+		
+		atexit_b(
+		^ {
+			remove( context->memgraphPath );
+		} );
+	}
+	
 	// Query for the replier's about TXT record. A response means that it's fully up and running.
 	
 	SNPrintF( queryName, sizeof( queryName ), "about.%s.local.", context->hostname );
@@ -16437,6 +16373,7 @@ static void	MDNSDiscoveryTestCmd( void )
 	dispatch_main();
 	
 exit:
+	FPrintF( stderr, "error: %#m\n", err );
 	exit( 1 );
 }
 
@@ -16506,6 +16443,77 @@ exit:
 }
 
 //===========================================================================================================================
+//	_MDNSDiscoveryTestRunHeap
+//===========================================================================================================================
+
+static OSStatus	_MDNSDiscoveryTestRunHeap( MDNSDiscoveryTestContext * const inContext )
+{
+	OSStatus		err;
+	char *			line = NULL;
+	
+	require_action_quiet( inContext->memgraphPath, exit, err = kNoErr );
+	
+	char *heapCmd = NULL;
+	ASPrintF( &heapCmd, "/usr/bin/heap --showSizes --diffFrom=%s mDNSResponder", inContext->memgraphPath );
+	require_action( heapCmd, exit, err = kNoMemoryErr );
+	
+	FILE *heapStream = popen( heapCmd, "r" );
+	ForgetMem( &heapCmd );
+	err = map_global_value_errno( heapStream, heapStream );
+	require_noerr( err, exit );
+	
+	Boolean heapByteCountObtained = false;
+	for( ;; )
+	{
+		err = fcopyline( heapStream, &line, NULL );
+		if( err == kEndingErr )
+		{
+			err = kNoErr;
+			break;
+		}
+		require_noerr( err, exit );
+		
+		if( !heapByteCountObtained )
+		{
+			unsigned long long heapByteCount = 0;
+			int n = 0;
+			const int matchCount = sscanf( line, "All zones: %*u nodes (%llu bytes)%n", &heapByteCount, &n );
+			if( ( matchCount == 1 ) && ( n > 0 ) )
+			{
+				inContext->heapByteCount = heapByteCount;
+				heapByteCountObtained = true;
+			}
+		}
+		FPrintF( stderr, "%s\n", line );
+		ForgetMem( &line );
+	}
+	if( !heapByteCountObtained )
+	{
+		FPrintF( stderr, "error: Did not match line for total heap byte count.\n" );
+	}
+	err = pclose( heapStream );
+	heapStream = NULL;
+	if( err == -1 )
+	{
+		const int errnoVal = errno_compat();
+		if( errnoVal )
+		{
+			err = errnoVal;
+		}
+	}
+	else if( err )
+	{
+		err = WEXITSTATUS( err );
+	}
+	require_noerr( err, exit );
+	require_action( heapByteCountObtained, exit, err = kFormatErr );
+	
+exit:
+	ForgetMem( &line );
+	return( err );
+}
+
+//===========================================================================================================================
 //	_MDNSDiscoveryTestServiceBrowserCallback
 //===========================================================================================================================
 
@@ -16519,6 +16527,8 @@ exit:
 #define kMDNSDiscoveryTestResultsKey_UnexpectedInstances			CFSTR( "unexpectedInstances" )
 #define kMDNSDiscoveryTestResultsKey_MissingInstances				CFSTR( "missingInstances" )
 #define kMDNSDiscoveryTestResultsKey_IncorrectInstances				CFSTR( "incorrectInstances" )
+#define kMDNSDiscoveryTestResultsKey_HeapByteLimit					CFSTR( "heapByteLimit" )
+#define kMDNSDiscoveryTestResultsKey_HeapByteCount					CFSTR( "heapByteCount" )
 #define kMDNSDiscoveryTestResultsKey_Success						CFSTR( "success" )
 #define kMDNSDiscoveryTestResultsKey_TotalResolveTime				CFSTR( "totalResolveTimeUs" )
 
@@ -16575,6 +16585,9 @@ static void	_MDNSDiscoveryTestServiceBrowserCallback( ServiceBrowserResults *inR
 	err = inError;
 	require_noerr( err, exit );
 	
+	err = _MDNSDiscoveryTestRunHeap( context );
+	require_noerr( err, exit );
+	
 	_NanoTime64ToTimestamp( context->startTime, startTime, sizeof( startTime ) );
 	_NanoTime64ToTimestamp( context->endTime, endTime, sizeof( endTime ) );
 	err = CFPropertyListCreateFormatted( kCFAllocatorDefault, &plist,
@@ -16603,6 +16616,7 @@ static void	_MDNSDiscoveryTestServiceBrowserCallback( ServiceBrowserResults *inR
 			"%kO=[%@]"	// unexpectedInstances
 			"%kO=[%@]"	// missingInstances
 			"%kO=[%@]"	// incorrectInstances
+			"%kO=%lli"	// heapByteLimit
 		"}",
 		kMDNSDiscoveryTestResultsKey_ReplierInfo,
 		kMDNSDiscoveryTestReplierInfoKey_Command,			context->replierCommand,
@@ -16625,9 +16639,16 @@ static void	_MDNSDiscoveryTestServiceBrowserCallback( ServiceBrowserResults *inR
 	#endif
 		kMDNSDiscoveryTestResultsKey_UnexpectedInstances,	&unexpectedInstances,
 		kMDNSDiscoveryTestResultsKey_MissingInstances,		&missingInstances,
-		kMDNSDiscoveryTestResultsKey_IncorrectInstances,	&incorrectInstances );
+		kMDNSDiscoveryTestResultsKey_IncorrectInstances,	&incorrectInstances,
+		kMDNSDiscoveryTestResultsKey_HeapByteLimit,			(int64_t) context->heapByteLimit );
 	require_noerr( err, exit );
 	
+	if( context->heapByteLimit > 0 )
+	{
+		err = CFPropertyListAppendFormatted( kCFAllocatorDefault, plist, "%kO=%lli",
+			kMDNSDiscoveryTestResultsKey_HeapByteCount, context->heapByteCount );
+		require_noerr( err, exit );
+	}
 	for( domain = inResults->domainList; domain && ( strcasecmp( domain->name, "local." ) != 0 ); domain = domain->next ) {}
 	require_action( domain, exit, err = kInternalErr );
 	
@@ -16923,11 +16944,11 @@ static void	_MDNSDiscoveryTestServiceBrowserCallback( ServiceBrowserResults *inR
 	{
 		err = CFDictionarySetInt64( plist, kMDNSDiscoveryTestResultsKey_TotalResolveTime, (int64_t) maxResolveTimeUs );
 		require_noerr( err, exit );
-		success = true;
-	}
-	else
-	{
-		success = false;
+		
+		if( ( context->heapByteLimit == 0 ) || ( context->heapByteCount <= context->heapByteLimit ) )
+		{
+			success = true;
+		}
 	}
 	CFDictionarySetBoolean( plist, kMDNSDiscoveryTestResultsKey_Success, success );
 	
@@ -28338,6 +28359,7 @@ typedef struct
 	Boolean							haveDelegatorUUID;		// True if delegatorUUID is set.
 	Boolean							dnssecOK;				// True if queries need an OPT record with the DO bit set.
 	Boolean							checkingDisabled;		// True if queries need the CD bit set.
+	Boolean							sensitiveLogging;		// True if querier's sensitive logging should be enabled.
 	Boolean							haveStartTimeLeeway;	// True if the start time leeway was set.
 	Boolean							done;					// True if the command is done.
 	
@@ -28519,6 +28541,7 @@ static void	QuerierCommand( void )
 	}
 	cmd->dnssecOK			= gQuerier_DNSSECOK			? true : false;
 	cmd->checkingDisabled	= gQuerier_CheckingDisabled	? true : false;
+	cmd->sensitiveLogging	= gQuerier_SensitiveLogging ? true : false;
 	if( gQuerier_StartLeewayMs )
 	{
 		err = StringToInt32( gQuerier_StartLeewayMs, &cmd->startTimeLeewayMs );
@@ -28799,6 +28822,7 @@ static void	_QuerierCmdStart( void *inCtx )
 	if( cmd->dnssecOK )					mdns_querier_set_dnssec_ok( cmd->querier, true );
 	if( cmd->checkingDisabled )			mdns_querier_set_checking_disabled( cmd->querier, true );
 	if( cmd->haveStartTimeLeeway )		mdns_querier_set_start_time_leeway( cmd->querier, cmd->startTimeLeewayMs );
+	if( cmd->sensitiveLogging )			mdns_querier_enable_sensitive_logging( cmd->querier, true );
 	
 	_QuerierCmdRetain( cmd );
 	mdns_querier_set_queue( cmd->querier, cmd->queue );
@@ -29118,10 +29142,10 @@ typedef struct
 	uint32_t				ifIndex;				// dnssd_getaddrinfo's interface index argument.
 	unsigned int			timeLimitSecs;			// Time limit in seconds for dnssd_getaddrinfo activity.
 	OSStatus				error;					// Command's error.
-	Boolean					needAuthTags;			// True if authentication tags are needed.
 	Boolean					showTracker;			// True if tracker hostname, if any, should be displayed.
 	Boolean					useFailover;			// True if DNS service failover should be used if necessary.
 	Boolean					prohibitEncryptedDNS;	// True if use of encrypted DNS protocols is prohibited.
+	Boolean					privateLogging;			// True if private logging is to be enabled.
 	Boolean					stopped;				// True if the command has been stopped.
 	Boolean					oneshot;				// True if the command should stop after first set of results.
 	Boolean					printedHeader;			// True if the results header has been printed.
@@ -29174,10 +29198,10 @@ static void	GetAddrInfoNewCommand( void )
 	cmd->flags					= GetDNSSDFlagsFromOpts();
 	cmd->serviceScheme			= gGAINew_ServiceScheme;
 	cmd->accountID				= gGAINew_AccountID;
-	cmd->needAuthTags			= gGAINew_WantAuthTags			? true : false;
 	cmd->showTracker			= gGAINew_ShowTracker			? true : false;
 	cmd->useFailover			= gGAINew_UseFailover			? true : false;
 	cmd->prohibitEncryptedDNS	= gGAINew_ProhibitEncryptedDNS	? true : false;
+	cmd->privateLogging			= gGAINew_PrivateLogging		? true : false;
 	cmd->oneshot				= gGAINew_OneShot				? true : false;
 	
 	err = InterfaceIndexFromArgString( gInterface, &cmd->ifIndex );
@@ -29319,7 +29343,6 @@ static void	_GetAddrInfoNewCmdStart( void *inCtx )
 	dnssd_getaddrinfo_set_flags( me->gai, me->flags );
 	dnssd_getaddrinfo_set_interface_index( me->gai, me->ifIndex );
 	dnssd_getaddrinfo_set_protocols( me->gai, me->protocols );
-	dnssd_getaddrinfo_set_need_authenticated_results( me->gai, me->needAuthTags ? true : false );
 	dnssd_getaddrinfo_set_use_failover( me->gai, me->useFailover );
 	if( __builtin_available( macOS 13.0, iOS 16.1, watchOS 9.1, tvOS 16.1, * ) )
 	{
@@ -29330,6 +29353,10 @@ static void	_GetAddrInfoNewCmdStart( void *inCtx )
 		FPrintF( stderr, "dnssd_getaddrinfo_prohibit_encrypted_dns is not available on this OS." );
 		err = kUnsupportedErr;
 		goto exit;
+	}
+	if( me->privateLogging )
+	{
+		dnssd_getaddrinfo_set_log_privacy_level( me->gai, dnssd_log_privacy_level_private );
 	}
 	switch( me->delegation.type )
 	{
@@ -29438,17 +29465,13 @@ static void	_GetAddrInfoNewCmdStart( void *inCtx )
 					FPrintF( stdout, "    (Not a known tracker)\n" );
 				}
 			}
-			if( me->needAuthTags )
+			if( __builtin_available( macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, * ) )
 			{
-				if( ( type == dnssd_getaddrinfo_result_type_add ) || ( type == dnssd_getaddrinfo_result_type_expired ) )
+				if( dnssd_getaddrinfo_result_has_extended_dns_error( result ) )
 				{
-					const void *		tagPtr;
-					size_t				tagLen;
-					
-					tagPtr = dnssd_getaddrinfo_result_get_authentication_tag( result, &tagLen );
-					FPrintF( stdout, "    Auth Tag: " );
-					if( tagPtr )	FPrintF( stdout, "%.4H (%zu bytes)\n", tagPtr, (int) tagLen, (int) tagLen, tagLen );
-					else			FPrintF( stdout, "<NO AUTH TAG!>\n" );
+					FPrintF( stdout, "    Extended DNS Error: {code: %u, extra-text: '%s'}\n",
+						dnssd_getaddrinfo_result_get_extended_dns_error_code( result ),
+						dnssd_getaddrinfo_result_get_extended_dns_error_text( result ) );
 				}
 			}
 		}
@@ -33843,6 +33866,18 @@ static void	_ServiceBrowserStop( ServiceBrowserRef me, OSStatus inError )
 	OSStatus		err;
 	SBDomain *		d;
 	
+	if( me->userCallback )
+	{
+		ServiceBrowserResults *		results = NULL;
+		
+		err = _ServiceBrowserCreateResults( me, &results );
+		if( !err ) err = inError;
+		
+		me->userCallback( results, err, me->userContext );
+		me->userCallback	= NULL;
+		me->userContext		= NULL;
+		if( results ) ServiceBrowserResultsRelease( results );
+	}
 	dispatch_source_forget( &me->stopTimer );
 	DNSServiceForget( &me->domainsQuery );
 	for( d = me->domainList; d; d = d->next )
@@ -33867,20 +33902,6 @@ static void	_ServiceBrowserStop( ServiceBrowserRef me, OSStatus inError )
 		}
 	}
 	DNSServiceForget( &me->connection );
-	
-	if( me->userCallback )
-	{
-		ServiceBrowserResults *		results = NULL;
-		
-		err = _ServiceBrowserCreateResults( me, &results );
-		if( !err ) err = inError;
-		
-		me->userCallback( results, err, me->userContext );
-		me->userCallback	= NULL;
-		me->userContext		= NULL;
-		if( results ) ServiceBrowserResultsRelease( results );
-	}
-	
 	while( ( d = me->domainList ) != NULL )
 	{
 		me->domainList = d->next;
@@ -34162,25 +34183,18 @@ static void DNSSD_API
 	{
 		if( me->validateResults )
 		{
-			if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+			const uint8_t *		dataPtr;
+			size_t				dataLen;
+			
+			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+			sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for browse result", dataLen );
+			if( dataPtr )
 			{
-				const uint8_t *		dataPtr;
-				size_t				dataLen;
+				attr = DNSServiceAttributeCreate();
+				require( attr, exit );
 				
-				dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-				sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for browse result", dataLen );
-				if( dataPtr )
-				{
-					attr = DNSServiceAttributeCreate();
-					require( attr, exit );
-					
-					err = DNSServiceAttrSetValidationData( attr, dataPtr, dataLen );
-					require_noerr( err, exit );
-				}
-			}
-			else
-			{
-				sb_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS\n" );
+				err = DNSServiceAttrSetValidationData( attr, dataPtr, dataLen );
+				require_noerr( err, exit );
 			}
 		}
 		err = _ServiceBrowserAddServiceInstance( me, browse, inInterfaceIndex, inName, inRegType, inDomain,
@@ -34196,10 +34210,7 @@ static void DNSSD_API
 	}
 	
 exit:
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 }
 
 //===========================================================================================================================
@@ -34245,41 +34256,34 @@ static void DNSSD_API
 	}
 	if( me->validateResults )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+		const uint8_t *		dataPtr;
+		size_t				dataLen;
+		
+		dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+		sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for resolve result\n", dataLen );
+		if( dataPtr )
 		{
-			const uint8_t *		dataPtr;
-			size_t				dataLen;
+			mdns_signed_resolve_result_t		signedResult;
 			
-			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-			sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for resolve result\n", dataLen );
-			if( dataPtr )
+			signedResult = mdns_signed_resolve_result_create_from_data( dataPtr, dataLen, &err );
+			if( signedResult )
 			{
-				mdns_signed_resolve_result_t		signedResult;
-				
-				signedResult = mdns_signed_resolve_result_create_from_data( dataPtr, dataLen, &err );
-				if( signedResult )
+				if( mdns_signed_resolve_result_covers_txt_rdata( signedResult, instance->txtPtr, instance->txtLen ) )
 				{
-					if( mdns_signed_resolve_result_covers_txt_rdata( signedResult, instance->txtPtr, instance->txtLen ) )
-					{
-						sb_ulog( kLogLevelTrace, "Signed resolve result covers TXT record data\n" );
-						validationDataPtr = dataPtr;
-						validationDataLen = dataLen;
-					}
-					else
-					{
-						sb_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
-					}
-					mdns_forget( &signedResult );
+					sb_ulog( kLogLevelTrace, "Signed resolve result covers TXT record data\n" );
+					validationDataPtr = dataPtr;
+					validationDataLen = dataLen;
 				}
 				else
 				{
-					sb_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+					sb_ulog( kLogLevelError, "Signed resolve result doesn't cover TXT record data\n" );
 				}
+				mdns_forget( &signedResult );
 			}
-		}
-		else
-		{
-			sb_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS\n" );
+			else
+			{
+				sb_ulog( kLogLevelError, "mdns_signed_resolve_result_create_from_data() failed: %#m\n", err );
+			}
 		}
 	}
 	instance->port = ntohs( inPort );
@@ -34313,14 +34317,7 @@ static void DNSSD_API
 			dnssd_getaddrinfo_set_protocols( gai, kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6 );
 			if( validationDataPtr )
 			{
-				if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-				{
-					dnssd_getaddrinfo_set_validation_data( gai, validationDataPtr, validationDataLen );
-				}
-				else
-				{
-					sb_ulog( kLogLevelError, "dnssd_getaddrinfo_set_validation_data is not available on this OS\n" );
-				}
+				dnssd_getaddrinfo_set_validation_data( gai, validationDataPtr, validationDataLen );
 			}
 			dnssd_getaddrinfo_set_queue( gai, me->queue );
 			_SBServiceInstanceRetain( instance );
@@ -34368,23 +34365,16 @@ static void DNSSD_API
 			instance->gaiStartTicks = UpTicks();
 			if( validationDataPtr )
 			{
-				if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-				{
-					attr = DNSServiceAttributeCreate();
-					require( attr, exit );
-					
-					err = DNSServiceAttrSetValidationData( attr, validationDataPtr, validationDataLen );
-					require_noerr( err, exit );
-					
-					err = DNSServiceGetAddrInfoEx( &sdRef, kDNSServiceFlagsShareConnection, instance->ifIndex,
-						kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6, instance->hostname, attr,
-						_ServiceBrowserGAICallback, instance );
-					require_noerr( err, exit );
-				}
-				else
-				{
-					sb_ulog( kLogLevelError, "DNSServiceAttributeCreate is not available on this OS\n" );
-				}
+				attr = DNSServiceAttributeCreate();
+				require( attr, exit );
+				
+				err = DNSServiceAttrSetValidationData( attr, validationDataPtr, validationDataLen );
+				require_noerr( err, exit );
+				
+				err = DNSServiceGetAddrInfoEx( &sdRef, kDNSServiceFlagsShareConnection, instance->ifIndex,
+					kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6, instance->hostname, attr,
+					_ServiceBrowserGAICallback, instance );
+				require_noerr( err, exit );
 			}
 			else
 			{
@@ -34398,10 +34388,7 @@ static void DNSSD_API
 	}
 	
 exit:
-	if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-	{
-		_DNSServiceAttrForget( &attr );
-	}
+	_DNSServiceAttrForget( &attr );
 }
 
 #if( MDNSRESPONDER_PROJECT )
@@ -34433,30 +34420,23 @@ static void
 			
 			if( me->validateResults )
 			{
-				if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+				const uint8_t *		dataPtr;
+				size_t				dataLen;
+				
+				dataPtr = dnssd_getaddrinfo_result_get_validation_data( result, &dataLen );
+				sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for dnssd_getaddrinfo result", dataLen );
+				if( dataPtr )
 				{
-					const uint8_t *		dataPtr;
-					size_t				dataLen;
+					OSStatus							createErr;
+					mdns_signed_hostname_result_t		signedResult;
 					
-					dataPtr = dnssd_getaddrinfo_result_get_validation_data( result, &dataLen );
-					sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for dnssd_getaddrinfo result", dataLen );
-					if( dataPtr )
+					signedResult = mdns_signed_hostname_result_create_from_data( dataPtr, dataLen, &createErr );
+					sb_ulog( kLogLevelTrace, "Signed hostname result: %@", signedResult );
+					if( signedResult )
 					{
-						OSStatus							createErr;
-						mdns_signed_hostname_result_t		signedResult;
-						
-						signedResult = mdns_signed_hostname_result_create_from_data( dataPtr, dataLen, &createErr );
-						sb_ulog( kLogLevelTrace, "Signed hostname result: %@", signedResult );
-						if( signedResult )
-						{
-							validated = true;
-							mdns_forget( &signedResult );
-						}
+						validated = true;
+						mdns_forget( &signedResult );
 					}
-				}
-				else
-				{
-					sb_ulog( kLogLevelError, "dnssd_getaddrinfo_result_get_validation_data is not available on this OS." );
 				}
 			}
 			err = _ServiceBrowserAddIPAddress( me, inInstance, dnssd_getaddrinfo_result_get_address( result ),
@@ -34518,30 +34498,23 @@ static void DNSSD_API
 		
 		if( me->validateResults )
 		{
-			if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
+			const uint8_t *		dataPtr;
+			size_t				dataLen;
+			
+			dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
+			sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for GetAddrInfo result", dataLen );
+			if( dataPtr )
 			{
-				const uint8_t *		dataPtr;
-				size_t				dataLen;
+				OSStatus							createErr;
+				mdns_signed_hostname_result_t		signedResult;
 				
-				dataPtr = DNSServiceGetValidationData( inSDRef, &dataLen );
-				sb_ulog( kLogLevelTrace, "Got %zu bytes of validation data for GetAddrInfo result", dataLen );
-				if( dataPtr )
+				signedResult = mdns_signed_hostname_result_create_from_data( dataPtr, dataLen, &createErr );
+				sb_ulog( kLogLevelTrace, "Signed hostname result: %@", signedResult );
+				if( signedResult )
 				{
-					OSStatus							createErr;
-					mdns_signed_hostname_result_t		signedResult;
-					
-					signedResult = mdns_signed_hostname_result_create_from_data( dataPtr, dataLen, &createErr );
-					sb_ulog( kLogLevelTrace, "Signed hostname result: %@", signedResult );
-					if( signedResult )
-					{
-						validated = true;
-						mdns_forget( &signedResult );
-					}
+					validated = true;
+					mdns_forget( &signedResult );
 				}
-			}
-			else
-			{
-				sb_ulog( kLogLevelError, "DNSServiceGetValidationData is not available on this OS" );
 			}
 		}
 		err = _ServiceBrowserAddIPAddress( me, instance, inSockAddr,
@@ -34612,18 +34585,9 @@ static OSStatus
 	newBrowse->startTicks = UpTicks();
 	if( me->validateResults )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			err = DNSServiceBrowseEx( &sdRef, flags, newBrowse->ifIndex, type->name, inDomain->name,
-				&kDNSServiceAttrValidationRequired, _ServiceBrowserBrowseCallback, newBrowse );
-			require_noerr( err, exit );
-		}
-		else
-		{
-			sb_ulog( kLogLevelError, "DNSServiceBrowseEx is not available on this OS." );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		err = DNSServiceBrowseEx( &sdRef, flags, newBrowse->ifIndex, type->name, inDomain->name,
+			&kDNSServiceAttrValidationRequired, _ServiceBrowserBrowseCallback, newBrowse );
+		require_noerr( err, exit );
 	}
 	else
 	{
@@ -34728,18 +34692,9 @@ static OSStatus
 	newInstance->resolveStartTicks = UpTicks();
 	if( inAttr )
 	{
-		if( __builtin_available( macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, * ) )
-		{
-			err = DNSServiceResolveEx( &sdRef, kDNSServiceFlagsShareConnection, newInstance->ifIndex, inName, inRegType,
-				inDomain, inAttr, _ServiceBrowserResolveCallback, newInstance );
-			require_noerr( err, exit );
-		}
-		else
-		{
-			sb_ulog( kLogLevelError, "DNSServiceResolveEx is not available on this OS." );
-			err = kUnsupportedErr;
-			goto exit;
-		}
+		err = DNSServiceResolveEx( &sdRef, kDNSServiceFlagsShareConnection, newInstance->ifIndex, inName, inRegType,
+			inDomain, inAttr, _ServiceBrowserResolveCallback, newInstance );
+		require_noerr( err, exit );
 	}
 	else
 	{

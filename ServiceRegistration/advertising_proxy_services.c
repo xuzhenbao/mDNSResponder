@@ -1,6 +1,6 @@
 /* advertising_proxy_services.h
  *
- * Copyright (c) 2020-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2020-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,13 @@
 #include "adv-ctl-common.h"
 #include "advertising_proxy_services.h"
 
+#ifndef IOLOOP_MACOS
+int adv_host_created;
+int adv_host_finalized;
+int advertising_proxy_conn_ref_created;
+int advertising_proxy_conn_ref_finalized;
+#endif
+
 static void
 adv_host_finalize(advertising_proxy_host_t *host)
 {
@@ -68,7 +75,7 @@ adv_host_allocate_(const char *file, int line)
     if (host == NULL) {
         return host;
     }
-    RETAIN(host);
+    RETAIN(host, adv_host);
     return host;
 }
 
@@ -79,7 +86,7 @@ adv_fd_finalize(void *context)
 {
     advertising_proxy_conn_ref connection = context;
     connection->io_context = NULL;
-    RELEASE_HERE(connection, cti_connection_finalize);
+    RELEASE_HERE(connection, advertising_proxy_conn_ref);
 }
 
 void
@@ -93,7 +100,7 @@ advertising_proxy_ref_dealloc(advertising_proxy_conn_ref conn_ref)
     cti_connection_close(conn_ref);
 
     // This is releasing the caller's reference. We may still have an internal reference.
-    RELEASE_HERE(conn_ref, cti_connection_finalize);
+    RELEASE_HERE(conn_ref, advertising_proxy_conn_ref);
     ERROR("advertising_proxy_ref_dealloc successfully released conn_ref");
 }
 
@@ -228,7 +235,7 @@ adv_service_list_callback(cti_connection_t connection, void *UNUSED object, cti_
         if (connection->callback.reply != NULL) {
             connection->callback.reply(connection, host, kDNSSDAdvertisingProxyStatus_NoError);
         }
-        RELEASE_HERE(host, adv_host_finalize);
+        RELEASE_HERE(host, advertising_proxy_conn_ref);
         host = NULL;
     }
 
@@ -243,7 +250,7 @@ adv_service_list_callback(cti_connection_t connection, void *UNUSED object, cti_
         }
     }
     if (host != NULL) {
-        RELEASE_HERE(host, adv_host_finalize);
+        RELEASE_HERE(host, advertising_proxy_conn_ref);
     }
 }
 
@@ -269,6 +276,8 @@ adv_ula_callback(cti_connection_t connection, void *UNUSED object, cti_status_t 
     }
 }
 
+#define adv_send_command_with_data(ref, client_queue, command_name, command, app_callback, internal_callback, allocation, data, len)  \
+    adv_send_command_(ref, client_queue, command_name, command, app_callback, internal_callback, allocation, __FILE__, __LINE__)
 #define adv_send_command(ref, client_queue, command_name, command, app_callback, internal_callback, allocation)  \
     adv_send_command_(ref, client_queue, command_name, command, app_callback, internal_callback, allocation, __FILE__, __LINE__)
 static advertising_proxy_error_type
@@ -289,13 +298,13 @@ adv_send_command_(advertising_proxy_conn_ref *ref, run_context_t client_queue, c
         return kDNSSDAdvertisingProxyStatus_NoMemory;
     }
     connection->fd = fd;
-    RETAIN(connection);
+    RETAIN(connection, advertising_proxy_conn_ref);
 
     connection->io_context = ioloop_file_descriptor_create(connection->fd, connection, adv_fd_finalize);
     if (connection->io_context == NULL) {
         ERROR("cti_listen_callback: no memory for io context.");
 		close(fd);
-		RELEASE_HERE(connection, cti_connection_finalize);
+		RELEASE_HERE(connection, advertising_proxy_conn_ref);
         return kDNSSDAdvertisingProxyStatus_NoMemory;
     }
     ioloop_add_reader(connection->io_context, adv_read_callback);
@@ -359,12 +368,17 @@ advertising_proxy_regenerate_ula(advertising_proxy_conn_ref *conn_ref,
 }
 
 advertising_proxy_error_type
-advertising_proxy_advertise_prefix(advertising_proxy_conn_ref *conn_ref,
+advertising_proxy_advertise_prefix(advertising_proxy_conn_ref *conn_ref, bool high,
                                    run_context_t client_queue, advertising_proxy_reply callback)
 {
     advertising_proxy_error_type errx;
-    errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_advertise_prefix",
-                            kDNSSDAdvertisingProxyAdvertisePrefix, callback, NULL, 0);
+    if (high) {
+        errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_advertise_prefix",
+                                kDNSSDAdvertisingProxyAdvertisePrefixPriorityHigh, callback, NULL, 0);
+    } else {
+        errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_advertise_prefix",
+                                kDNSSDAdvertisingProxyAdvertisePrefix, callback, NULL, 0);
+    }
     return errx;
 }
 
@@ -386,6 +400,28 @@ advertising_proxy_remove_prefix(advertising_proxy_conn_ref *conn_ref, run_contex
     advertising_proxy_error_type errx;
     errx = adv_send_command_with_data(conn_ref, client_queue, "advertising_proxy_remove_prefix",
                                       kDNSSDAdvertisingProxyRemovePrefix, callback, NULL, 0,
+                                      prefix_buf, buf_len);
+    return errx;
+}
+
+advertising_proxy_error_type
+advertising_proxy_add_nat64_prefix(advertising_proxy_conn_ref *conn_ref, run_context_t client_queue,
+                             advertising_proxy_reply callback, const uint8_t *prefix_buf, size_t buf_len)
+{
+    advertising_proxy_error_type errx;
+    errx = adv_send_command_with_data(conn_ref, client_queue, "advertising_proxy_add_nat64_prefix",
+                                      kDNSSDAdvertisingProxyAddNAT64Prefix, callback, NULL, 0,
+                                      prefix_buf, buf_len);
+    return errx;
+}
+
+advertising_proxy_error_type
+advertising_proxy_remove_nat64_prefix(advertising_proxy_conn_ref *conn_ref, run_context_t client_queue,
+                                advertising_proxy_reply callback, const uint8_t *prefix_buf, size_t buf_len)
+{
+    advertising_proxy_error_type errx;
+    errx = adv_send_command_with_data(conn_ref, client_queue, "advertising_proxy_remove_nat64_prefix",
+                                      kDNSSDAdvertisingProxyRemoveNAT64Prefix, callback, NULL, 0,
                                       prefix_buf, buf_len);
     return errx;
 }
@@ -467,6 +503,69 @@ advertising_proxy_start_dropping_push_connections(advertising_proxy_conn_ref *co
     advertising_proxy_error_type errx;
     errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_disable_start_dropping_push_connections",
                             kDNSSDAdvertisingProxyStartDroppingPushConnections, callback, NULL, 0);
+    return errx;
+}
+
+advertising_proxy_error_type
+advertising_proxy_start_breaking_time_validation(advertising_proxy_conn_ref *conn_ref,
+                                                 run_context_t client_queue, advertising_proxy_reply callback)
+{
+    advertising_proxy_error_type errx;
+    errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_start_breaking_time_validation",
+                            kDNSSDAdvertisingProxyStartBreakingTimeValidation, callback, NULL, 0);
+    return errx;
+}
+
+advertising_proxy_error_type
+advertising_proxy_block_anycast_service(advertising_proxy_conn_ref *conn_ref,
+                                        run_context_t client_queue, advertising_proxy_reply callback)
+{
+    advertising_proxy_error_type errx;
+    errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_block_anycast_service",
+                            kDNSSDAdvertisingProxyBlockAnycastService, callback, NULL, 0);
+    return errx;
+}
+
+advertising_proxy_error_type
+advertising_proxy_unblock_anycast_service(advertising_proxy_conn_ref *conn_ref,
+                                          run_context_t client_queue, advertising_proxy_reply callback)
+{
+    advertising_proxy_error_type errx;
+    errx = adv_send_command(conn_ref, client_queue, "advertising_proxy_disable_unblock_anycast_service",
+                            kDNSSDAdvertisingProxyUnblockAnycastService, callback, NULL, 0);
+    return errx;
+}
+
+static void
+adv_set_variable_callback(advertising_proxy_conn_ref conn_ref, xpc_object_t *response, int status)
+{
+    if (conn_ref->app_context_callback != NULL) {
+        conn_ref->app_context_callback(conn_ref, conn_ref->context, response, status);
+    }
+}
+
+advertising_proxy_error_type
+advertising_proxy_set_variable(advertising_proxy_conn_ref *conn_ref,
+                               run_context_t client_queue, advertising_proxy_context_reply callback, void *context,
+                               const char *name, const char *value)
+{
+    advertising_proxy_error_type errx;
+    size_t name_len = strlen(name), value_len = strlen(value);
+    size_t total_len = name_len + value_len + 2;
+    uint8_t *buf = malloc(total_len);
+    if (buf == NULL) {
+        return kDNSSDAdvertisingProxyStatus_NoMemory;
+    }
+    memcpy(buf, name, name_len + 1);
+    memcpy(buf + name_len + 1, value, value_len + 1);
+    errx = adv_send_command_with_data(conn_ref, client_queue, "advertising_proxy_get_service_list",
+                                      kDNSSDAdvertisingProxySetVariable, NULL, adv_set_variable_callback,
+                                      0, buf, total_len);
+    free(buf);
+    if (errx == kDNSSDAdvertisingProxyStatus_NoError) {
+        (*conn_ref)->context = context;
+        (*conn_ref)->app_context_callback = callback;
+    }
     return errx;
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -124,6 +124,23 @@ mrcs_dns_proxy_enable_force_aaaa_synthesis(mrcs_dns_proxy_t proxy, bool enable);
 
 /*!
  *	@brief
+ *		Sets a DNS proxy's effective user ID.
+ *
+ *	@param proxy
+ *		The DNS proxy.
+ *
+ *	@param euid
+ *		The effective user ID.
+ *
+ *	@discussion
+ *		Any policy decisions that need to be made for a DNS proxy's query that take a user ID into account, such
+ *		as path evaluation, will use the DNS proxy's effective user ID.
+ */
+void
+mrcs_dns_proxy_set_euid(mrcs_dns_proxy_t proxy, uid_t euid);
+
+/*!
+ *	@brief
  *		Determines whether a DNS proxy contains an input interface.
  *
  *	@param proxy
@@ -184,6 +201,19 @@ mrcs_dns_proxy_get_nat64_prefix(mrcs_dns_proxy_t proxy);
  */
 bool
 mrcs_dns_proxy_forces_aaaa_synthesis(mrcs_dns_proxy_t proxy);
+
+/*!
+ *	@brief
+ *		Gets a DNS proxy's effective user ID.
+ *
+ *	@param proxy
+ *		The DNS proxy.
+ *
+ *	@result
+ *		The effective user ID.
+ */
+uid_t
+mrcs_dns_proxy_get_euid(mrcs_dns_proxy_t proxy);
 
 /*!
  *	@brief

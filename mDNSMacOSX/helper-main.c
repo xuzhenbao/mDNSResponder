@@ -1,11 +1,11 @@
 /*
- * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *     https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -147,7 +147,7 @@ static void *idletimer(void *context)
     return NULL;
 }
 
-static int initialize_timer()
+static int initialize_timer(void)
 {
     gTimer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + actualidle, actualidle, 0, 0, diediedie, NULL);
     int err = 0;
@@ -472,7 +472,11 @@ int main(int ac, char *av[])
     // We should normally be running as a system daemon.  However, that might not be the case in some scenarios (e.g. debugging).
     // Explicitly ensure that our Keychain operations utilize the system domain.
     if (opt_debug)
+    {
+        mdns_clang_ignore_warning_begin(-Wdeprecated-declarations);
         SecKeychainSetPreferenceDomain(kSecPreferencesDomainSystem);
+        mdns_clang_ignore_warning_end();
+    }
 #endif
 
     if (maxidle)

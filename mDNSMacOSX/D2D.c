@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -383,13 +383,6 @@ mDNSlocal mStatus xD2DParseCompressedPacket(const mDNSu8 * const lhs, const mDNS
         return mStatus_Incompatible;
     }
 
-    if (mDNS_LoggingEnabled)
-    {
-        const int len = (int)(compression_lhs - (mDNSu8*)&compression_base_msg);
-        LogRedact(MDNS_LOG_CATEGORY_D2D, MDNS_LOG_DEFAULT, "xD2DParseCompressedPacket: Static Bytes - "
-            "len: %d, Hex: " PUB_HEX, len, HEX_PARAM(&compression_base_msg, len));
-    }
-
     mDNSu8 *ptr = compression_lhs; // pointer to the end of our fake packet
 
     // Check to make sure we're not going to go past the end of the DNSMessage data
@@ -419,6 +412,14 @@ mDNSlocal mStatus xD2DParseCompressedPacket(const mDNSu8 * const lhs, const mDNS
     ptr += rhs_len;
     *out_ptr = ptr;
 
+    domainname recordName;
+    const mDNSu8 *const recordNameNextPtr = getDomainName(&compression_base_msg, recordNamePtr, compression_limit,
+        &recordName);
+    if (!recordNameNextPtr)
+    {
+        AssignConstStringDomainName(&recordName, "");
+    }
+
     // If the record answers a DNS-SD PTR browsing query, then clear the cache-flush bit. Such records are part of a
     // shared resource record set since PTR records for instances of a given service type can come from more than one
     // mDNS responder. From <https://datatracker.ietf.org/doc/html/rfc6762#section-10.2>:
@@ -427,20 +428,15 @@ mDNSlocal mStatus xD2DParseCompressedPacket(const mDNSu8 * const lhs, const mDNS
     //    record.  To do so would cause all the other shared versions of this
     //    resource record with different rdata from different responders to be
     //    immediately deleted from all the caches on the network.
-    if (recordType == kDNSServiceType_PTR)
+    if (recordType == kDNSServiceType_PTR && DomainNameIsForBrowsing(&recordName))
     {
-        domainname recordName;
-        if (getDomainName(&compression_base_msg, recordNamePtr, compression_limit, &recordName) &&
-            DomainNameIsForBrowsing(&recordName))
-        {
-            putVal16(recordClassPtr, kDNSClass_IN);
-        }
+        putVal16(recordClassPtr, kDNSClass_IN);
     }
     if (mDNS_LoggingEnabled)
     {
-        const int len = (int)(ptr - compression_lhs);
-        LogRedact(MDNS_LOG_CATEGORY_D2D, MDNS_LOG_DEFAULT, "xD2DParseCompressedPacket: Our Bytes - "
-            "len: %d, Hex: " PRI_HEX, len, HEX_PARAM(compression_lhs, len));
+        LogRedact(MDNS_LOG_CATEGORY_D2D, MDNS_LOG_DEFAULT, "xD2DParseCompressedPacket: Our Bytes - name: " PRI_DM_NAME
+            ", type: " PUB_DNS_TYPE ", TTL: %u, rdata length: %u", DM_NAME_PARAM(&recordName),
+            DNS_TYPE_PARAM(recordType), ttl, rhs_len);
     }
     return mStatus_NoError;
 }

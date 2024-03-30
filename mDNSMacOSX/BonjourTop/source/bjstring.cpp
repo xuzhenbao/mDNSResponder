@@ -192,7 +192,7 @@ void BJString::Format(BJ_UINT64 number,BJ_FORMAT_STYLE style)
     switch (style) {
         case BJSS_BYTE:
             Create(32);
-            sprintf(buffer,"%llu",number);
+            snprintf(buffer,sizeof(buffer),"%llu",number);
             break;
         case BJSS_TIME:
         {

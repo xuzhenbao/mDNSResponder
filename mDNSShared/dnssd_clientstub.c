@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4 -*-
  *
- * Copyright (c) 2003-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2023 Apple Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -34,7 +34,6 @@
 
 #include "dnssd_ipc.h"
 
-#include "mdns_strict.h"
 
 #ifndef DEBUG_64BIT_SCM_RIGHTS
 #define DEBUG_64BIT_SCM_RIGHTS 0
@@ -50,6 +49,7 @@
     #include <windows.h>
     #include <stdarg.h>
     #include <stdio.h>
+    #include <stdint.h>
 
     #define sockaddr_mdns sockaddr_in
     #define AF_MDNS AF_INET
@@ -88,6 +88,43 @@ static void syslog( int priority, const char * message, ...)
     #include <syslog.h>
     #include <sys/uio.h>
 
+#endif
+
+#include "mdns_strict.h"
+
+#if !defined(SETIOV)
+    #if defined(_WIN32)
+        #define iovec_t         WSABUF
+        #define iov_len         len
+        #define iov_base        buf
+
+        #define SETIOV(IOV, PTR, LEN) \
+            do \
+            { \
+                (IOV)->iov_base = (char *)(PTR); \
+                (IOV)->iov_len  = (LEN); \
+            } while(0)
+
+        static
+        ssize_t writev(SocketRef inSock, const iovec_t *inArray, int inCount)
+        {
+            int         err;
+            DWORD       n;
+
+            err = WSASend(inSock, (iovec_t *)inArray, inCount, &n, 0, NULL, NULL);
+            return(err ? err : n);
+        }
+
+    #else
+        typedef struct iovec    iovec_t;
+
+        #define SETIOV(IOV, PTR, LEN) \
+            do \
+            { \
+                (IOV)->iov_base = (void *)(PTR); \
+                (IOV)->iov_len  = (LEN); \
+            } while(0)
+    #endif
 #endif
 
 #if defined(_WIN32)
@@ -249,6 +286,10 @@ DNSServiceAttributeRef DNSSD_API DNSServiceAttributeCreate
     void
 )
 {
+#ifdef MEMORY_OBJECT_TRACKING
+    extern int saref_created;
+    saref_created++;
+#endif
     DNSServiceAttributeRef attr = (DNSServiceAttributeRef)mdns_calloc(1, sizeof(*attr));
     return attr;
 }
@@ -277,7 +318,12 @@ DNSServiceErrorType DNSSD_API DNSServiceAttributeSetTimestamp
 
 void DNSSD_API DNSServiceAttributeDeallocate(DNSServiceAttributeRef attr)
 {
-    mdns_free(attr);
+#ifdef MEMORY_OBJECT_TRACKING
+    extern int saref_finalized;
+    saref_finalized++;
+#endif
+    DNSServiceAttributeRef tmp = attr;
+    mdns_free(tmp);
 }
 
 size_t
@@ -567,6 +613,10 @@ static void FreeDNSRecords(DNSServiceOp *sdRef)
     while (rec)
     {
         DNSRecord *next = rec->recnext;
+#ifdef MEMORY_OBJECT_TRACKING
+        extern int rref_finalized;
+        rref_finalized++;
+#endif
         mdns_free(rec->msg);
         mdns_free(rec);
         rec = next;
@@ -575,6 +625,13 @@ static void FreeDNSRecords(DNSServiceOp *sdRef)
 
 static void FreeDNSServiceOp(DNSServiceOp *x)
 {
+#ifdef MEMORY_OBJECT_TRACKING
+    extern void *dns_service_op_not_to_be_freed;
+    if (x != NULL && x == dns_service_op_not_to_be_freed) {
+        syslog(LOG_ERR, "dnssd_clientstub attempt to dispose protected DNSServiceRef %p", x);
+        abort();
+    }
+#endif
     // We don't use our DNSServiceRefValid macro here because if we're cleaning up after a socket() call failed
     // then sockfd could legitimately contain a failing value (e.g. dnssd_InvalidSocket)
     if ((x->sockfd ^ x->validator) != ValidatorBits)
@@ -607,6 +664,10 @@ static void FreeDNSServiceOp(DNSServiceOp *x)
             x->kacontext = NULL;
         }
         mdns_free(x);
+#ifdef MEMORY_OBJECT_TRACKING
+        extern int sdref_finalized;
+        sdref_finalized++;
+#endif
     }
 }
 
@@ -683,6 +744,10 @@ static DNSServiceErrorType ConnectToServer(DNSServiceRef *ref, DNSServiceFlags f
     sdr->disp_queue    = NULL;
 #endif
     sdr->kacontext     = NULL;
+#ifdef MEMORY_OBJECT_TRACKING
+    extern int sdref_created;
+    sdref_created++;
+#endif
     
     if (flags & kDNSServiceFlagsShareConnection)
     {
@@ -923,8 +988,10 @@ static DNSServiceErrorType deliver_request(ipc_msg_hdr *hdr, DNSServiceOp *sdr)
     // any associated data does not work reliably -- e.g. one particular issue we ran
     // into is that if the receiving program is in a kqueue loop waiting to be notified
     // of the received message, it doesn't get woken up when the control message arrives.
-    if (MakeSeparateReturnSocket || sdr->op == send_bpf) 
-        datalen--;     // Okay to use sdr->op when checking for op == send_bpf
+    if (MakeSeparateReturnSocket)
+    {
+        datalen--;
+    }
 #endif
 
     // At this point, our listening socket is set up and waiting, if necessary, for the daemon to connect back to
@@ -961,7 +1028,7 @@ static DNSServiceErrorType deliver_request(ipc_msg_hdr *hdr, DNSServiceOp *sdr)
 
     if (!MakeSeparateReturnSocket) 
         errsd = sdr->sockfd;
-    if (MakeSeparateReturnSocket || sdr->op == send_bpf)    // Okay to use sdr->op when checking for op == send_bpf
+    if (MakeSeparateReturnSocket)
     {
 #if defined(USE_TCP_LOOPBACK) || defined(USE_NAMED_ERROR_RETURN_SOCKET)
         // At this point we may wait in accept for a few milliseconds waiting for the daemon to connect back to us,
@@ -986,31 +1053,14 @@ static DNSServiceErrorType deliver_request(ipc_msg_hdr *hdr, DNSServiceOp *sdr)
         msg.msg_iov        = &vec;
         msg.msg_iovlen     = 1;
         msg.msg_flags      = 0;
-        if (MakeSeparateReturnSocket || sdr->op == send_bpf)    // Okay to use sdr->op when checking for op == send_bpf
-        {
-            if (sdr->op == send_bpf)
-            {
-                int i;
-                char p[12];     // Room for "/dev/bpf999" with terminating null
-                for (i=0; i<100; i++)
-                {
-                    snprintf(p, sizeof(p), "/dev/bpf%d", i);
-                    listenfd = open(p, O_RDWR, 0);
-                    //if (dnssd_SocketValid(listenfd)) syslog(LOG_WARNING, "dnssd_clientstub deliver_request Sending fd %d for %s", listenfd, p);
-                    if (!dnssd_SocketValid(listenfd) && dnssd_errno != EBUSY)
-                        syslog(LOG_WARNING, "dnssd_clientstub deliver_request Error opening %s %d (%s)", p, dnssd_errno, dnssd_strerror(dnssd_errno));
-                    if (dnssd_SocketValid(listenfd) || dnssd_errno != EBUSY) break;
-                }
-            }
-            msg.msg_control    = cbuf;
-            msg.msg_controllen = CMSG_LEN(sizeof(dnssd_sock_t));
+        msg.msg_control    = cbuf;
+        msg.msg_controllen = CMSG_LEN(sizeof(dnssd_sock_t));
 
-            cmsg = CMSG_FIRSTHDR(&msg);
-            cmsg->cmsg_len     = CMSG_LEN(sizeof(dnssd_sock_t));
-            cmsg->cmsg_level   = SOL_SOCKET;
-            cmsg->cmsg_type    = SCM_RIGHTS;
-            *((dnssd_sock_t *)CMSG_DATA(cmsg)) = listenfd;
-        }
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_len     = CMSG_LEN(sizeof(dnssd_sock_t));
+        cmsg->cmsg_level   = SOL_SOCKET;
+        cmsg->cmsg_type    = SCM_RIGHTS;
+        *((dnssd_sock_t *)CMSG_DATA(cmsg)) = listenfd;
 
 #if defined(TEST_KQUEUE_CONTROL_MESSAGE_BUG) && TEST_KQUEUE_CONTROL_MESSAGE_BUG
         sleep(1);
@@ -1040,8 +1090,6 @@ static DNSServiceErrorType deliver_request(ipc_msg_hdr *hdr, DNSServiceOp *sdr)
         // Close our end of the socketpair *before* calling read_all() to get the four-byte error code.
         // Otherwise, if the daemon closes our socket (or crashes), we will have to wait for a timeout
         // in read_all() because the socket is not closed (we still have an open reference to it)
-        // Note: listenfd is overwritten in the case of send_bpf above and that will be closed here
-        // for send_bpf operation.
         dnssd_close(listenfd);
         listenfd = dnssd_InvalidSocket; // Make sure we don't close it a second time in the cleanup handling below
     }
@@ -1049,9 +1097,7 @@ static DNSServiceErrorType deliver_request(ipc_msg_hdr *hdr, DNSServiceOp *sdr)
     // At this point we may wait in read_all for a few milliseconds waiting for the daemon to send us the error code,
     // but that's okay -- the daemon should not take more than a few milliseconds to respond.
     // set_waitlimit() ensures we do not block indefinitely just in case something is wrong
-    if (sdr->op == send_bpf)    // Okay to use sdr->op when checking for op == send_bpf
-        err = kDNSServiceErr_NoError;
-    else if ((err = set_waitlimit(errsd, DNSSD_CLIENT_TIMEOUT)) == kDNSServiceErr_NoError)
+    if ((err = set_waitlimit(errsd, DNSSD_CLIENT_TIMEOUT)) == kDNSServiceErr_NoError)
     {
         ioresult = read_all(errsd, (uint8_t *)&err, (int)sizeof(err));
         if (ioresult < read_all_success)
@@ -2126,7 +2172,7 @@ DNSServiceErrorType DNSSD_API DNSServiceCreateDelegateConnection(DNSServiceRef *
 
 DNSServiceErrorType DNSServiceSendQueuedRequestsInternal(DNSServiceRef sdr)
 {
-    struct iovec *iov;
+    iovec_t *iov;
     ssize_t totalLength = 0, bytesWritten;
     uint32_t numMsg, i;
     DNSRecordRef rref;
@@ -2161,8 +2207,7 @@ DNSServiceErrorType DNSServiceSendQueuedRequestsInternal(DNSServiceRef sdr)
         {
             uint32_t datalen = rref->msg->datalen;
             ConvertHeaderBytes(rref->msg);
-            iov[i].iov_base = rref->msg;
-            iov[i].iov_len = datalen + sizeof(ipc_msg_hdr);
+            SETIOV(&iov[i], rref->msg, datalen + sizeof(ipc_msg_hdr));
             i++;
         }
     }
@@ -2310,6 +2355,10 @@ DNSServiceErrorType DNSServiceRegisterRecordInternal
     }
     rref = mdns_calloc(1, sizeof(*rref));
     if (!rref) { mdns_free(hdr); return kDNSServiceErr_NoMemory; }
+#ifdef MEMORY_OBJECT_TRACKING
+    extern int rref_created;
+    rref_created++;
+#endif
     rref->AppContext = context;
     rref->AppCallback = callBack;
     rref->record_index = sdRef->max_index++;
@@ -2392,6 +2441,10 @@ DNSServiceErrorType DNSSD_API DNSServiceAddRecord
 
     rref = mdns_calloc(1, sizeof(*rref));
     if (!rref) { mdns_free(hdr); return kDNSServiceErr_NoMemory; }
+#ifdef MEMORY_OBJECT_TRACKING
+    extern int rref_created;
+    rref_created++;
+#endif
     rref->record_index = sdRef->max_index++;
     rref->sdr = sdRef;
     *RecordRef = rref;
@@ -2518,7 +2571,18 @@ DNSServiceErrorType DNSSD_API DNSServiceRemoveRecord
 
     if (!DNSServiceRefValid(sdRef))
     {
-        syslog(LOG_WARNING, "dnssd_clientstub DNSServiceRemoveRecord called with invalid DNSServiceRef %p %08X %08X", sdRef, sdRef->sockfd, sdRef->validator);
+        syslog(LOG_WARNING, "dnssd_clientstub DNSServiceRemoveRecord called with invalid DNSServiceRef %p %08X %08X",
+               sdRef, sdRef->sockfd, sdRef->validator);
+        return kDNSServiceErr_BadReference;
+    }
+
+    // Ensure that this rref is actually dependent on the sdref. An rref can't not be dependent on an sdref.
+    DNSRecord **p = &sdRef->rec;
+    while (*p && *p != RecordRef) p = &(*p)->recnext;
+    if (*p == NULL)
+    {
+        syslog(LOG_WARNING, "dnssd_clientstub DNSServiceRemoveRecord called with invalid DNSRecordRef %p %08X %08X",
+               RecordRef, sdRef->sockfd, sdRef->validator);
         return kDNSServiceErr_BadReference;
     }
 
@@ -2542,15 +2606,24 @@ DNSServiceErrorType DNSSD_API DNSServiceRemoveRecord
     hdr->reg_index = RecordRef->record_index;
     put_flags(flags, &ptr);
     err = deliver_request(hdr, sdRef);      // Will free hdr for us
-    if (!err)
+    if (!err || err == kDNSServiceErr_BadReference)
     {
-        // This RecordRef could have been allocated in DNSServiceRegisterRecord or DNSServiceAddRecord.
-        // If so, delink from the list before freeing
-        DNSRecord **p = &sdRef->rec;
-        while (*p && *p != RecordRef) p = &(*p)->recnext;
-        if (*p) *p = RecordRef->recnext;
+        // This RecordRef could only have been allocated in DNSServiceRegisterRecord or DNSServiceAddRecord.
+        // Delink from the list before freeing
+        *p = RecordRef->recnext;
+#ifdef MEMORY_OBJECT_TRACKING
+        extern int rref_finalized;
+        rref_finalized++;
+#endif
         mdns_free(RecordRef->msg);
         mdns_free(RecordRef);
+
+        // In the event that we got a BadReference from mDNSResponder, this means that the DNSServiceRegisterRecord
+        // or DNSServiceAddRecord call that created the rref data structure and added it to the sdref didn't succeed
+        // in creating a registration in the mDNSResponder process, so when we told mDNSResponder to remove it, it
+        // didn't find anything to remove. In this case, it doesn't make sense to return an error to the caller, because
+        // we have successfully removed the rref.
+        err = kDNSServiceErr_NoError;
     }
     return err;
 }

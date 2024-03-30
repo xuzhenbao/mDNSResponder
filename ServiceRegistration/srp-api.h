@@ -90,6 +90,10 @@ int srp_deregister(void *NULLABLE os_context);
 // other than kDNSServiceErr_NoError means that the specified service instance wasn't found.
 int srp_deregister_instance(DNSServiceRef NULLABLE sdRef);
 
+// Call this to update the service type on an existing registration. This only makes sense for a subtype: if
+// this changes the base type, it will look like a new service instance to the SRP server.
+DNSServiceErrorType srp_update_service_type(DNSServiceRef NONNULL sdRef, const char *NONNULL regtype, DNSServiceRegisterReply NULLABLE callback, void *NULLABLE context);
+
 // The below functions must be provided by the host.
 
 // This function fetches a key with the specified name for use in signing SRP updates.
@@ -155,6 +159,9 @@ int srp_set_wakeup(void *NULLABLE host_context,
 
 // This is called to cancel a wakeup, and should not fail even if there is no wakeup pending.
 int srp_cancel_wakeup(void *NULLABLE host_context, void *NONNULL context);
+
+// Returns the current wall clock time in seconds since 1970
+uint32_t srp_timenow(void);
 
 #ifdef __cplusplus
 } // extern "C"

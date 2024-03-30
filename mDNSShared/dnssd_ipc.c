@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2021 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2023 Apple Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -26,9 +26,10 @@
  */
 
 #include "dnssd_ipc.h"
-#include "mdns_strict.h"
 
 #if defined(_WIN32)
+
+#include <stdint.h>
 
 char *win32_strerror(int inErrorCode)
 {
@@ -53,6 +54,8 @@ char *win32_strerror(int inErrorCode)
 }
 
 #endif
+
+#include "mdns_strict.h"
 
 static uint8_t *_write_big32(uint8_t *ptr, const uint32_t u32)
 {
@@ -196,6 +199,11 @@ size_t get_required_tlv_length(const uint16_t value_length)
     return (IPC_TLV16_OVERHEAD_LENGTH + value_length);
 }
 
+size_t get_required_tlv_string_length(const char *str_value)
+{
+    return (IPC_TLV16_OVERHEAD_LENGTH + strlen(str_value) + 1);
+}
+
 size_t get_required_tlv_uint8_length(void)
 {
     return (IPC_TLV16_OVERHEAD_LENGTH + 1);
@@ -233,6 +241,19 @@ void put_tlv(const uint16_t type, const uint16_t length, const uint8_t *const va
     {
         *ptr = dst;
     }
+}
+
+void put_tlv_string(const uint16_t type, const char *const str_value, uint8_t **const ptr, const uint8_t *const limit,
+    int *const out_error)
+{
+    int err = -1;
+    size_t len = strlen(str_value) + 1;
+    if (len <= UINT16_MAX)
+    {
+        put_tlv(type, (uint16_t)len, (const uint8_t *)str_value, ptr, limit);
+        err = 0;
+    }
+    _assign_null_safe(out_error, err);
 }
 
 void put_tlv_uint8(const uint16_t type, const uint8_t u8, uint8_t **const ptr, const uint8_t *const limit)
@@ -296,6 +317,18 @@ static const uint8_t *_tlv16_get_value(const uint8_t *const start, const uint8_t
 const uint8_t *get_tlv(const uint8_t *const start, const uint8_t *const end, const uint16_t type, size_t *const out_length)
 {
     return _tlv16_get_value(start, end, type, out_length, NULL);
+}
+
+const char *get_tlv_string(const uint8_t *const start, const uint8_t *const end, const uint16_t type)
+{
+    const char *str_value = NULL;
+    size_t length;
+    const char *value = (const char *)_tlv16_get_value(start, end, type, &length, NULL);
+    if(strnlen(value, length) == (length - 1))
+    {
+        str_value = value;
+    }
+    return str_value;
 }
 
 uint32_t get_tlv_uint32(const uint8_t *const start, const uint8_t *const end, const uint16_t type, int *const out_error)

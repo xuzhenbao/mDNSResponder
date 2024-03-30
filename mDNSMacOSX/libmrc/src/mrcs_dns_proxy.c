@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022 Apple Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 #include "mrcs_dns_proxy.h"
 
 #include "helpers.h"
-#include "mdns_memcpy_bits.h"
+#include "memory.h"
 #include "mrcs_cf_support.h"
 #include "mrcs_objects.h"
 
@@ -40,6 +40,7 @@ struct mrcs_dns_proxy_s {
 	mrcs_interface_t *	input_interfaces;		// Array of input interfaces.
 	size_t				input_interface_count;	// Current number of input interface indexes.
 	mrcs_interface_t	output_interface;		// Output interface.
+	uid_t				euid;					// Effective user ID.
 	bool				nat64_prefix_valid;		// True if the NAT64 prefix is currently valid.
 	bool				force_aaaa_synthesis;	// True if the DNS proxy policy is to force AAAA synthesis.
 };
@@ -182,6 +183,14 @@ mrcs_dns_proxy_enable_force_aaaa_synthesis(const mrcs_dns_proxy_t me, const bool
 
 //======================================================================================================================
 
+void
+mrcs_dns_proxy_set_euid(const mrcs_dns_proxy_t me, const uid_t euid)
+{
+	me->euid = euid;
+}
+
+//======================================================================================================================
+
 bool
 mrcs_dns_proxy_contains_input_interface(const mrcs_dns_proxy_t me, const uint32_t ifindex)
 {
@@ -215,6 +224,14 @@ bool
 mrcs_dns_proxy_forces_aaaa_synthesis(const mrcs_dns_proxy_t me)
 {
 	return me->force_aaaa_synthesis;
+}
+
+//======================================================================================================================
+
+uid_t
+mrcs_dns_proxy_get_euid(const mrcs_dns_proxy_t me)
+{
+	return me->euid;
 }
 
 //======================================================================================================================

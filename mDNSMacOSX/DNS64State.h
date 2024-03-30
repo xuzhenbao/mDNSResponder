@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017 Apple Inc. All rights reserved.
+ * Copyright (c) 2017-2023 Apple Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 #ifndef __DNS64State_h
 #define __DNS64State_h
 
-typedef enum
-{
+MDNS_CLOSED_ENUM(DNS64State, mDNSu8,
     kDNS64State_Initial             = 0,    // Initial state.
     kDNS64State_PrefixDiscovery     = 1,    // Querying for "ipv4only.arpa." AAAA records to discover NAT64 IPv6 prefix(es).
     kDNS64State_PrefixDiscoveryPTR  = 2,    // Same as PrefixDiscovery, but discoverying for "ip6.arpa." PTR record queries.
@@ -28,8 +27,7 @@ typedef enum
     kDNS64State_QueryPTR            = 6,    // Determining whether to query for reverse IPV4 or reverse IPv6 PTR record.
     kDNS64State_ReverseIPv4         = 7,    // Querying for reverse IPV4 (in-addr.arpa.) PTR record.
     kDNS64State_ReverseIPv6         = 8     // Querying for the original reverse IPv6 (ip6.arpa.) PTR record.
-
-}   DNS64State;
+);
 
 typedef struct
 {

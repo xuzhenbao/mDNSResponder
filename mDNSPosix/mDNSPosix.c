@@ -2174,7 +2174,7 @@ mDNSexport void mDNSPlatformSetSocktOpt(void *sock, mDNSTransport_Type transType
     (void) q;
 }
 
-mDNSexport mDNSs32 mDNSPlatformGetPID()
+mDNSexport mDNSs32 mDNSPlatformGetPID(void)
 {
     return 0;
 }
