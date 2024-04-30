@@ -71,7 +71,7 @@ mDNSlocal void LogMsgWithLevelv(os_log_t category, os_log_type_t level, const ch
 mDNSlocal void LogMsgWithLevelv(const char *category, mDNSLogLevel_t level, const char *format, va_list args)
 {
     // Do not print the logs if the log category is MDNS_LOG_CATEGORY_DISABLED.
-    if (strcmp(category, MDNS_LOG_CATEGORY_DISABLED) == 0)
+    if (category && strcmp(category, MDNS_LOG_CATEGORY_DISABLED) == 0)
     {
         return;
     }
